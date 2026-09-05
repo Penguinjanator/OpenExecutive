@@ -428,10 +428,14 @@ async def test_generated_slot_pins_encoding_on_every_text_write(
             offenders.append(f"write_text: {self.name}")
         return real_write(self, data, encoding=encoding or "utf-8", errors=errors, newline=newline)
 
-    def guarded_read(self, encoding=None, errors=None, newline=None):  # type: ignore[no-untyped-def]
+    # No `newline` here: Path.read_text only accepts it on Python 3.13+, and CI
+    # runs 3.11 — forwarding it unconditionally would TypeError the moment a
+    # read_text call enters the guarded path (exactly the regression this guard
+    # exists to catch). **kwargs keeps the forwarding correct on every version.
+    def guarded_read(self, encoding=None, **kwargs):  # type: ignore[no-untyped-def]
         if encoding is None:
             offenders.append(f"read_text: {self.name}")
-        return real_read(self, encoding=encoding or "utf-8", errors=errors, newline=newline)
+        return real_read(self, encoding=encoding or "utf-8", **kwargs)
 
     monkeypatch.setattr(Path, "write_text", guarded_write)
     monkeypatch.setattr(Path, "read_text", guarded_read)
