@@ -353,6 +353,31 @@ pick a model that's strong at it (e.g. Llama 3.3 70B, Qwen2.5) — small models
 may route poorly. `LOCAL_API_KEY` is only needed if your server (vLLM, or a
 gateway) requires a bearer token; Ollama and LM Studio need none.
 
+### Using a hosted OpenAI-compatible gateway
+
+The `LOCAL_*` settings are not limited to localhost — the same recipe works with
+any **hosted** OpenAI-compatible endpoint (an aggregator or inference gateway):
+
+```bash
+LOCAL_MODELS_ENABLED=true
+LOCAL_BASE_URL=https://gateway.example.com/v1
+LOCAL_API_KEY=your-gateway-key
+LOCAL_MODELS=vendor/model-a,vendor/model-b
+```
+
+The listed slugs are sent to the gateway verbatim and appear in the Council UI
+dropdown, exactly like local slugs. Gateways that speak OpenRouter's request
+format and model namespace can alternatively be used through the OpenRouter
+path (`OPENROUTER_ENABLED=true` + `OPENROUTER_API_KEY` +
+`OPENROUTER_BASE_URL=https://gateway.example.com/v1`), which keeps that path's
+Claude-name translation and feature handling.
+
+The local-model caveats above apply to the `LOCAL_*` path unchanged, plus one
+that matters more for hosted endpoints: everything the Executive processes —
+company profile, documents, conversations — is sent to whichever endpoint you
+configure here. Point these settings only at a provider you trust with that
+data.
+
 ## Adding a New Specialist Agent
 
 1. Create `packages/core/openexecutive/agents/your_agent.py` extending `BaseAgent`
