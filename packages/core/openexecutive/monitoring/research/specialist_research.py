@@ -12,7 +12,10 @@ from typing import Any
 
 from openexecutive.agents.base import BaseAgent
 from openexecutive.monitoring.research.models import ResearchFinding
-from openexecutive.monitoring.research.prompts import research_addendum_for
+from openexecutive.monitoring.research.prompts import (
+    PER_SPECIALIST_FINDING_CAP,
+    research_addendum_for,
+)
 from openexecutive.monitoring.research.tools import (
     EMIT_RESEARCH_FINDINGS_TOOL,
 )
@@ -102,7 +105,15 @@ def _extract_findings(
         block_input = getattr(block, "input", None) or {}
         items = block_input.get("findings")
         if isinstance(items, list):
-            raw_findings.extend(items)
+            if len(items) > PER_SPECIALIST_FINDING_CAP:
+                # The schema's maxItems already refuses this on Anthropic;
+                # a translated provider may not enforce it, so keep the
+                # first N — the model was told to lead with the material ones.
+                logger.warning(
+                    "research: specialist=%s emitted %d findings — keeping the first %d",
+                    specialist_slug, len(items), PER_SPECIALIST_FINDING_CAP,
+                )
+            raw_findings.extend(items[:PER_SPECIALIST_FINDING_CAP])
 
     if not raw_findings:
         # Empty research is a valid answer ("nothing in my domain

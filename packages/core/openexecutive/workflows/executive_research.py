@@ -413,6 +413,7 @@ class ExecutiveResearchWorkflow(Workflow):
             existing_watchlist=existing_watchlist,
             note=inputs.note,
             decisions=decisions,
+            departments=departments,
         )
 
         yield WorkflowEvent(
@@ -1070,6 +1071,7 @@ def _render_research_context(
     existing_watchlist: list[Any],
     note: str,
     decisions: list[Any] | None = None,
+    departments: list[Any] | None = None,
 ) -> str:
     """Build the user-turn block passed to every specialist call."""
     from datetime import UTC, datetime, timedelta
@@ -1147,6 +1149,18 @@ def _render_research_context(
             parts.append(f"{line}: {summary[:160]}")
         parts.append("")
 
+    interest_lines = _render_department_interests(departments)
+    if interest_lines:
+        # What a department head asked to have watched is company intent
+        # the profile does not carry; without it a specialist's grounding
+        # rule drops findings about exactly those entities.
+        parts.append(
+            "DEPARTMENT WATCH INTERESTS (entities a department head asked "
+            "to have watched — a finding may be grounded in one of these):"
+        )
+        parts.extend(interest_lines)
+        parts.append("")
+
     parts.append(
         "Research within your domain and emit findings via the "
         "`emit_research_findings` tool. Use web_search to FIND and "
@@ -1157,6 +1171,25 @@ def _render_research_context(
         "finding."
     )
     return "\n".join(parts)
+
+
+def _render_department_interests(departments: list[Any] | None) -> list[str]:
+    """One ``- <slug>: <entities>`` line per department with watched
+    entities (at most 20 departments, 20 entities each). Shared by the
+    specialist context and the watchlist turn so both name the same
+    interests."""
+    lines: list[str] = []
+    for state in departments or []:
+        config = getattr(state, "config", None)
+        slug = getattr(config, "slug", "")
+        entities = [
+            " ".join(str(e).split())
+            for e in (getattr(config, "watched_entities", None) or [])
+            if str(e).strip()
+        ]
+        if slug and entities:
+            lines.append(f"- {slug}: {', '.join(entities[:20])}")
+    return lines[:20]
 
 
 def _render_team_roster(people: list[Any]) -> str:
@@ -1314,19 +1347,13 @@ def _render_watchlist_turn(
         parts.append("\nHOW PAST PROPOSALS TURNED OUT:")
         parts.extend(history_lines[:12])
 
-    interest_lines: list[str] = []
-    for state in departments or []:
-        config = getattr(state, "config", None)
-        slug = getattr(config, "slug", "")
-        entities = [str(e) for e in (getattr(config, "watched_entities", None) or []) if str(e).strip()]
-        if slug and entities:
-            interest_lines.append(f"- {slug}: {', '.join(entities[:20])}")
+    interest_lines = _render_department_interests(departments)
     if interest_lines:
         parts.append(
             "\nDEPARTMENT WATCH INTERESTS (entities a department asked to have "
             "watched — ground a proposal about one in that entity):"
         )
-        parts.extend(interest_lines[:20])
+        parts.extend(interest_lines)
 
     parts.append(
         "\nDecide which ongoing sources are worth monitoring and call "

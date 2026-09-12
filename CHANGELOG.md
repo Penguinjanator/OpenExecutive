@@ -103,6 +103,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bumps `dismiss_count`); approving recovers it. Trust now discounts the
   ranking and is shown to the review as evidence.
 
+### Changed
+- **Specialists are told what departments watch.** The research context
+  every specialist receives now carries a `DEPARTMENT WATCH INTERESTS`
+  block (each department's watched entities), and the grounding rule
+  admits a department interest or a company named in a recent decision.
+  A Finance head who lists Brex now gets Brex findings; before, the
+  specialists were never told and their grounding rule dropped them. The
+  per-specialist finding cap is enforced in the tool schema and the
+  parser, not only in prompt text.
+
 ### Removed
 - **The xcrawl scrape service and everything that depended on it.** The
   research run no longer has a post-dedup verify pass or an optional

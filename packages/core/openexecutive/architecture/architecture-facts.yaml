@@ -1897,13 +1897,27 @@ external_monitoring:
       loop with its full outbound toolkit and decides per finding.
 
       1. gather_context — load company profile, active initiatives,
-         existing watchlist.
+         existing watchlist, departments and the ten most recent episodic
+         decisions (90 days). `_render_research_context` turns these into
+         the user turn every specialist gets: today's date + the 30-day
+         window, the profile block, ACTIVE INITIATIVES, ALREADY ON THE
+         WATCHLIST, RECENT DECISIONS and DEPARTMENT WATCH INTERESTS (one
+         line per department listing its `watched_entities`, via
+         `_render_department_interests`, shared with the watchlist turn).
+         The prompt's REQUIRED GROUNDING list admits a department interest
+         or a company named in a recent decision, so a specialist can
+         surface a finding about an entity a department head asked for —
+         before this, the grounding rule dropped exactly those.
       2. research_specialists — fan out via asyncio.gather to seven
          specialist slugs (cso, cfo, cmo, coo, chro, cpo, gc). Each
          runs through `specialist_research.research_one_specialist`
          with its normal `effective_system_prompt()` + a research-mode
          addendum (`prompts.research_addendum_for`) + the Anthropic
          web_search tool + a structured `emit_research_findings` tool.
+         Findings per specialist are capped at PER_SPECIALIST_FINDING_CAP
+         (3) three ways: the prompt says so, the tool schema carries
+         `maxItems`, and `_extract_findings` keeps the first N for a
+         provider that does not enforce the schema.
          The research turn's model + deep-reasoning are controlled by the
          `research` virtual Council agent (get_research_model() /
          get_research_use_deep_reasoning(): Council override → `RESEARCH_MODEL`
