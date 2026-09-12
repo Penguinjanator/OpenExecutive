@@ -42,6 +42,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -118,6 +119,7 @@ def compute_research_state_hash(db_path: Path | None = None) -> str:
         logger.exception("research.scheduler: profile load failed")
         return "error:profile"
 
+    initiatives: list = []
     try:
         from openexecutive.memory.episodic import DB_PATH, get_active_initiatives
 
@@ -125,10 +127,8 @@ def compute_research_state_hash(db_path: Path | None = None) -> str:
         # `get_active_initiatives` binds DB_PATH at def time; route
         # through the resolver so monkeypatched DB_PATH in tests
         # (and any future multi-DB harness) actually takes effect.
-        for i in sorted(
-            get_active_initiatives(db_path=db_path or DB_PATH),
-            key=lambda x: (getattr(x, "title", "") or ""),
-        ):
+        initiatives = list(get_active_initiatives(db_path=db_path or DB_PATH))
+        for i in sorted(initiatives, key=lambda x: (getattr(x, "title", "") or "")):
             parts.append(
                 f"{getattr(i, 'title', '')}::{getattr(i, 'status', '')}"
             )
@@ -152,38 +152,44 @@ def compute_research_state_hash(db_path: Path | None = None) -> str:
         logger.exception("research.scheduler: watchlist load failed")
         parts.append("WATCHLIST_ERROR")
 
-    departments: list = []
-    try:
-        from openexecutive.departments.store import list_departments
+    from openexecutive.monitoring.research import watch_policy
 
-        departments = list(list_departments())
-        parts.append("DEPARTMENTS:")
-        for state in sorted(departments, key=lambda d: d.config.slug):
-            parts.append(
-                f"{state.config.slug}::"
-                + "|".join(state.config.watched_entities)
-                + "::" + "|".join(state.config.charter.scope)
-                + "::" + "|".join(g.key_result for g in state.goals)
-            )
-    except Exception:
-        logger.exception("research.scheduler: departments load failed")
-        parts.append("DEPARTMENTS_ERROR")
+    departments = watch_policy.load_departments(db_path)
+    _append_part(parts, "DEPARTMENTS", lambda: [
+        f"{state.config.slug}::"
+        + "|".join(state.config.watched_entities)
+        + "::" + "|".join(state.config.charter.scope)
+        + "::" + "|".join(g.key_result for g in state.goals)
+        for state in sorted(departments, key=lambda d: d.config.slug)
+    ])
 
-    try:
-        from openexecutive.monitoring.research import watch_policy
+    def _matching_decisions() -> list[str]:
+        # The same vocabulary the policy grounds with (minus watch labels,
+        # which never ground), so a decision moves the hash exactly when it
+        # would move a classification.
+        vocabulary = watch_policy.grounding_vocabulary(profile, initiatives, [], departments)
+        return [
+            f"{getattr(decision, 'id', '')}::{str(getattr(decision, 'summary', '') or '')[:120]}"
+            for decision in watch_policy.recent_decisions(db_path=db_path)
+            if any(watch_policy.named_in_decision(term, decision) for term in vocabulary)
+        ]
 
-        vocabulary = watch_policy.grounding_vocabulary(profile, [], [], departments)
-        parts.append("DECISIONS:")
-        for decision in watch_policy.recent_decisions(db_path=db_path):
-            summary = str(getattr(decision, "summary", "") or "")
-            if any(watch_policy.named_in_decision(term, decision) for term in vocabulary):
-                parts.append(f"{getattr(decision, 'id', '')}::{summary[:120]}")
-    except Exception:
-        logger.exception("research.scheduler: decisions load failed")
-        parts.append("DECISIONS_ERROR")
+    _append_part(parts, "DECISIONS", _matching_decisions)
 
     digest = hashlib.sha256("\n".join(parts).encode()).hexdigest()
     return digest
+
+
+def _append_part(parts: list[str], label: str, lines: Callable[[], list[str]]) -> None:
+    """Append one labelled fingerprint section, or a ``<LABEL>_ERROR``
+    sentinel when loading it fails (logged; the hash still differs from a
+    healthy run so the failure is visible in the audit trail)."""
+    parts.append(f"{label}:")
+    try:
+        parts.extend(lines())
+    except Exception:
+        logger.exception("research.scheduler: %s load failed", label.lower())
+        parts.append(f"{label}_ERROR")
 
 
 def _last_successful_research_run() -> tuple[str | None, str | None]:

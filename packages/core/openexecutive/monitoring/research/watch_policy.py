@@ -127,11 +127,14 @@ GROUNDING_KINDS: frozenset[str] = frozenset({
 STRONG_GROUNDING_KINDS: frozenset[str] = frozenset({
     KIND_COMPANY, KIND_COMPETITOR, KIND_VENDOR, KIND_TICKER, KIND_DEPARTMENT_ENTITY,
 })
-# When one term appears in several sources the strongest kind wins.
+# When one term appears in several sources the strongest kind wins. Profile
+# kinds outrank department kinds on purpose: a vendor the profile names and
+# Finance also lists stays a `vendor` (so the policy's vendor history keeps
+# applying to it) and merely gains Finance as its department.
 _KIND_RANK: dict[str, int] = {
-    KIND_COMPANY: 9, KIND_COMPETITOR: 8, KIND_DEPARTMENT_ENTITY: 7, KIND_VENDOR: 6,
-    KIND_TICKER: 5, KIND_INITIATIVE: 4, KIND_PRIORITY: 3, KIND_DEPARTMENT_SCOPE: 2,
-    KIND_WATCH: 1,
+    KIND_COMPANY: 9, KIND_COMPETITOR: 8, KIND_VENDOR: 7, KIND_TICKER: 6,
+    KIND_DEPARTMENT_ENTITY: 5, KIND_INITIATIVE: 4, KIND_PRIORITY: 3,
+    KIND_DEPARTMENT_SCOPE: 2, KIND_WATCH: 1,
 }
 # Recent decisions are consulted this far back, and only this many.
 DECISION_LOOKBACK_DAYS = 90
@@ -302,8 +305,11 @@ def grounding_vocabulary(
     ``department_entity`` term and each charter-scope phrase / goal key
     result a ``department_scope`` term, all tagged with the department's
     slug. When a term is both a profile kind and a department's, the
-    stronger kind wins but the department is kept — a profile competitor
-    that Finance also lists stays a ``competitor`` and routes to Finance."""
+    stronger kind wins and the department is kept — a profile competitor
+    that Finance also lists stays a ``competitor`` and routes to Finance.
+    When two departments claim one term, the department that supplied the
+    winning kind owns it (a watched entity beats a scope phrase); on a tie
+    the first one seen keeps it."""
     vocab: Vocabulary = {}
 
     def add(term: str, kind: str, department: str = "") -> None:
@@ -314,8 +320,10 @@ def grounding_vocabulary(
         if current is None:
             vocab[n] = VocabEntry(kind, department)
             return
-        best_kind = kind if _KIND_RANK[kind] > _KIND_RANK[current.kind] else current.kind
-        vocab[n] = VocabEntry(best_kind, current.department or department)
+        if _KIND_RANK[kind] > _KIND_RANK[current.kind]:
+            vocab[n] = VocabEntry(kind, department or current.department)
+        else:
+            vocab[n] = VocabEntry(current.kind, current.department or department)
 
     for item in existing:
         for label_key in ("display_name", "feed_label", "vendor_label", "label"):
@@ -354,6 +362,18 @@ def grounding_vocabulary(
     return vocab
 
 
+def load_departments(db_path: Path | None = None) -> list[Any]:
+    """Every ``DepartmentState`` (watched entities, charter, goals, head),
+    or ``[]`` when the departments store is unavailable. Never raises."""
+    try:
+        from openexecutive.departments.store import list_departments
+
+        return list(list_departments(db_path))
+    except Exception:
+        logger.exception("watch_policy: list_departments failed")
+        return []
+
+
 def recent_decisions(
     now: datetime | None = None, *, db_path: Path | None = None,
 ) -> list[Any]:
@@ -371,7 +391,9 @@ def recent_decisions(
     out: list[Any] = []
     for row in rows:
         ts = _parse(str(getattr(row, "timestamp", "") or ""))
-        if ts is not None and ts < cutoff:
+        # A row whose timestamp cannot be read must not count as "recent"
+        # forever; it is simply not recent.
+        if ts is None or ts < cutoff:
             continue
         out.append(row)
     return out
@@ -468,8 +490,10 @@ def match_vocab(entity: str, vocabulary: dict[str, Any]) -> tuple[str, VocabEntr
 
 
 def named_in_decision(entity_term: str, decision: Any) -> bool:
-    """Does a recent episodic decision name this entity? Whole-term
-    containment, or a distinctive token of the term as a whole word."""
+    """Does a recent episodic decision name this entity? The whole term as
+    a phrase, or EVERY distinctive token of the term as a whole word — so
+    "Acme Corp" is named by "Acme pricing review" (corp is a stopword) but
+    "Acme Security" is not named by "Review the security policy"."""
     text = _norm(str(getattr(decision, "summary", "") or ""))
     if not entity_term or not text:
         return False
@@ -478,7 +502,19 @@ def named_in_decision(entity_term: str, decision: Any) -> bool:
     entity_tokens = {
         t for t in entity_term.split() if len(t) >= _MIN_PARTIAL_TOKEN and t not in _STOPWORDS
     }
-    return bool(entity_tokens & set(text.split()))
+    return bool(entity_tokens) and entity_tokens <= set(text.split())
+
+
+def _decision_bonus(entity_term: str, ctx: PolicyContext) -> tuple[int, str, str]:
+    """``(points, reason, department hint)`` from the recent decisions: +1
+    when one names the entity; the department it was recorded for (when
+    the policy knows that department) is offered as a routing hint."""
+    for recent in ctx.recent_decisions:
+        if not named_in_decision(entity_term, recent):
+            continue
+        decided_for = str(getattr(recent, "department", "") or "")
+        return 1, "named in a recent decision", decided_for if decided_for in ctx.departments else ""
+    return 0, "", ""
 
 
 def entity_declined(entity: str, declines: list[Any]) -> bool:
@@ -648,18 +684,16 @@ def classify(
     else:
         reasons.append(f"entity '{proposal.grounding_entity}' is not in company data")
 
-    if entity_term:
-        for recent in ctx.recent_decisions:
-            if not named_in_decision(entity_term, recent):
-                continue
-            score += 1
-            reasons.append("named in a recent decision")
+    if grounded:
+        # Only a company-data entity earns the decision point; a bare watch
+        # label must not pick up a department from a decision.
+        bonus, why, hint = _decision_bonus(entity_term, ctx)
+        if bonus:
+            score += bonus
+            reasons.append(why)
             # A decision made for a department is a routing hint when the
             # term itself has none.
-            decided_for = str(getattr(recent, "department", "") or "")
-            if not department and decided_for in ctx.departments:
-                department = decided_for
-            break
+            department = department or hint
 
     own_source = bool(entity_term) and _is_own_source(proposal, entity_term, ctx.vocabulary)
     if own_source:
@@ -1132,10 +1166,11 @@ def _auto_disable(now: datetime, db_path: Path | None) -> int:
 
 
 def _nudge_if_piled_up(now: datetime, db_path: Path | None) -> int:
-    # Department-routed suggestions were put in front of their head when
-    # they were filed; the pile-up nudge is for the principal's own.
+    # Suggestions routed to a department HEAD were put in front of that head
+    # when they were filed; everything else (the principal's own, and rows
+    # for a department without a head) is the principal's pile.
     pending = [
-        i for i in ms.list_pending_suggestions(db_path=db_path) if not i.route_to_department
+        i for i in ms.list_pending_suggestions(db_path=db_path) if i.route_to_person_id is None
     ]
     if len(pending) < _NUDGE_MIN_PENDING:
         return 0
@@ -1206,6 +1241,7 @@ __all__ = [
     "department_refs",
     "entity_declined",
     "grounding_vocabulary",
+    "load_departments",
     "match_entity",
     "match_vocab",
     "named_in_decision",

@@ -185,10 +185,12 @@ def propose_via_alert(
 
     ``external_id_suffix`` turns the card into a recurring one: an open
     (unread) card with the same dedup key is refreshed in place with the new
-    body instead of a second row being inserted, and once the person has
-    acted on it a fresh card is minted only when the suffix changes (callers
-    pass e.g. the ISO week). Without a suffix the proposal is one-shot and a
-    repeat with the same summary is suppressed for good.
+    body — whatever its suffix, so one situation never has two open cards —
+    and once the person has acted on it a fresh card is minted only when
+    the suffix changes (callers pass e.g. the ISO week). Without a suffix
+    the proposal is one-shot and a repeat with the same summary is
+    suppressed for good. Coalescing keeps the open card's routing: a head
+    change re-routes it only once the current card has been handled.
     """
     from openexecutive.alerts.store import coalesce_alert, insert_alert
 

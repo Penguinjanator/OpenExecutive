@@ -717,8 +717,16 @@ def test_department_vocabulary_kinds_and_department_merge() -> None:
     assert vocab["expense card programs"] == wp.VocabEntry(wp.KIND_DEPARTMENT_SCOPE, "finance")
     assert vocab["close the books in 5 days"].kind == wp.KIND_DEPARTMENT_SCOPE
     # A profile competitor that Finance also lists keeps the stronger kind
-    # and still routes to Finance.
+    # and still routes to Finance; so does a profile vendor (profile kinds
+    # outrank department kinds, so the vendor history keeps applying).
     assert vocab["acme corp"] == wp.VocabEntry(wp.KIND_COMPETITOR, "finance")
+    stripe_vocab = wp.grounding_vocabulary(_profile(), [], [], [_department("finance", "Finance", watched=["Stripe"])])
+    assert stripe_vocab["stripe"] == wp.VocabEntry(wp.KIND_VENDOR, "finance")
+    # Two departments: the one supplying the winning kind owns the term.
+    eng = _department("eng", "Engineering", scope=["Acme Migration"])
+    fin = _department("finance", "Finance", watched=["Acme Migration"])
+    both = wp.grounding_vocabulary(None, [], [], [eng, fin])
+    assert both["acme migration"] == wp.VocabEntry(wp.KIND_DEPARTMENT_ENTITY, "finance")
     # Legacy plain-kind dicts still match.
     assert wp.match_entity("Brex Inc", vocab) == ("brex", wp.KIND_DEPARTMENT_ENTITY)
     assert wp.match_entity("Brex", {"brex": wp.KIND_VENDOR}) == ("brex", wp.KIND_VENDOR)
@@ -778,7 +786,21 @@ def test_recent_decision_adds_a_point_and_a_routing_hint() -> None:
     unrelated = SimpleNamespace(summary="Hire two SDRs in Q4", department="finance", timestamp="")
     assert wp.classify(p, f, _dept_ctx(recent_decisions=[unrelated])).score == base.score
     assert wp.named_in_decision("acme corp", SimpleNamespace(summary="Acme Corp pricing review"))
+    assert wp.named_in_decision("acme corp", SimpleNamespace(summary="Acme pricing review"))
     assert not wp.named_in_decision("acme corp", SimpleNamespace(summary="The corp retreat"))
+    # Every distinctive token must appear: a common word shared with the
+    # term is not a mention, and a watch label never earns the point.
+    assert not wp.named_in_decision("acme security", SimpleNamespace(summary="Review the security policy"))
+    hijack = SimpleNamespace(summary="Adopt the new pricing policy", department="finance", timestamp="")
+    label_only = _proposal(slug="rss-hubs", signal_type="rss", target="https://hubspot.com/feed",
+                           grounding_entity="HubSpot pricing")
+    ctx = _dept_ctx(existing=[SimpleNamespace(
+        slug="stock-hubs", signal_type="stock", target="HUBS", enabled=True,
+        config_json={"display_name": "HubSpot pricing"},
+    )], recent_decisions=[hijack])
+    labelled = wp.classify(label_only, _finding(), ctx)
+    assert labelled.grounding_kind == wp.KIND_WATCH and labelled.department == ""
+    assert "named in a recent decision" not in labelled.reasons
 
 
 def test_recent_decisions_apply_the_lookback(db: Path) -> None:
@@ -793,6 +815,10 @@ def test_recent_decisions_apply_the_lookback(db: Path) -> None:
                      ((datetime.now(UTC) - timedelta(days=120)).isoformat(),))
     rows = wp.recent_decisions(db_path=db)
     assert [r.summary for r in rows] == ["Evaluate Brex for expense cards"]
+    # An unreadable timestamp is not "recent forever".
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE decisions SET timestamp = 'garbage'")
+    assert wp.recent_decisions(db_path=db) == []
 
 
 def test_department_head_gets_one_card_per_run_coalesced_weekly(db: Path) -> None:
@@ -843,15 +869,25 @@ def test_department_card_falls_back_to_the_principal(db: Path) -> None:
     assert row is not None and row.route_to_department == "finance" and row.route_to_person_id is None
 
 
-def test_nudge_counts_only_the_principals_suggestions(db: Path) -> None:
+def test_nudge_counts_only_suggestions_no_head_received(db: Path) -> None:
     from openexecutive.alerts.store import list_alerts
 
     for i in range(3):
         ms.insert_watchlist_item(
             slug=f"rss-d{i}", signal_type="rss", target=f"https://d{i}.com/feed",
             mode=MODE_DRY_RUN, origin=ORIGIN_RESEARCH_PROPOSED, route_to_department="finance",
-            db_path=db,
+            route_to_person_id=7, db_path=db,
         )
         _backdate(db, f"rss-d{i}", 8)
     assert wp.sweep(datetime.now(UTC), db_path=db)["nudged"] == 0
     assert not [a for a in list_alerts(limit=10, db_path=db) if a.source == wp.NUDGE_ALERT_SOURCE]
+    # A department without a head is still the principal's pile: those rows
+    # count, so they can never become invisible.
+    for i in range(3):
+        ms.insert_watchlist_item(
+            slug=f"rss-n{i}", signal_type="rss", target=f"https://n{i}.com/feed",
+            mode=MODE_DRY_RUN, origin=ORIGIN_RESEARCH_PROPOSED, route_to_department="ops",
+            db_path=db,
+        )
+        _backdate(db, f"rss-n{i}", 8)
+    assert wp.sweep(datetime.now(UTC), db_path=db)["nudged"] == 1

@@ -101,7 +101,15 @@ def test_state_hash_moves_only_for_decisions_that_name_known_entities(
     after = research_scheduler.compute_research_state_hash(db_path=db)
     assert after != before
     store_decision("finance", "Move Stripe to annual billing", db_path=db)
-    assert research_scheduler.compute_research_state_hash(db_path=db) not in (before, after)
+    third = research_scheduler.compute_research_state_hash(db_path=db)
+    assert third not in (before, after)
+    # An initiative title is vocabulary too.
+    from openexecutive.memory.episodic import store_initiative
+
+    store_initiative("Project Halo", "active", db_path=db)
+    with_initiative = research_scheduler.compute_research_state_hash(db_path=db)
+    store_decision("ops", "Pause the Project Halo rollout", db_path=db)
+    assert research_scheduler.compute_research_state_hash(db_path=db) != with_initiative
 
 
 def test_state_hash_changes_when_initiative_added(db: Path) -> None:

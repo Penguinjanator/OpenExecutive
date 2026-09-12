@@ -406,15 +406,12 @@ class ExecutiveResearchWorkflow(Workflow):
         # Departments (watched entities, scope, goals) and recent decisions
         # are current company intent the static profile lacks; both feed
         # the watch policy's grounding and routing.
-        try:
-            from openexecutive.departments.store import list_departments
+        from openexecutive.monitoring.research.watch_policy import (
+            load_departments,
+            recent_decisions,
+        )
 
-            departments = list(list_departments())
-        except Exception:
-            logger.exception("research: list_departments failed")
-            departments = []
-        from openexecutive.monitoring.research.watch_policy import recent_decisions
-
+        departments = load_departments()
         decisions = recent_decisions()
 
         research_context = _render_research_context(

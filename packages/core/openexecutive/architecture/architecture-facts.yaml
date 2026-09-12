@@ -1388,17 +1388,25 @@ external_monitoring:
       match a company-data term for a direct add. Every vocabulary value is
       a VocabEntry(kind, department): terms that came from a department carry
       its slug, and a profile term a department also lists keeps the profile
-      kind but gains the department (stronger kind wins, department is kept).
+      kind but gains the department (stronger kind wins, department is kept;
+      between two departments the one supplying the winning kind owns it).
     - vocabulary precedence when a term appears in several sources:
-      company > competitor > department_entity > vendor > ticker > initiative
-      > priority > department_scope > watch.
+      company > competitor > vendor > ticker > department_entity > initiative
+      > priority > department_scope > watch. Profile kinds outrank department
+      kinds so the policy's (signal_type, kind) history keeps applying.
       Partial (token) matching ignores stopwords and tokens < 4 chars.
     - episodic decisions: the run loads the 10 most recent `decisions` rows
-      from the last 90 days (watch_policy.recent_decisions); a proposal whose
-      matched entity is named in one scores +1 ("named in a recent
-      decision"), and when the term has no department but the decision was
-      recorded for one, that department becomes the routing hint. Decisions
-      are rendered to every specialist as RECENT DECISIONS (user turn).
+      from the last 90 days (watch_policy.recent_decisions; an unreadable
+      timestamp means not recent); a proposal whose matched COMPANY-DATA
+      entity (never a bare watch label) is named in one scores +1 ("named in
+      a recent decision"), and when the term has no department but the
+      decision was recorded for one, that department becomes the routing
+      hint. "Named" = the whole term as a phrase, or EVERY distinctive token
+      of the term as a whole word — a common word shared with the term is
+      not a mention. Decisions are rendered to every specialist as RECENT
+      DECISIONS (user turn) whether or not they match; only matching ones
+      move the research fingerprint (a decision that names nothing the
+      policy knows cannot change what it would do).
     - score ledger: +2 entity in company data (mandatory), +1 entity already
       watched under another source, +1 target is the entity's own source (for
       stock/edgar the grounding entity IS the ticker / a URL whose SITE LABEL —
@@ -1452,9 +1460,13 @@ external_monitoring:
       watchlist). propose_via_alert's new `external_id_suffix` (the ISO week)
       makes the card recurring: an open card is refreshed in place
       (coalesce_alert), an acknowledged one is not re-minted until the next
-      week. The principal's pile-up nudge counts only suggestions with no
-      route_to_department. /watchlist shows "for: <department>" on routed
-      suggestion and research cards. Approve/decline stay identity-free.
+      week; an open card is refreshed whatever the week, so one department
+      never has two open cards. The principal's pile-up nudge counts only
+      suggestions that reached no head (route_to_person_id NULL — the
+      principal's own, and rows for a department without a head), so a
+      suggestion can never become invisible. /watchlist shows
+      "for: <department>" on routed suggestion and research cards.
+      Approve/decline stay identity-free.
     - declines (`watchlist_declines`, keyed by normalized target — https
       forced, www. dropped, host/path lower-cased, query/fragment/trailing
       slash removed): explicit (Decline button, "Stop watching…",
@@ -1494,9 +1506,11 @@ external_monitoring:
       approving / declining a suggestion never triggers a fresh research run.
       It also hashes each department's watched_entities / charter scope /
       goal key results, and the recent decisions whose summary names a
-      vocabulary term (only those: the chat extractor writes decisions
-      freely, and one naming nothing the policy knows cannot change what
-      the policy would do).
+      vocabulary term — the same vocabulary the policy grounds with
+      (profile + initiatives + departments; watch labels never ground) —
+      only those: the chat extractor writes decisions freely, and one
+      naming nothing the policy knows cannot change what the policy would
+      do. A matching decision ageing past 90 days moves the hash once.
     - surfaces: /watchlist "Suggested by the Executive" (Approve / Decline…
       with reason), "Added by the Executive · rationale" on research cards
       with "Stop watching…", the morning brief's HANDLED block (watching /
