@@ -341,6 +341,34 @@ def test_response_reports_search_count_and_skips_server_tool_calls() -> None:
     })
     assert msg.usage.server_tool_use.web_search_requests == 3
     assert [b.name for b in msg.content if b.type == "tool_use"] == ["emit_research_findings"]
+    assert msg.stop_reason == "tool_use"  # a client tool call remains
+
+    # Only server-side calls: nothing is left for the caller to run, so the
+    # turn is complete — not "tool_use" with no tool blocks (that would make
+    # the Executive loop append an empty tool-result turn and spin).
+    only_server = from_openai_response({
+        "id": "x", "model": "m",
+        "choices": [{"finish_reason": "tool_calls", "message": {
+            "role": "assistant", "content": "searched and answered",
+            "tool_calls": [{"id": "s1", "type": "openrouter:web_search",
+                            "function": {"name": "web_search", "arguments": "{}"}}],
+        }}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "web_search_requests": 1},
+    })
+    assert only_server.stop_reason == "end_turn"
+    assert [b.type for b in only_server.content] == ["text"]
+
+    # An ordinary function call without a `type` field (quirky backends)
+    # is still a client tool call.
+    untyped = from_openai_response({
+        "id": "x", "model": "m",
+        "choices": [{"finish_reason": "tool_calls", "message": {
+            "role": "assistant", "content": None,
+            "tool_calls": [{"id": "c9", "function": {"name": "emit", "arguments": "{}"}}],
+        }}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    })
+    assert [b.name for b in untyped.content if b.type == "tool_use"] == ["emit"]
     # Absent → 0, never missing (audit usage reads it on every row).
     plain = from_openai_response({
         "id": "y", "model": "m",
@@ -1032,3 +1060,35 @@ def test_stream_accumulator_reports_search_count() -> None:
               "usage": {"prompt_tokens": 5, "completion_tokens": 1, "web_search_requests": 2}})
     msg = acc.finalize()
     assert msg.usage.server_tool_use.web_search_requests == 2
+
+
+def test_stream_accumulator_drops_server_tool_call_continuation_chunks() -> None:
+    """A server-side call is typed only on its first delta; the argument
+    chunks that follow carry just index + arguments and must be dropped with
+    it, or a phantom tool_use with an empty id and name would be emitted."""
+    acc = StreamAccumulator()
+    acc.feed({"id": "s", "model": "m", "choices": [{"delta": {"tool_calls": [
+        {"index": 0, "id": "srv_1", "type": "openrouter:web_search",
+         "function": {"name": "web_search", "arguments": ""}}]}, "finish_reason": None}]})
+    acc.feed({"id": "s", "model": "m", "choices": [{"delta": {"tool_calls": [
+        {"index": 0, "function": {"arguments": "{\"query\": \"acme layoffs\"}"}}]}, "finish_reason": None}]})
+    acc.feed({"id": "s", "model": "m", "choices": [{"delta": {"tool_calls": [
+        {"index": 1, "id": "c1", "type": "function",
+         "function": {"name": "consult_specialist", "arguments": "{\"q\": 1}"}}]}, "finish_reason": None}]})
+    acc.feed({"id": "s", "model": "m", "choices": [{"delta": {"content": "Acme cut staff."},
+                                                    "finish_reason": "tool_calls"}]})
+    msg = acc.finalize()
+    tool_uses = [b for b in msg.content if b.type == "tool_use"]
+    assert [(b.id, b.name) for b in tool_uses] == [("c1", "consult_specialist")]
+    assert msg.stop_reason == "tool_use"
+
+    # Only a server-side call in the stream: the turn is complete.
+    acc2 = StreamAccumulator()
+    acc2.feed({"id": "s", "model": "m", "choices": [{"delta": {"tool_calls": [
+        {"index": 0, "id": "srv_1", "type": "openrouter:web_search",
+         "function": {"name": "web_search", "arguments": ""}}]}, "finish_reason": None}]})
+    acc2.feed({"id": "s", "model": "m", "choices": [{"delta": {"tool_calls": [
+        {"index": 0, "function": {"arguments": "{}"}}]}, "finish_reason": None}]})
+    acc2.feed({"id": "s", "model": "m", "choices": [{"delta": {"content": "done"}, "finish_reason": "tool_calls"}]})
+    final = acc2.finalize()
+    assert [b.type for b in final.content] == ["text"] and final.stop_reason == "end_turn"

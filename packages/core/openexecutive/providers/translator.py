@@ -303,6 +303,15 @@ _WEB_SEARCH_TOOL_PREFIX = "web_search_"
 # everything else Exa. See
 # https://openrouter.ai/docs/guides/features/server-tools/web-search.
 _OPENROUTER_WEB_SEARCH_TYPE = "openrouter:web_search"
+# Tool-call ``type`` prefix of OpenRouter's server-side tools in a response.
+# Those calls were executed upstream; they are never surfaced as tool_use
+# blocks for the caller to run.
+_OPENROUTER_SERVER_TOOL_PREFIX = "openrouter:"
+
+
+def _is_server_tool_call(call: dict[str, Any]) -> bool:
+    call_type = call.get("type")
+    return isinstance(call_type, str) and call_type.startswith(_OPENROUTER_SERVER_TOOL_PREFIX)
 
 
 def _web_search_server_tool(tools: Any) -> dict[str, Any] | None:
@@ -619,10 +628,13 @@ def from_openai_response(body: dict[str, Any]) -> SimpleNamespace:
     if isinstance(text, str) and text:
         content_blocks.append(_block("text", text=_strip_cite_markup(text)))
 
+    skipped_server_calls = 0
     for call in msg.get("tool_calls") or []:
-        if call.get("type") not in (None, "function"):
-            # A server-side tool call (OpenRouter executed it already) is not
-            # for the caller to run.
+        if _is_server_tool_call(call):
+            # OpenRouter executed it already (web search); not for the
+            # caller to run.
+            skipped_server_calls += 1
+            logger.debug("openrouter: skipping server-side tool call %r", call.get("type"))
             continue
         fn = call.get("function") or {}
         raw_args = fn.get("arguments") or "{}"
@@ -635,6 +647,11 @@ def from_openai_response(body: dict[str, Any]) -> SimpleNamespace:
                 input=_strip_cite_in_value(parsed),
             )
         )
+    stop_reason = _stop_reason_from_openai(choice.get("finish_reason"))
+    if skipped_server_calls and not any(b.type == "tool_use" for b in content_blocks):
+        # Every tool call was server-side: nothing is left for the caller
+        # to run, so the turn is complete, not waiting on tool results.
+        stop_reason = "end_turn"
 
     # Reasoning LAST. Several callers read ``content[0].text`` (the SDK
     # itself only ever emits text first for those prompts), so the synthetic
@@ -652,7 +669,7 @@ def from_openai_response(body: dict[str, Any]) -> SimpleNamespace:
         role="assistant",
         model=body.get("model", ""),
         content=content_blocks,
-        stop_reason=_stop_reason_from_openai(choice.get("finish_reason")),
+        stop_reason=stop_reason,
         stop_sequence=None,
         usage=SimpleNamespace(
             input_tokens=usage.get("prompt_tokens", 0),
@@ -737,6 +754,10 @@ class StreamAccumulator:
         self._cite_pending = ""
         # tool_calls[idx] = {"id": ..., "name": ..., "arg_chunks": [..]}
         self._tool_calls: dict[int, dict[str, Any]] = {}
+        # Indices of server-side tool calls (typed only on their first
+        # delta); their continuation chunks carry only index + arguments
+        # and must be dropped too.
+        self._server_tool_indices: set[int] = set()
         # OpenRouter streams ``delta.reasoning_details`` chunks; collected
         # verbatim and re-emitted as one block at finalize().
         self._reasoning_details: list[Any] = []
@@ -796,9 +817,13 @@ class StreamAccumulator:
             self._reasoning_details.extend(details)
 
         for tc in delta.get("tool_calls") or []:
-            if tc.get("type") not in (None, "function"):
-                continue  # server-side tool call, already executed upstream
             idx = tc.get("index", 0)
+            if _is_server_tool_call(tc):
+                self._server_tool_indices.add(idx)
+                logger.debug("openrouter: skipping server-side tool call %r", tc.get("type"))
+                continue
+            if idx in self._server_tool_indices:
+                continue  # continuation chunk of a server-side call
             slot = self._tool_calls.setdefault(
                 idx, {"id": "", "name": "", "arg_chunks": []}
             )
@@ -864,7 +889,11 @@ class StreamAccumulator:
             role="assistant",
             model=self._model,
             content=content_blocks,
-            stop_reason=_stop_reason_from_openai(self._finish_reason),
+            stop_reason=(
+                "end_turn"
+                if self._server_tool_indices and not self._tool_calls
+                else _stop_reason_from_openai(self._finish_reason)
+            ),
             stop_sequence=None,
             usage=SimpleNamespace(
                 input_tokens=self._usage.get("prompt_tokens", 0),

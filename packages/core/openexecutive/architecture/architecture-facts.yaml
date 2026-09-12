@@ -132,10 +132,12 @@ caching:
     is preserved by replacing the Anthropic web_search server tool with
     OpenRouter's own ``openrouter:web_search`` server tool (see
     providers.translator_shapes), so a research specialist or the
-    Executive pinned to e.g. Gemini still searches, and with the SAME
-    contract as Anthropic-direct: the model decides when to search,
-    ``max_uses`` caps searches server-side (so RESEARCH_WEB_SEARCH_MAX_USES
-    and WEB_SEARCH_MAX_USES mean the same thing on both deployment types),
+    Executive pinned to e.g. Gemini still searches, with the same
+    per-request contract as Anthropic-direct: the model decides when to
+    search, ``max_uses`` caps searches server-side per request (so
+    RESEARCH_WEB_SEARCH_MAX_USES and WEB_SEARCH_MAX_USES mean the same
+    thing on both deployment types; on either path a multi-step chat turn
+    gets the cap afresh on each step),
     WEB_SEARCH_ALLOWED_DOMAINS / BLOCKED_DOMAINS map to allowed_domains /
     excluded_domains, and the response's ``usage.web_search_requests`` is
     surfaced as ``server_tool_use`` so the usage rows record searches on
@@ -225,8 +227,15 @@ providers:
     via OpenRouter, Claude or not — without this a call routed
     via OpenRouter would silently lose web search (the executive_research
     council emitted zero findings). Server-side tool calls in the response
-    (``tool_calls[].type != "function"``) are skipped, never surfaced as
-    tool_use blocks for the caller to run. OpenRouter search makes the model cite sources
+    (``tool_calls[].type`` starting with ``openrouter:``, including the
+    untyped continuation chunks of a streamed call) are skipped, never
+    surfaced as tool_use blocks for the caller to run; a response whose
+    only tool calls were server-side ends the turn (``end_turn``) rather
+    than waiting on tool results. Unlike the Anthropic path, which echoes
+    ``server_tool_use`` / ``web_search_tool_result`` blocks back into the
+    next step's history, the OpenRouter path carries only the model's own
+    text forward, so across a multi-step chat turn it may search again for
+    what it already found. OpenRouter search makes the model cite sources
     with inline ``<cite index="...">…</cite>`` markup; the response path
     strips those wrapper tags from both text and tool-call arguments so they
     don't leak into findings / chat replies. Streaming SSE chunks
