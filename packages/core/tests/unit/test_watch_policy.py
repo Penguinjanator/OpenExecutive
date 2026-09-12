@@ -584,8 +584,20 @@ def test_auto_disable_records_a_retryable_decline(db: Path) -> None:
     assert not ms.is_declined("https://noisy.com/feed", now=datetime.now(UTC) + timedelta(days=91), db_path=db)
 
 
-def test_source_url_stamp_only_keeps_public_http_urls() -> None:
+def test_source_url_stamp_only_keeps_public_http_urls(db: Path) -> None:
     f = _finding(relevant_urls=["javascript:alert(1)", "ftp://x/y", "https://www.acme.com/blog/pricing"])
-    out = wp.apply_proposals([_proposal()], [f], _ctx())  # no db: insert fails → rejected
-    assert out[0]["outcome"] == "rejected" and "see server log" in out[0]["result_preview"]
     assert wp._safe_source_url(f) == "https://www.acme.com/blog/pricing"
+    out = wp.apply_proposals([_proposal()], [f], _ctx(), db_path=db)
+    assert out[0]["outcome"] == "added"
+    row = ms.get_watchlist_item_by_slug("rss-acme-blog", db_path=db)
+    assert row is not None and row.config_json["_policy"]["source_url"] == "https://www.acme.com/blog/pricing"
+
+
+def test_insert_failure_is_reported_without_exception_text(db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(**kw: Any) -> int:
+        raise RuntimeError("sqlite3.OperationalError: /secret/path locked")
+
+    monkeypatch.setattr(ms, "insert_watchlist_item", boom)
+    out = wp.apply_proposals([_proposal()], [_finding()], _ctx(), db_path=db)
+    assert out[0]["outcome"] == "rejected" and "see server log" in out[0]["result_preview"]
+    assert "/secret/path" not in out[0]["result_preview"]
