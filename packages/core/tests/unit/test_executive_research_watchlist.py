@@ -284,6 +284,30 @@ def test_research_context_renders_recent_decisions() -> None:
     assert "RECENT DECISIONS" not in without
 
 
+def test_propose_watch_requires_a_finding_and_the_prompt_says_so() -> None:
+    from openexecutive.orchestrator.watchlist_tools import PROPOSE_WATCH_TOOL
+
+    assert "finding_index" in PROPOSE_WATCH_TOOL["input_schema"]["required"]
+    system = er._build_watchlist_system(2, 2)
+    assert "`finding_index` is REQUIRED" in system
+
+
+@pytest.mark.asyncio
+async def test_watchlist_pass_links_the_finding_when_the_model_omits_it(
+    db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call = _propose("rss-tesla-ir", "rss", "https://ir.tesla.com/press.xml", entity="Tesla")
+    del call[1]["finding_index"]
+    _stub_provider(monkeypatch, [_resp([call]), _resp([])])
+    out = await er._watchlist_analysis_loop(
+        [_finding(title="Tesla cut Model Y prices", url="https://ir.tesla.com/press-release/model-y")],
+        [], profile=_profile(), initiatives=[],
+    )
+    assert [c["outcome"] for c in out] == ["added"]
+    row = monitoring_store.get_watchlist_item_by_slug("rss-tesla-ir", db_path=db)
+    assert row is not None and row.mode == "active"
+
+
 @pytest.mark.asyncio
 async def test_watchlist_pass_routes_department_grounded_watch(
     db: Path, monkeypatch: pytest.MonkeyPatch,

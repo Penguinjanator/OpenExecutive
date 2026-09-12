@@ -913,3 +913,101 @@ def test_nudge_counts_only_suggestions_no_head_received(db: Path) -> None:
         )
         _backdate(db, f"rss-n{i}", 8)
     assert wp.sweep(datetime.now(UTC), db_path=db)["nudged"] == 1
+
+
+# --------------------------------------------------------------------- #
+# Profile entry parsing, short names, finding auto-link
+# --------------------------------------------------------------------- #
+
+
+def test_entity_names_parse_profile_entries() -> None:
+    assert wp.entity_names("Tesla (TSLA) — Model Y is the volume benchmark") == (["Tesla"], ["TSLA"])
+    assert wp.entity_names("GM / Chevrolet (Equinox EV, Blazer EV) — direct competitor") == (["GM", "Chevrolet"], [])
+    assert wp.entity_names("BYD — global cost leader; tariff-gated out of the US") == (["BYD"], [])
+    assert wp.entity_names("Hyundai / Kia (Ioniq 5, EV6, EV9) - strong value") == (["Hyundai", "Kia"], [])
+    assert wp.entity_names("Rivian (RIVN, 1211.HK)") == (["Rivian"], ["RIVN", "1211.HK"])
+    assert wp.entity_names("Stripe: payments") == (["Stripe"], [])
+    assert wp.entity_names("  ") == ([], [])
+
+
+def _descriptive_profile() -> CompanyProfile:
+    return CompanyProfile.model_validate({
+        "name": "Halcyon Motors",
+        "competitive_landscape": {"primary_competitors": [
+            "Tesla (TSLA) — Model Y is the volume benchmark and price-cut pace-setter",
+            "BYD — global cost leader; tariff-gated out of the US for now",
+            "GM / Chevrolet (Equinox EV, Blazer EV) — direct mainstream-price competitor",
+            "Hyundai / Kia (Ioniq 5, EV6, EV9) — strong value + charging speed",
+        ]},
+        "vendors": ["CATL — sole LFP cell source"],
+        "tickers": ["1211.HK"],
+    })
+
+
+def test_descriptive_profile_entries_ground_by_name_only() -> None:
+    vocab = wp.grounding_vocabulary(_descriptive_profile(), [], [])
+    assert vocab["tesla"].kind == wp.KIND_COMPETITOR and vocab["tsla"].kind == wp.KIND_TICKER
+    assert vocab["byd"].kind == wp.KIND_COMPETITOR and vocab["gm"].kind == wp.KIND_COMPETITOR
+    assert vocab["chevrolet"].kind == wp.KIND_COMPETITOR and vocab["kia"].kind == wp.KIND_COMPETITOR
+    assert vocab["catl"].kind == wp.KIND_VENDOR and vocab["1211 hk"].kind == wp.KIND_TICKER
+    # The description never becomes a term, so "Model Y" or "global" ground nothing.
+    assert wp.match_entity("Model Y", vocab) is None and wp.match_entity("global cost leader", vocab) is None
+    # Short names match as whole words, in longer forms too.
+    assert wp.match_entity("BYD", vocab) == ("byd", wp.KIND_COMPETITOR)
+    assert wp.match_entity("BYD Auto", vocab) == ("byd", wp.KIND_COMPETITOR)
+    assert wp.match_entity("GM", vocab) == ("gm", wp.KIND_COMPETITOR)
+    assert wp.match_entity("General Motors", vocab) is None  # a different name is not a match
+
+
+def test_short_names_get_own_source_and_finding_support() -> None:
+    profile = _descriptive_profile()
+    vocab = wp.grounding_vocabulary(profile, [], [])
+    ctx = wp.PolicyContext(vocabulary=vocab, priority_terms=[], existing=[])
+    f = _finding(title="BYD enters Mexico", summary="BYD launched the Seal in Mexico on 2026-09-05.",
+                 relevant_urls=["https://www.byd.com/news/mexico"], source_specialist="cso")
+    p = _proposal(slug="rss-byd", target="https://www.byd.com/news/feed", grounding_entity="BYD")
+    d = wp.classify(p, f, ctx)
+    assert d.tier == wp.TIER_DIRECT and "target is the entity's own source" in d.reasons
+    # A dotted ticker: own source when grounded as the ticker, and named in
+    # text as a phrase.
+    f2 = _finding(title="BYD (1211.HK) slides", summary="1211.HK fell 6% on 2026-09-05.", relevant_urls=[])
+    stock = _proposal(slug="stock-byd", signal_type="stock", target="1211.HK", grounding_entity="1211.HK")
+    d2 = wp.classify(stock, f2, ctx)
+    assert d2.tier == wp.TIER_DIRECT and d2.grounding_kind == wp.KIND_TICKER
+    # Grounded as the competitor name instead, the ticker is not its own
+    # source, so it is a suggestion.
+    assert wp.classify(_proposal(slug="stock-byd2", signal_type="stock", target="1211.HK",
+                                 grounding_entity="BYD"), f2, ctx).tier == wp.TIER_SUGGEST
+    decided = SimpleNamespace(summary="Benchmark C1 pricing against BYD monthly", department="", timestamp="")
+    assert wp.named_in_decision("byd", decided, vocab)
+    # A short name inside a longer term needs the vocabulary to count.
+    two_word = SimpleNamespace(summary="Benchmark against BYD Auto monthly", department="", timestamp="")
+    assert wp.named_in_decision("byd auto", two_word, vocab)
+    # Every distinctive word must appear: "BYD Auto" is not named by "BYD pricing".
+    assert not wp.named_in_decision("byd auto", SimpleNamespace(summary="Watch BYD pricing"), vocab)
+    assert wp.entity_declined("BYD Auto", [SimpleNamespace(reason="not_relevant", entity="BYD")])
+    assert not wp.entity_declined("Rivian", [SimpleNamespace(reason="not_relevant", entity="BYD")])
+
+
+def test_proposal_without_finding_index_is_linked_to_the_citing_finding(db: Path) -> None:
+    findings = [
+        _finding(title="Unrelated", summary="Globex raised prices.", relevant_urls=["https://globex.com/blog"]),
+        _finding(title="Acme cut prices", summary="Acme Corp cut list prices 20%.",
+                 relevant_urls=["https://www.acme.com/blog/pricing"]),
+        _finding(title="ACME slides", summary="ACME fell 8% on 2026-09-01.", relevant_urls=[]),
+    ]
+    ctx = _ctx()
+    unlinked = _proposal(finding_index=None)
+    assert wp.auto_link_finding(unlinked, findings, ctx) == 1
+    stock = _proposal(slug="stock-acme", signal_type="stock", target="ACME", grounding_entity="ACME",
+                      finding_index=None)
+    assert wp.auto_link_finding(stock, findings, ctx) == 1  # names the entity first
+    nowhere = _proposal(slug="rss-else", target="https://elsewhere.com/feed", grounding_entity="Acme Corp",
+                        finding_index=None)
+    assert wp.auto_link_finding(nowhere, findings, ctx) is None
+    out = wp.apply_proposals([unlinked, nowhere], findings, ctx, db_path=db)
+    assert [o["outcome"] for o in out] == ["added", "rejected"]
+    row = ms.get_watchlist_item_by_slug("rss-acme-blog", db_path=db)
+    assert row is not None
+    assert wp.policy_stamp_of(row)["reasons"][0] == "linked to finding #2 by its cited source"
+    assert wp.policy_stamp_of(row)["specialist"] == "cso"

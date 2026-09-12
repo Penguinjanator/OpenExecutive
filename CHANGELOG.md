@@ -28,6 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   department watch interests and the decisions that name a known entity, so
   a new watched entity or a relevant decision triggers the next scan.
   `/watchlist` shows "for: <department>" on routed rows.
+- **Watch proposals are linked to their evidence, and profile entries ground
+  by name.** `propose_watch` now requires `finding_index`, and when the model
+  omits it the policy links the finding that cites the source itself instead
+  of rejecting the proposal for lack of evidence. Profile competitor / vendor
+  / ticker entries and department watched entities are parsed to their names
+  ("Tesla (TSLA) — Model Y…" grounds as Tesla plus the ticker TSLA; "GM /
+  Chevrolet (…)" as both), so short names such as BYD, GM or Kia match and
+  the description text can no longer stand in for the entity.
 - **Research watchlist policy — grounded watches go straight in, uncertain
   ones become suggestions.** The research council's watchlist pass no longer
   adds watches itself; its only tool is `propose_watch`, and deterministic

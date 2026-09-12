@@ -171,7 +171,7 @@ def compute_research_state_hash(db_path: Path | None = None) -> str:
         return [
             f"{getattr(decision, 'id', '')}::{str(getattr(decision, 'summary', '') or '')[:120]}"
             for decision in watch_policy.recent_decisions(db_path=db_path)
-            if any(watch_policy.named_in_decision(term, decision) for term in vocabulary)
+            if any(watch_policy.named_in_decision(term, decision, vocabulary) for term in vocabulary)
         ]
 
     _append_part(parts, "DECISIONS", _matching_decisions)

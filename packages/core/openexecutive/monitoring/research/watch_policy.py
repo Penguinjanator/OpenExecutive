@@ -292,6 +292,38 @@ def _norm(term: str) -> str:
     return " ".join(_TOKEN_RE.findall((term or "").lower()))
 
 
+# A profile list entry is often "Name (TICKER) — free-text description" or
+# "Name A / Name B (products…)". Only the NAME grounds; the description is a
+# bag of common words that would both hide the name (short names such as BYD
+# never match inside a sentence) and poison own-source checks ("global" in
+# "BYD — global cost leader" would make global.com BYD's own site).
+_ENTRY_SPLIT_RE = re.compile(r"\s+[—–-]\s+|[:;]")
+_PAREN_RE = re.compile(r"\(([^)]*)\)")
+_TICKER_RE = re.compile(r"^(?:[A-Z]{1,5}(?:\.[A-Z]{1,3})?|\d{3,6}\.[A-Z]{2,3})$")
+
+
+def entity_names(raw: str) -> tuple[list[str], list[str]]:
+    """``(names, tickers)`` parsed from one profile / department entry.
+
+    "Tesla (TSLA) — Model Y is the benchmark" → (["Tesla"], ["TSLA"]);
+    "GM / Chevrolet (Equinox EV, Blazer EV) — direct competitor" →
+    (["GM", "Chevrolet"], []); "Stripe" → (["Stripe"], [])."""
+    text = str(raw or "").strip()
+    if not text:
+        return [], []
+    head = _ENTRY_SPLIT_RE.split(text, maxsplit=1)[0]
+    tickers: list[str] = []
+    for group in _PAREN_RE.findall(head):
+        for part in re.split(r"[,/]", group):
+            candidate = part.strip()
+            if _TICKER_RE.match(candidate) and candidate not in tickers:
+                tickers.append(candidate)
+    bare = _PAREN_RE.sub(" ", head)
+    names = [n.strip(" ,") for n in re.split(r"\s*/\s*", bare)]
+    names = [n for n in names if len(_norm(n)) >= 2]
+    return names, tickers
+
+
 def grounding_vocabulary(
     profile: Any,
     initiatives: list[Any],
@@ -338,23 +370,32 @@ def grounding_vocabulary(
         add(item.slug.replace("-", " "), KIND_WATCH)
     for i in initiatives:
         add(str(getattr(i, "title", "") or ""), KIND_INITIATIVE)
+    def add_entity(raw: str, kind: str, department: str = "") -> None:
+        # Named-entity lists: only the parsed name(s) ground; a parenthesised
+        # ticker is a ticker term of its own.
+        names, tickers = entity_names(raw)
+        for name in names:
+            add(name, kind, department)
+        for ticker in tickers:
+            add(ticker, KIND_TICKER, department)
+
     if profile is not None:
         for p in list(getattr(getattr(profile, "strategic_priorities", None), "current_year", []) or []):
             add(str(p), KIND_PRIORITY)
         for t in list(getattr(profile, "tickers", []) or []):
-            add(str(t), KIND_TICKER)
+            add_entity(str(t), KIND_TICKER)
         for v in list(getattr(profile, "vendors", []) or []):
-            add(str(v), KIND_VENDOR)
+            add_entity(str(v), KIND_VENDOR)
         for c in list(getattr(getattr(profile, "competitive_landscape", None), "primary_competitors", []) or []):
-            add(str(c), KIND_COMPETITOR)
-        add(str(getattr(profile, "name", "") or ""), KIND_COMPANY)
+            add_entity(str(c), KIND_COMPETITOR)
+        add_entity(str(getattr(profile, "name", "") or ""), KIND_COMPANY)
     for state in departments or []:
         config = getattr(state, "config", None)
         slug = str(getattr(config, "slug", "") or "")
         if not slug:
             continue
         for entity in list(getattr(config, "watched_entities", []) or []):
-            add(str(entity), KIND_DEPARTMENT_ENTITY, slug)
+            add_entity(str(entity), KIND_DEPARTMENT_ENTITY, slug)
         charter = getattr(config, "charter", None)
         for phrase in list(getattr(charter, "scope", []) or []):
             add(str(phrase), KIND_DEPARTMENT_SCOPE, slug)
@@ -426,15 +467,20 @@ def priority_terms(profile: Any) -> list[str]:
     return out[:6]
 
 
-def _distinctive_tokens(text: str, vocabulary: dict[str, Any] | None = None) -> set[str]:
-    """Tokens that may carry a partial match: not stopwords, and either long
-    enough or a whole vocabulary term in their own right (short names such
-    as IBM, AWS, SAP)."""
+def _name_tokens(text: str, vocabulary: dict[str, Any] | None = None) -> list[str]:
+    """Ordered tokens that may carry a partial match: not stopwords, and
+    either long enough or a whole vocabulary term in their own right (short
+    names such as IBM, AWS, BYD, GM)."""
     vocab = vocabulary or {}
-    return {
+    return [
         t for t in text.split()
         if t not in _STOPWORDS and (len(t) >= _MIN_PARTIAL_TOKEN or t in vocab)
-    }
+    ]
+
+
+def _distinctive_tokens(text: str, vocabulary: dict[str, Any] | None = None) -> set[str]:
+    """Set form of :func:`_name_tokens`."""
+    return set(_name_tokens(text, vocabulary))
 
 
 def _entry(value: Any) -> VocabEntry:
@@ -490,7 +536,9 @@ def match_vocab(entity: str, vocabulary: dict[str, Any]) -> tuple[str, VocabEntr
     return best
 
 
-def named_in_decision(entity_term: str, decision: Any) -> bool:
+def named_in_decision(
+    entity_term: str, decision: Any, vocabulary: dict[str, Any] | None = None,
+) -> bool:
     """Does a recent episodic decision name this entity? The whole term as
     a phrase, or EVERY distinctive token of the term as a whole word — so
     "Acme Corp" is named by "Acme pricing review" (corp is a stopword) but
@@ -500,9 +548,7 @@ def named_in_decision(entity_term: str, decision: Any) -> bool:
         return False
     if f" {entity_term} " in f" {text} ":
         return True
-    entity_tokens = {
-        t for t in entity_term.split() if len(t) >= _MIN_PARTIAL_TOKEN and t not in _STOPWORDS
-    }
+    entity_tokens = _distinctive_tokens(entity_term, vocabulary)
     return bool(entity_tokens) and entity_tokens <= set(text.split())
 
 
@@ -511,7 +557,7 @@ def _decision_bonus(entity_term: str, ctx: PolicyContext) -> tuple[int, str, str
     when one names the entity; the department it was recorded for (when
     the policy knows that department) is offered as a routing hint."""
     for recent in ctx.recent_decisions:
-        if not named_in_decision(entity_term, recent):
+        if not named_in_decision(entity_term, recent, ctx.vocabulary):
             continue
         decided_for = str(getattr(recent, "department", "") or "")
         return 1, "named in a recent decision", decided_for if decided_for in ctx.departments else ""
@@ -531,7 +577,10 @@ def entity_declined(entity: str, declines: list[Any]) -> bool:
         dn = _norm(str(getattr(d, "entity", "") or ""))
         if len(dn) < 2:
             continue
-        if dn == n:
+        # Exact, or a one-word declined name ("BYD") as a whole word of the
+        # entity ("BYD Auto") and vice versa — short names have no
+        # distinctive tokens, so the token rule below cannot see them.
+        if dn == n or (" " not in dn and dn in n.split()) or (" " not in n and n in dn.split()):
             return True
         d_tokens = {t for t in dn.split() if t not in _STOPWORDS and len(t) >= _MIN_PARTIAL_TOKEN}
         if tokens and d_tokens and (d_tokens <= tokens or tokens <= d_tokens):
@@ -565,9 +614,7 @@ def _is_own_source(proposal: WatchProposal, entity_term: str, vocabulary: dict[s
     # "Acme Payments" is not payments.io. Entities are free text
     # (departments type them), so a generic trailing word must never hand
     # an unrelated domain "own source" credit.
-    entity_tokens = [
-        t for t in entity_term.split() if len(t) >= _MIN_PARTIAL_TOKEN and t not in _STOPWORDS
-    ]
+    entity_tokens = _name_tokens(entity_term, vocabulary)
     if not entity_tokens:
         return False
     return _site_label(host) in {entity_tokens[0], "".join(entity_tokens)}
@@ -591,19 +638,25 @@ def _site_label(host: str) -> str:
     return labels[-2]
 
 
-def _finding_supports(proposal: WatchProposal, finding: ResearchFinding, entity_term: str) -> bool:
+def _finding_supports(
+    proposal: WatchProposal,
+    finding: ResearchFinding,
+    entity_term: str,
+    vocabulary: dict[str, Any] | None = None,
+) -> bool:
     """Does the cited finding actually concern this target? A URL target
     must share its site with one of the finding's cited URLs; a ticker or
     query target must appear in the finding's text or be about the entity
     the finding names."""
     text = _norm(f"{finding.title} {finding.summary}")
     text_tokens = set(text.split())
-    entity_tokens = {
-        t for t in entity_term.split() if len(t) >= _MIN_PARTIAL_TOKEN and t not in _STOPWORDS
-    }
-    names_entity = bool(entity_term) and (entity_term in text or bool(entity_tokens & text_tokens))
+    entity_tokens = _distinctive_tokens(entity_term, vocabulary)
+    names_entity = bool(entity_term) and (
+        f" {entity_term} " in f" {text} " or bool(entity_tokens & text_tokens)
+    )
     if proposal.signal_type in (SOURCE_KIND_STOCK, SOURCE_KIND_EDGAR):
-        return _norm(proposal.target) in text_tokens or names_entity
+        # Phrase containment: a dotted ticker normalizes to two words.
+        return f" {_norm(proposal.target)} " in f" {text} " or names_entity
     if proposal.signal_type == SOURCE_KIND_QUERY:
         return names_entity
     # A URL target must share its site with a cited URL: a finding that
@@ -708,7 +761,7 @@ def classify(
     if own_source:
         score += 1
         reasons.append("target is the entity's own source")
-    supported = finding is not None and _finding_supports(proposal, finding, entity_term)
+    supported = finding is not None and _finding_supports(proposal, finding, entity_term, ctx.vocabulary)
     if finding is not None and not supported:
         # The cited finding says nothing about THIS source, so it lends it
         # no credit — the model cannot borrow a strong finding's points for
@@ -842,6 +895,22 @@ def _policy_stamp(decision: Decision, proposal: WatchProposal, finding: Research
     }
 
 
+def auto_link_finding(
+    proposal: WatchProposal, findings: list[ResearchFinding], ctx: PolicyContext,
+) -> int | None:
+    """Index of the first finding that concerns this proposal's source (a
+    cited URL on the target's site; for a ticker or query, the ticker or
+    the grounding entity named in its text), for a proposal the model filed
+    without a ``finding_index``. The link is the same test the score uses,
+    so it can never lend a proposal a finding the score would not honour."""
+    match = match_vocab(proposal.grounding_entity, ctx.vocabulary)
+    entity_term = match[0] if match else _norm(proposal.grounding_entity)
+    for index, finding in enumerate(findings):
+        if _finding_supports(proposal, finding, entity_term, ctx.vocabulary):
+            return index
+    return None
+
+
 def policy_stamp_of(item: WatchlistItem) -> dict[str, Any]:
     stamp = item.config_json.get("_policy") if isinstance(item.config_json, dict) else None
     return dict(stamp) if isinstance(stamp, dict) else {}
@@ -878,7 +947,19 @@ def apply_proposals(
             continue
         seen_targets.add(proposal.normalized_target)
 
+        linked_note = ""
+        if finding is None:
+            # The model routinely omits finding_index; the finding that
+            # cites this source is still the evidence, so link it.
+            auto_index = auto_link_finding(proposal, findings, ctx)
+            if auto_index is not None:
+                finding = findings[auto_index]
+                proposal.finding_index = auto_index
+                linked_note = f"linked to finding #{auto_index + 1} by its cited source"
+
         decision = classify(proposal, finding, ctx)
+        if linked_note:
+            decision.reasons.insert(0, linked_note)
         if decision.tier == TIER_DIRECT and direct_left <= 0:
             decision.tier = TIER_SUGGEST
             decision.reasons.append("direct-add budget spent this run")
@@ -1252,9 +1333,11 @@ __all__ = [
     "VocabEntry",
     "WatchProposal",
     "apply_proposals",
+    "auto_link_finding",
     "classify",
     "department_refs",
     "entity_declined",
+    "entity_names",
     "grounding_vocabulary",
     "load_departments",
     "match_entity",
