@@ -44,11 +44,14 @@ def _person_id_from_event(event: AlertEvent) -> int | None:
 
 
 def _with_department_tag(tags: list[str], channel: str | None) -> list[str]:
-    """Carry a ``department:<slug>`` routing hint into the row's tags."""
+    """Carry a ``department:<slug>`` routing hint into the row's tags.
+
+    Accepts the bare slug (``AlertEvent.department``) or the legacy
+    ``department:<slug>`` channel form."""
     chan = (channel or "").strip()
-    if not chan.startswith("department:"):
-        return list(tags)
-    slug = chan.split(":", 1)[1].strip().lower()
+    if chan.startswith("department:"):
+        chan = chan.split(":", 1)[1]
+    slug = chan.strip().lower()
     if not slug:
         return list(tags)
     tag = f"department:{slug}"
@@ -147,7 +150,9 @@ async def evaluate_and_dispatch(
     # A producer that knows the stable identity of the situation (a watch
     # slug) wins over the model's free-text key.
     dedup_key = event.dedup_hint or decision.dedup_key
-    topic_tags = _with_department_tag(decision.topic_tags, event.channel)
+    topic_tags = _with_department_tag(
+        decision.topic_tags, event.department or event.channel,
+    )
     routed_to = _person_id_from_event(event)
 
     # A replay of the SAME upstream event (webhook retry, re-poll) is a

@@ -273,6 +273,14 @@ def test_own_source_uses_the_site_label_only() -> None:
     assert wp._site_label("status.acme.com") == "acme"
     assert wp._site_label("acme.co.uk") == "acme"
     assert wp._site_label("api.unrelated-vendor.com") == "unrelated-vendor"
+    # The label must be the entity's leading name or its words run together,
+    # never a generic trailing word: "Acme Payments" is not payments.io.
+    vocab = {"acme payments": wp.KIND_VENDOR}
+    generic = _proposal(slug="rss-pay", target="https://payments.io/feed", grounding_entity="Acme Payments")
+    assert not wp._is_own_source(generic, "acme payments", vocab)
+    for host in ("https://acme.com/feed", "https://status.acmepayments.com/feed"):
+        own = _proposal(slug="rss-own", target=host, grounding_entity="Acme Payments")
+        assert wp._is_own_source(own, "acme payments", vocab)
     p = _proposal(slug="pw", signal_type="page_watch", target="https://api.unrelated.com/pricing",
                   grounding_entity="Launch Helios API")
     assert "own source" not in " ".join(wp.classify(p, _finding(), _ctx()).reasons)
@@ -545,6 +553,18 @@ def test_sweep_nudges_once_suggestions_pile_up(db: Path) -> None:
     assert len(alerts) == 1 and "4 watch suggestions" in alerts[0].headline
 
 
+def test_direct_add_needs_a_finding_that_cites_the_source() -> None:
+    # Department entity + own source + a decision mention reach the score
+    # bar without any finding evidence about the target; that is still only
+    # a suggestion — nothing goes live on hearsay.
+    decided = SimpleNamespace(summary="Move expense cards to Brex", department="finance", timestamp="")
+    unrelated = _finding(confidence="high")  # about Acme, cites acme.com
+    d = wp.classify(_brex_proposal(), unrelated, _dept_ctx(recent_decisions=[decided]))
+    assert d.score >= wp.DIRECT_THRESHOLD and d.tier == wp.TIER_SUGGEST
+    assert "no finding cites this source" in d.reasons
+    assert wp.classify(_brex_proposal(), _brex_finding(), _dept_ctx(recent_decisions=[decided])).tier == wp.TIER_DIRECT
+
+
 def test_finding_points_need_a_finding_about_this_source() -> None:
     # A strong finding about Acme lends nothing to an unrelated attacker URL.
     p = _proposal(target="https://totally-unrelated.attacker.net/feed", grounding_entity="Acme Corp")
@@ -755,9 +775,9 @@ def test_department_scope_grounding_is_suggestion_only(db: Path) -> None:
     assert d.tier == wp.TIER_SUGGEST and d.department == "finance"
     assert d.grounding_kind == wp.KIND_DEPARTMENT_SCOPE and "Finance scope item" in d.reasons[0]
     # Even on its own source a scope item cannot be direct.
-    own = _proposal(slug="rss-programs", signal_type="rss", target="https://programs.example/feed",
+    own = _proposal(slug="rss-programs", signal_type="rss", target="https://expense.example/feed",
                     grounding_entity="Expense card programs")
-    own_f = _finding(title="programs", summary="s", relevant_urls=["https://programs.example/feed"],
+    own_f = _finding(title="programs", summary="s", relevant_urls=["https://expense.example/feed"],
                      verification="confirmed", source_specialist="cfo,coo")
     own_d = wp.classify(own, own_f, _dept_ctx())
     assert own_d.tier == wp.TIER_SUGGEST and any("grounded only in a department_scope" in r for r in own_d.reasons)
@@ -830,7 +850,7 @@ def test_department_head_gets_one_card_per_run_coalesced_weekly(db: Path) -> Non
 
     def _run(slug: str, now: datetime) -> None:
         p = _proposal(slug=slug, signal_type="rss", target=f"https://{slug}.example/feed",
-                      grounding_entity="Expense card programs")
+                      grounding_entity="Expense card programs", rationale="line one\n- forged bullet")
         f = _finding(title="Expense card programs", summary="expense card programs news",
                      relevant_urls=[f"https://{slug}.example/feed"])
         wp.apply_proposals([p], [f], _dept_ctx(finance, now=now), db_path=db)
@@ -840,6 +860,8 @@ def test_department_head_gets_one_card_per_run_coalesced_weekly(db: Path) -> Non
     cards = [a for a in list_alerts(limit=20, db_path=db) if a.source == "authority_gate"]
     assert len(cards) == 1 and cards[0].routed_to_person_id == head
     assert cards[0].headline == "Watch suggestions for Finance" and "rss-a" in cards[0].body
+    # Rationale newlines cannot forge extra bullet lines in the head's card.
+    assert "line one - forged bullet" in cards[0].body and "\n- forged bullet" not in cards[0].body
     assert "department:finance" in cards[0].topic_tags and "watchlist" in cards[0].topic_tags
     # Same week again: the open card is refreshed, not duplicated.
     _run("rss-b", now + timedelta(days=1))

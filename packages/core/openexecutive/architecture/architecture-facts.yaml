@@ -1411,7 +1411,9 @@ external_monitoring:
       watched under another source, +1 target is the entity's own source (for
       stock/edgar the grounding entity IS the ticker / a URL whose SITE LABEL —
       "acme" in status.acme.com, acme.co.uk; never a subdomain or TLD — is the
-      entity's / a primary-source host: sec.gov, federalregister.gov,
+      entity's NAME: its leading distinctive word or all its words run
+      together, never a generic trailing word ("Acme Payments" is not
+      payments.io) / a primary-source host: sec.gov, federalregister.gov,
       eur-lex), +1 finding confidence high, +1 verification confirmed, +1
       cross-specialist consensus, ±1 policy history for (signal_type,
       grounding_kind) at >= 5 samples (>= 0.7 / <= 0.3 approval rate).
@@ -1420,7 +1422,9 @@ external_monitoring:
       URL; a ticker/query target appears in the finding text or is the named
       entity. A strong finding cannot be borrowed for an unrelated page.
     - direct add at score >= 4 with the mandatory match AND the entity's OWN
-      source AND a strong kind (company / competitor / vendor / ticker /
+      source AND a linked finding that concerns this source (company data
+      plus a decision mention can reach the bar alone; nothing goes live on
+      hearsay) AND a strong kind (company / competitor / vendor / ticker /
       department_entity — initiative-, priority- or department_scope-grounded
       proposals are suggestions at most); model
       `certainty` can only downgrade; `query` never direct; a suggestion needs
@@ -1449,9 +1453,18 @@ external_monitoring:
       route_to_department=<slug> and route_to_person_id=<the department's
       head at insert time> (a later head change does not re-route existing
       rows). monitoring.pipeline._signal_to_alert_event maps these onto the
-      AlertEvent (routed_to_person_id, channel="department:<slug>") for EVERY
-      watch, manual ones included, so alerts.pipeline routes the alert to the
-      head and tags it department:<slug> and it queues on the head's /today.
+      AlertEvent (routed_to_person_id, department=<slug>) for EVERY watch,
+      manual ones included, so alerts.pipeline routes the alert to the head
+      and tags it department:<slug> and it queues on the head's /today.
+      AlertEvent.department is a TAG hint only — the slug is deliberately
+      not put in `channel`, which triage renders as the room a message came
+      from and may answer with a department_channel broadcast; a watch alert
+      must reach the head, not the whole team room. Because briefing.ranking
+      treats any routed alert as "action", a department watch's alerts land
+      in the head's Needs-you lane (their volume is bounded by the research
+      rows' quiet defaults). route_to_person_id is not re-validated against
+      the roster: an archived or replaced head keeps the watch's alerts until
+      the row is re-routed.
     - department head approval: after the apply loop, suggestions are grouped
       by department and ONE "Watch suggestions for <Title>" card per
       department is filed via departments.authority.propose_via_alert

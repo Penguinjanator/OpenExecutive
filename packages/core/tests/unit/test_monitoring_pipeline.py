@@ -1974,7 +1974,10 @@ def test_signal_to_alert_event_routes_a_department_watch() -> None:
         dedup_key="vendor:inc-1",
     )
     event = _signal_to_alert_event(signal, item)
-    assert event.routed_to_person_id == 7 and event.channel == "department:finance"
+    assert event.routed_to_person_id == 7 and event.department == "finance"
+    # The slug is a tag hint, never a `channel`: triage reads channel as the
+    # room a message came from and may answer with a team-room broadcast.
+    assert event.channel is None
 
 
 def test_strip_url_query_drops_tokens() -> None:

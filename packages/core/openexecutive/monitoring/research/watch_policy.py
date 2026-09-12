@@ -64,6 +64,7 @@ from openexecutive.monitoring.models import (
 )
 from openexecutive.monitoring.research.models import ResearchFinding
 from openexecutive.monitoring.sources._http import validate_target_url
+from openexecutive.monitoring.sources.base import collapse_whitespace
 from openexecutive.monitoring.validation import normalize_target, registrable_domain
 
 logger = logging.getLogger(__name__)
@@ -558,11 +559,18 @@ def _is_own_source(proposal: WatchProposal, entity_term: str, vocabulary: dict[s
         return True
     # Only the site's own label counts ("acme" in status.acme.com / acme.co.uk);
     # subdomain labels and the TLD never do, so "api" or ".cloud" cannot
-    # make an unrelated host look like the entity's.
-    entity_tokens = {
+    # make an unrelated host look like the entity's. And the label must be
+    # the entity's NAME — its leading distinctive word, or all of its words
+    # run together (acmepayments.com) — not any word of a multi-word entity:
+    # "Acme Payments" is not payments.io. Entities are free text
+    # (departments type them), so a generic trailing word must never hand
+    # an unrelated domain "own source" credit.
+    entity_tokens = [
         t for t in entity_term.split() if len(t) >= _MIN_PARTIAL_TOKEN and t not in _STOPWORDS
-    }
-    return _site_label(host) in entity_tokens
+    ]
+    if not entity_tokens:
+        return False
+    return _site_label(host) in {entity_tokens[0], "".join(entity_tokens)}
 
 
 # Second-level labels under which the real site label sits one step deeper
@@ -654,7 +662,8 @@ def classify(
     Finding points count only when the cited finding concerns this source
     (shares its site with a cited URL, or names the entity). Direct at
     >= DIRECT_THRESHOLD with the mandatory entity match, only for the
-    entity's OWN source, and only when the entity is a named competitor /
+    entity's OWN source, only with a finding that concerns this source,
+    and only when the entity is a named competitor /
     vendor / ticker / the company / a department's watched entity
     (STRONG_GROUNDING_KINDS); the model's own ``certainty`` can only
     downgrade. ``query`` is never direct.
@@ -749,6 +758,12 @@ def classify(
         # competitor, however well corroborated, is the principal's call.
         tier = TIER_SUGGEST
         reasons.append("not the entity's own source")
+    if tier == TIER_DIRECT and not supported:
+        # Company data plus a decision mention can reach the bar on their
+        # own; adding without asking still needs a finding that actually
+        # cites this source, so nothing goes live on hearsay.
+        tier = TIER_SUGGEST
+        reasons.append("no finding cites this source")
     if tier == TIER_DIRECT and kind not in STRONG_GROUNDING_KINDS:
         tier = TIER_SUGGEST
         reasons.append(
@@ -981,7 +996,7 @@ def _notify_department_heads(
         if person_id is None:
             continue
         lines = [
-            f"- {i.slug} ({i.signal_type}) — {i.notes or i.target}"[:200]
+            f"- {i.slug} ({i.signal_type}) — {collapse_whitespace(i.notes or i.target)}"[:200]
             for i in items[:DEPARTMENT_CARD_MAX_LINES]
         ]
         body = (

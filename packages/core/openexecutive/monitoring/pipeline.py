@@ -282,9 +282,11 @@ def _signal_to_alert_event(
         # from the department's watched entities, or by hand) sends its
         # alerts to that department's head and tags them department:<slug>
         # (alerts.pipeline reads both), so they queue on the head's /today
-        # instead of the principal's.
+        # instead of the principal's. The slug goes in ``department`` — a
+        # tag hint — never in ``channel``, which triage would read as the
+        # room the event came from and answer with a team-room broadcast.
         routed_to_person_id=item.route_to_person_id,
-        channel=f"department:{item.route_to_department}" if item.route_to_department else None,
+        department=item.route_to_department,
     )
 
 

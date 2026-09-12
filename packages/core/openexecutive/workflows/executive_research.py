@@ -1172,7 +1172,10 @@ def _render_research_context(
         # what matters; the static profile lags it by design.
         parts.append("RECENT DECISIONS:")
         for d in decisions[:10]:
-            summary = str(getattr(d, "summary", "") or "").strip()
+            # One line per decision: the summary is free text written by
+            # the chat memory extractor, so an embedded newline must not be
+            # able to forge another labelled line of this turn.
+            summary = " ".join(str(getattr(d, "summary", "") or "").split())
             if not summary:
                 continue
             when = str(getattr(d, "timestamp", "") or "")[:10]
