@@ -279,6 +279,32 @@ def test_request_web_search_max_uses_maps_to_capped_max_results() -> None:
     )
     assert body["plugins"] == [{"id": "web", "max_results": 8}]
 
+    # A small search budget never becomes a tiny result count: the plugin
+    # runs one search, so its own default (5) is the floor.
+    small = to_openai_request(
+        "anthropic/claude-opus-4.7",
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "web_search_20250305", "name": "web_search", "max_uses": 2},
+            ],
+        },
+    )
+    assert small["plugins"] == [{"id": "web", "max_results": 5}]
+
+    # A configured domain list cannot be applied by the plugin: fail closed.
+    for key in ("allowed_domains", "blocked_domains"):
+        restricted = to_openai_request(
+            "anthropic/claude-opus-4.7",
+            {
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [
+                    {"type": "web_search_20250305", "name": "web_search", "max_uses": 3, key: ["sec.gov"]},
+                ],
+            },
+        )
+        assert "plugins" not in restricted
+
     # An oversized max_uses is capped so a search *count* can't become an
     # unbounded result *count* (Exa bills per result).
     capped = to_openai_request(
@@ -664,6 +690,42 @@ def test_response_strips_cite_markup_from_nested_tool_arguments() -> None:
     assert finding["summary"] == "Spread widened to $8/bbl."
     # Real source URL is untouched by the strip.
     assert finding["relevant_urls"] == ["https://example.com/crude"]
+
+
+def test_response_parses_tool_arguments_with_raw_cite_markup(monkeypatch) -> None:
+    """The web plugin's <cite> markup inside an argument string carries
+    unescaped quotes; stripping it before parsing keeps the payload."""
+    raw = '{"findings": [{"title": "Acme<cite index="3-14">raised</cite> $5M"}]}'
+    msg = from_openai_response({
+        "id": "x", "model": "google/gemini-2.5-flash",
+        "choices": [{"finish_reason": "tool_calls", "message": {
+            "role": "assistant", "content": None,
+            "tool_calls": [{"id": "c1", "type": "function",
+                            "function": {"name": "emit_research_findings", "arguments": raw}}],
+        }}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    })
+    block = next(b for b in msg.content if b.type == "tool_use")
+    assert block.input == {"findings": [{"title": "Acmeraised $5M"}]}
+
+    # Arguments that still do not parse are logged, not silently emptied.
+    # Patch the module logger directly: earlier tests may reconfigure
+    # logging propagation, which would make caplog miss the record.
+    from openexecutive.providers import translator as tr
+    warnings: list[str] = []
+    monkeypatch.setattr(tr.logger, "warning", lambda msg, *a, **k: warnings.append(msg % a if a else msg))
+    if True:
+        bad = from_openai_response({
+            "id": "x", "model": "m",
+            "choices": [{"finish_reason": "tool_calls", "message": {
+                "role": "assistant", "content": None,
+                "tool_calls": [{"id": "c2", "type": "function",
+                                "function": {"name": "emit_research_findings", "arguments": "{not json"}}],
+            }}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        })
+    assert next(b for b in bad.content if b.type == "tool_use").input == {}
+    assert any("unparseable JSON arguments" in w for w in warnings)
 
 
 def test_response_strips_orphan_closing_cite_tag() -> None:

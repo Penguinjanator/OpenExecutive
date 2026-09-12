@@ -125,7 +125,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing). The tool is now kept for any OpenRouter model and translated
   into OpenRouter's web plugin, as it already was for Claude via
   OpenRouter; only a self-hosted OpenAI-compatible backend still strips
-  it. The plugin runs one search per request and reports no search count.
+  it. The plugin runs one search per request and reports no search count;
+  a configured domain allow/block list cannot be applied to it, so on that
+  path such a setting disables search rather than widening it.
 - **Every model call is recorded.** Research specialists, the research
   routing and watchlist passes, triage and the chat memory extractor now
   write the same `cache_event` audit row the Executive's chat turns always

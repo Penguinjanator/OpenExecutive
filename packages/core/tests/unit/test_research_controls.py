@@ -120,8 +120,28 @@ def test_non_claude_openrouter_models_keep_web_search_but_local_models_do_not(
     }
     gated = apply_feature_gates(spec, dict(kwargs))
     body = to_openai_request("google/gemini-2.5-flash", gated)
-    assert body.get("plugins") == [{"id": "web", "max_results": 3}]
+    assert body.get("plugins") == [{"id": "web", "max_results": 5}]  # plugin default is the floor
     assert [t["function"]["name"] for t in body["tools"]] == ["emit"]
 
     stripped = apply_feature_gates(registry._LOCAL_FEATURE_SPEC, dict(kwargs))
     assert "plugins" not in to_openai_request("local-model", stripped)
+
+
+def test_local_backend_provider_never_carries_web_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Guard the live provider, not only the constant: a self-hosted
+    OpenAI-compatible backend has no search plugin, so its provider must
+    resolve every slug — listed or not — to a spec without web search."""
+    from types import SimpleNamespace
+
+    from openexecutive.providers import registry
+
+    monkeypatch.setattr(registry, "get_settings", lambda: SimpleNamespace(
+        local_models_enabled=True, local_models=["llama3.3"],
+        local_base_url="http://127.0.0.1:11434/v1", local_api_key=None, local_timeout_s=30.0,
+    ))
+    monkeypatch.setattr(registry, "_local_provider", None)
+    provider = registry._local()
+    for slug in ("llama3.3", "not-in-the-list"):
+        _resolved_slug, spec = provider._resolve(slug)
+        assert spec.supports_web_search is False
+        assert spec.supports_tool_use is True

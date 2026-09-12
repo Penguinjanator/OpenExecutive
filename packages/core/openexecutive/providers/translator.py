@@ -45,6 +45,7 @@ What we DO NOT translate:
 from __future__ import annotations
 
 import json
+import logging
 import re
 from types import SimpleNamespace
 from typing import Any
@@ -290,6 +291,8 @@ def _anthropic_tools_to_openai(tools: list[Any]) -> list[dict[str, Any]]:
 # Anthropic native web-search server-tool type prefix (e.g.
 # ``web_search_20250305``). OpenRouter cannot execute Anthropic's server tool,
 # but its own ``web`` plugin does the same job, so we translate the intent.
+logger = logging.getLogger(__name__)
+
 _WEB_SEARCH_TOOL_PREFIX = "web_search_"
 # OpenRouter's web plugin defaults to 5 results. We derive ``max_results`` from
 # the Anthropic tool's ``max_uses`` but cap it: ``max_uses`` is a search *count*
@@ -319,12 +322,25 @@ def _web_search_plugin(tools: Any) -> dict[str, Any] | None:
             and isinstance(t.get("type"), str)
             and t["type"].startswith(_WEB_SEARCH_TOOL_PREFIX)
         ):
+            if t.get("allowed_domains") or t.get("blocked_domains"):
+                # The plugin has no domain filter. A configured allow/block
+                # list is a real control, so fail closed: no search at all
+                # on this path rather than an unrestricted one.
+                logger.warning(
+                    "web_search: WEB_SEARCH_ALLOWED_DOMAINS / BLOCKED_DOMAINS cannot "
+                    "be applied to OpenRouter's web plugin — search disabled for "
+                    "this OpenRouter call"
+                )
+                return None
             max_uses = t.get("max_uses")
-            # Note: bool is an int subtype, so exclude it explicitly. Anthropic's
-            # allowed_domains / blocked_domains have no OpenRouter web-plugin
-            # equivalent and are intentionally not translated (unused here).
+            # ``max_uses`` is a search COUNT; the plugin runs one search and
+            # ``max_results`` is how many results it injects. Never go below
+            # the plugin's own default (a cap of two searches must not become
+            # two results), and cap the top so a large search budget cannot
+            # become an unbounded result count (Exa bills per result). bool
+            # is an int subtype, so exclude it explicitly.
             max_results = (
-                min(max_uses, _WEB_PLUGIN_MAX_RESULTS_CAP)
+                min(max(max_uses, _WEB_PLUGIN_DEFAULT_MAX_RESULTS), _WEB_PLUGIN_MAX_RESULTS_CAP)
                 if isinstance(max_uses, int)
                 and not isinstance(max_uses, bool)
                 and max_uses > 0
@@ -523,6 +539,24 @@ def _remove_complete_cite_tags(text: str) -> str:
         text = stripped
 
 
+def _parse_tool_arguments(raw_args: Any, tool_name: str) -> Any:
+    """Parse a tool call's JSON arguments. The web plugin's ``<cite>`` markup
+    can land inside argument strings with unescaped quotes; strip it from the
+    raw text before parsing so a citation cannot turn a full payload into an
+    empty one. A payload that still fails to parse is logged (it would
+    otherwise read as "the model returned nothing")."""
+    if not isinstance(raw_args, str):
+        return raw_args
+    try:
+        return json.loads(_CITE_TAG_RE.sub("", raw_args))
+    except json.JSONDecodeError as exc:
+        logger.warning(
+            "openrouter: tool call %r carried unparseable JSON arguments (%s) — "
+            "treating as empty", tool_name, exc,
+        )
+        return {}
+
+
 def _strip_cite_markup(text: str) -> str:
     """Remove ``<cite …>`` / ``</cite>`` wrapper tags, preserving inner text.
 
@@ -594,10 +628,7 @@ def from_openai_response(body: dict[str, Any]) -> SimpleNamespace:
     for call in msg.get("tool_calls") or []:
         fn = call.get("function") or {}
         raw_args = fn.get("arguments") or "{}"
-        try:
-            parsed = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-        except json.JSONDecodeError:
-            parsed = {}
+        parsed = _parse_tool_arguments(raw_args, fn.get("name", ""))
         content_blocks.append(
             _block(
                 "tool_use",
@@ -800,10 +831,7 @@ class StreamAccumulator:
         for idx in sorted(self._tool_calls):
             slot = self._tool_calls[idx]
             joined_args = "".join(slot["arg_chunks"])
-            try:
-                parsed = json.loads(joined_args) if joined_args else {}
-            except json.JSONDecodeError:
-                parsed = {}
+            parsed = _parse_tool_arguments(joined_args or "{}", slot["name"])
             content_blocks.append(
                 _block(
                     "tool_use",

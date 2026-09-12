@@ -135,10 +135,15 @@ caching:
     searches. The plugin is not the Anthropic tool: it runs one
     prompt-derived search per request and injects the results (the model
     cannot search again), ``max_uses`` becomes a result count capped at
-    10, allowed/blocked domain lists are not applied, and OpenRouter
+    10 with the plugin's own default (5) as the floor, and OpenRouter
     reports no search count, so `web_search_requests` on those usage rows
-    reads 0 even though search ran. Only the self-hosted
-    OpenAI-compatible backend strips the tool (no plugin there).
+    reads 0 even though search ran. The plugin has no domain filter, so
+    when WEB_SEARCH_ALLOWED_DOMAINS / BLOCKED_DOMAINS is set the translator
+    attaches NO plugin (fail closed, with a warning) rather than an
+    unrestricted search. The plugin's ``<cite>`` markup is stripped from
+    tool-call arguments before they are parsed, so a citation inside an
+    `emit_research_findings` string cannot empty the payload. Only the
+    self-hosted OpenAI-compatible backend strips the tool (no plugin there).
 
 providers:
   module: openexecutive.providers

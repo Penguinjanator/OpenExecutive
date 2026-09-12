@@ -335,8 +335,8 @@ def _openrouter() -> OpenRouterProvider:
             )
         # Claude ids and catalog Claude slugs resolve through the derivation
         # rule; every other slug (curated fallback or live catalog) gets the
-        # provider's non-Claude default spec, so a catalog refresh after
-        # construction needs no rebuild.
+        # registry's non-Claude default spec from the resolver, so a catalog
+        # refresh after construction needs no rebuild.
         _openrouter_provider = OpenRouterProvider(
             api_key=settings.openrouter_api_key,
             base_url=settings.openrouter_base_url,
