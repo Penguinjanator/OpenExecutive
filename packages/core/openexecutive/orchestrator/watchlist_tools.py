@@ -694,13 +694,17 @@ async def handle_tune_watchlist_entry(tool_input: dict[str, Any]) -> str:
     fields: dict[str, Any] = {}
     changes: list[str] = []
 
-    if item.origin == ORIGIN_RESEARCH_PROPOSED and ("mode" in tool_input or "enabled" in tool_input):
+    if item.origin == ORIGIN_RESEARCH_PROPOSED and any(
+        k in tool_input for k in ("mode", "enabled", "cadence", "severity_floor", "severity_ceiling", "trigger")
+    ):
         # A pending research suggestion leaves the pending state only through
-        # the principal's approve / decline — never by a tune from a model.
+        # the principal's approve / decline — never by a tune from a model —
+        # and it goes live with the quiet defaults policy gave it, not with
+        # a cadence / floor / trigger loosened while it waited.
         return _err(
             tool,
             f"{slug!r} is a pending research suggestion; the principal approves or "
-            "declines it on the watch list",
+            "declines it on the watch list (only notes can be edited meanwhile)",
         )
     if "enabled" in tool_input:
         enabled = bool(tool_input["enabled"])

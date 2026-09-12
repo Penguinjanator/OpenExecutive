@@ -281,6 +281,9 @@ async def test_tune_cannot_move_a_pending_suggestion_out_of_review(db: Path) -> 
     assert "pending research suggestion" in out["error"]
     out2 = json.loads(await wt.handle_tune_watchlist_entry({"slug": "rss-sugg", "enabled": False}))
     assert "error" in out2
+    # Nor can its quiet defaults be loosened while it waits.
+    out_floor = json.loads(await wt.handle_tune_watchlist_entry({"slug": "rss-sugg", "severity_floor": "low"}))
+    assert "error" in out_floor
     # Other tunables stay allowed.
     out3 = json.loads(await wt.handle_tune_watchlist_entry({"slug": "rss-sugg", "notes": "hi"}))
     assert out3.get("ok") is True

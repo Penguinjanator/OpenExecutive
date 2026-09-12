@@ -31,8 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the research turn ("stock watches grounded in a competitor: 4
   approved / 1 declined"). Research-added watches retire themselves: the
   scheduler sweep disables one that fired ≥5 alerts with ≥2 dismissed and
-  low trust, a feed/page/status watch with no signal in 30 days, or one with
-  3 consecutive poll failures (audited; re-enable from `/watchlist`).
+  low trust, or one with 3 consecutive poll failures (audited; re-enable
+  from `/watchlist`; silence alone never retires a watch).
   Endpoints: `POST /watchlist/{slug}/approve`, `POST /watchlist/{slug}/decline`.
   Settings: `WATCHLIST_RESEARCH_MAX_DIRECT_ADDS=2`,
   `WATCHLIST_RESEARCH_MAX_PROPOSALS=2`, `WATCHLIST_MAX_ENABLED=40`,

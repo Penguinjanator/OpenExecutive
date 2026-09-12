@@ -610,17 +610,27 @@ def delete_pending_suggestion(item_id: int, db_path: Path | None = None) -> bool
     (compare-and-delete, with its signal history). False when it was
     approved, declined or removed in the meantime."""
     with _get_conn(db_path) as conn:
-        row = conn.execute(
-            "SELECT 1 FROM watchlist WHERE id = ? AND origin = ? AND mode = ?",
-            (item_id, ORIGIN_RESEARCH_PROPOSED, MODE_DRY_RUN),
-        ).fetchone()
-        if row is None:
-            return False
-        conn.execute("DELETE FROM external_signals WHERE watchlist_id = ?", (item_id,))
-        cursor = conn.execute(
-            "DELETE FROM watchlist WHERE id = ? AND origin = ? AND mode = ?",
-            (item_id, ORIGIN_RESEARCH_PROPOSED, MODE_DRY_RUN),
-        )
+        # Take the write lock up front so the check and the two deletes are
+        # one unit: an approve landing in between must not lose the now-live
+        # watch's signal history.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM watchlist WHERE id = ? AND origin = ? AND mode = ?",
+                (item_id, ORIGIN_RESEARCH_PROPOSED, MODE_DRY_RUN),
+            ).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                return False
+            conn.execute("DELETE FROM external_signals WHERE watchlist_id = ?", (item_id,))
+            cursor = conn.execute(
+                "DELETE FROM watchlist WHERE id = ? AND origin = ? AND mode = ?",
+                (item_id, ORIGIN_RESEARCH_PROPOSED, MODE_DRY_RUN),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
         return cursor.rowcount > 0
 
 

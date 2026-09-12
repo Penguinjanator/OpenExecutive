@@ -49,14 +49,14 @@ def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return db_path
 
 
-def _finding(title: str = "Tesla cut prices") -> ResearchFinding:
+def _finding(title: str = "Tesla cut prices", url: str = "https://example.com/feed.xml") -> ResearchFinding:
     return ResearchFinding(
         title=title,
         summary="Detail with a source.",
         severity_hint="high",
         suggested_audience="principal",
         confidence="high",
-        relevant_urls=["https://example.com/feed.xml"],
+        relevant_urls=[url],
         source_specialist="cfo",
     )
 
@@ -158,7 +158,8 @@ async def test_watchlist_pass_files_uncertain_proposal_as_suggestion(
                         certainty="unsure")]),
     ])
     calls = await er._watchlist_analysis_loop(
-        [_finding()], existing_watchlist=[], profile=_profile(), initiatives=[],
+        [_finding("Initech raised", url="https://initech.com/blog/series-b")],
+        existing_watchlist=[], profile=_profile(), initiatives=[],
     )
     assert [c["outcome"] for c in calls] == ["suggested"]
     row = monitoring_store.get_watchlist_item_by_slug("rss-initech", db_path=db)
@@ -170,7 +171,7 @@ async def test_watchlist_pass_files_uncertain_proposal_as_suggestion(
 @pytest.mark.asyncio
 async def test_watchlist_pass_respects_proposal_cap(db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     over = [
-        _propose(f"stock-x{i}", "stock", f"X{i}", entity="Nobody", certainty="unsure")
+        _propose(f"stock-x{i}", "stock", f"X{i}", entity="Tesla", certainty="unsure")
         for i in range(er._MAX_WATCHLIST_PROPOSALS_PER_RUN + 3)
     ]
     _stub_provider(monkeypatch, [_resp(over, stop_reason="tool_use")])

@@ -388,6 +388,31 @@ def _site_label(host: str) -> str:
     return labels[-2]
 
 
+def _finding_supports(proposal: WatchProposal, finding: ResearchFinding, entity_term: str) -> bool:
+    """Does the cited finding actually concern this target? A URL target
+    must share its site with one of the finding's cited URLs; a ticker or
+    query target must appear in the finding's text or be about the entity
+    the finding names."""
+    text = _norm(f"{finding.title} {finding.summary}")
+    text_tokens = set(text.split())
+    entity_tokens = {
+        t for t in entity_term.split() if len(t) >= _MIN_PARTIAL_TOKEN and t not in _STOPWORDS
+    }
+    names_entity = bool(entity_term) and (entity_term in text or bool(entity_tokens & text_tokens))
+    if proposal.signal_type in (SOURCE_KIND_STOCK, SOURCE_KIND_EDGAR):
+        return _norm(proposal.target) in text_tokens or names_entity
+    if proposal.signal_type == SOURCE_KIND_QUERY:
+        return names_entity
+    # A URL target must share its site with a cited URL: a finding that
+    # merely names the entity cannot vouch for an arbitrary page about it.
+    host = registrable_domain(proposal.target)
+    cited = {registrable_domain(u) for u in finding.relevant_urls}
+    cited.discard("")
+    return bool(host) and any(
+        host == c or host.endswith("." + c) or c.endswith("." + host) for c in cited
+    )
+
+
 def _history_adjustment(
     signal_type: str, grounding_kind: str, counts: dict[tuple[str, str], dict[str, int]],
 ) -> tuple[int, str]:
@@ -430,10 +455,12 @@ def classify(
     +1 cross-specialist consensus on the finding
     ±1 policy history for (signal_type, grounding kind) at >=5 samples
 
-    Direct at >= DIRECT_THRESHOLD with the mandatory entity match, and only
-    when the entity is a named competitor / vendor / ticker / the company
-    (STRONG_GROUNDING_KINDS); the model's own ``certainty`` can only
-    downgrade. ``query`` is never direct.
+    Finding points count only when the cited finding concerns this source
+    (shares its site with a cited URL, or names the entity). Direct at
+    >= DIRECT_THRESHOLD with the mandatory entity match, only for the
+    entity's OWN source, and only when the entity is a named competitor /
+    vendor / ticker / the company (STRONG_GROUNDING_KINDS); the model's own
+    ``certainty`` can only downgrade. ``query`` is never direct.
     """
     reasons: list[str] = []
     score = 0
@@ -449,10 +476,17 @@ def classify(
     else:
         reasons.append(f"entity '{proposal.grounding_entity}' is not in company data")
 
-    if entity_term and _is_own_source(proposal, entity_term, ctx.vocabulary):
+    own_source = bool(entity_term) and _is_own_source(proposal, entity_term, ctx.vocabulary)
+    if own_source:
         score += 1
         reasons.append("target is the entity's own source")
-    if finding is not None:
+    supported = finding is not None and _finding_supports(proposal, finding, entity_term)
+    if finding is not None and not supported:
+        # The cited finding says nothing about THIS source, so it lends it
+        # no credit — the model cannot borrow a strong finding's points for
+        # an unrelated URL. (Company-data grounding still counts.)
+        reasons.append("cited finding does not mention this source")
+    if finding is not None and supported:
         if finding.confidence == "high":
             score += 1
             reasons.append("finding confidence high")
@@ -487,12 +521,18 @@ def classify(
     tier = TIER_SUGGEST
     if grounded and score >= DIRECT_THRESHOLD:
         tier = TIER_DIRECT
-    if tier == TIER_DIRECT and kind not in STRONG_GROUNDING_KINDS:
-        tier = TIER_SUGGEST
-        reasons.append(f"grounded only in a {kind} — needs a named competitor, vendor or ticker")
     if tier == TIER_DIRECT and proposal.signal_type == SOURCE_KIND_QUERY:
         tier = TIER_SUGGEST
         reasons.append("standing web queries are always suggestions")
+    if tier == TIER_DIRECT and not own_source:
+        # Adding on its own is reserved for the entity's OWN source (its
+        # ticker, its site, its status page); a third-party page about a
+        # competitor, however well corroborated, is the principal's call.
+        tier = TIER_SUGGEST
+        reasons.append("not the entity's own source")
+    if tier == TIER_DIRECT and kind not in STRONG_GROUNDING_KINDS:
+        tier = TIER_SUGGEST
+        reasons.append(f"grounded only in a {kind} — needs a named competitor, vendor or ticker")
     if tier == TIER_DIRECT and proposal.certainty != "confident":
         tier = TIER_SUGGEST
         reasons.append("model marked it unsure")

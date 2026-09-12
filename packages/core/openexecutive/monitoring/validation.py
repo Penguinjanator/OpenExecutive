@@ -13,7 +13,7 @@ there.
 from __future__ import annotations
 
 import re
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from openexecutive.alerts.models import AlertSeverity
 
@@ -43,21 +43,37 @@ def normalize_target(signal_type: str, target: str) -> str:
     raw = (target or "").strip()
     if signal_type in ("stock", "edgar"):
         return raw.upper()
-    if "://" not in raw:
+    if signal_type == "query" or "://" not in raw:
         # Free-text targets (standing queries): collapse case + whitespace.
         return " ".join(raw.lower().split())
     try:
         parts = urlsplit(raw)
     except ValueError:
         return raw.lower()
-    # Scheme, www., query string, fragment, path case and a trailing slash
-    # are all ways to spell the same source; none of them may defeat a
-    # decline or the duplicate-source guard.
-    host = (parts.hostname or "").lower()
+    # Scheme, www., a trailing host dot, query string, fragment, path case,
+    # percent-encoding, dot segments and a trailing slash are all ways to
+    # spell the same source; none of them may defeat a decline or the
+    # duplicate-source guard.
+    host = (parts.hostname or "").lower().rstrip(".")
     if host.startswith("www."):
         host = host[4:]
-    path = parts.path.lower().rstrip("/") if parts.path not in ("", "/") else ""
+    path = _canonical_path(parts.path)
     return urlunsplit(("https", host, path, "", ""))
+
+
+def _canonical_path(path: str) -> str:
+    """Lower-cased, percent-decoded path with dot segments resolved and no
+    trailing slash ("" for the root)."""
+    segments: list[str] = []
+    for seg in unquote(path).split("/"):
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            if segments:
+                segments.pop()
+            continue
+        segments.append(seg.lower())
+    return "/" + "/".join(segments) if segments else ""
 
 
 def registrable_domain(url: str) -> str:

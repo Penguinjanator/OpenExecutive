@@ -138,6 +138,10 @@ def test_priority_terms_drop_stopwords() -> None:
 
 def test_normalize_target_and_domain() -> None:
     assert normalize_target("stock", " acme ") == "ACME"
+    # Respellings of one path collapse: dot segments, percent-encoding, a
+    # trailing host dot.
+    assert normalize_target("rss", "https://competitor.example./x/../blog/./%66eed") == "https://competitor.example/blog/feed"
+    assert normalize_target("query", "site:https://acme.com  Acme   Pricing") == "site:https://acme.com acme pricing"
     # scheme, www., query, fragment, path case and trailing slash never
     # distinguish two spellings of one source.
     assert normalize_target("rss", "HTTP://www.Acme.com/Feed/?x=1#top") == "https://acme.com/feed"
@@ -165,18 +169,30 @@ def test_ticker_in_profile_is_own_source_for_stock() -> None:
     assert d.tier == wp.TIER_DIRECT
 
 
+def _stripe_finding(**kw: Any) -> ResearchFinding:
+    return _finding(title="Stripe incident", summary="Stripe reported degraded payments on 2026-09-02.",
+                    relevant_urls=["https://status.stripe.com/incidents/abc"], source_specialist="coo", **kw)
+
+
 def test_vendor_status_page_is_direct() -> None:
     p = _proposal(
         slug="vendor-stripe", signal_type="vendor_status",
         target="https://status.stripe.com/feed.atom", grounding_entity="Stripe",
     )
-    d = wp.classify(p, _finding(), _ctx())
+    d = wp.classify(p, _stripe_finding(), _ctx())
     assert d.tier == wp.TIER_DIRECT and "own source" in " ".join(d.reasons)
+
+
+def _initech_finding(**kw: Any) -> ResearchFinding:
+    base: dict[str, Any] = dict(title="Initech raised", summary="Initech raised a Series B on 2026-09-03.",
+                                relevant_urls=["https://initech.com/blog/series-b"])
+    base.update(kw)
+    return _finding(**base)
 
 
 def test_entity_not_in_company_data_is_never_direct() -> None:
     p = _proposal(grounding_entity="Initech", target="https://initech.com/feed.xml")
-    d = wp.classify(p, _finding(verification="confirmed", source_specialist="cso,cfo"), _ctx())
+    d = wp.classify(p, _initech_finding(verification="confirmed", source_specialist="cso,cfo"), _ctx())
     assert d.tier == wp.TIER_SUGGEST
     assert d.score == 3  # own-source +1 needs an entity; high +1, verified +1, consensus +1
 
@@ -226,8 +242,8 @@ def test_nothing_vouching_is_rejected_not_suggested() -> None:
                      finding_index=None)
     assert wp.classify(bare, None, _ctx()).tier == wp.TIER_REJECT
     weak = _proposal(grounding_entity="Initech", target="https://initech.com/feed.xml", certainty="unsure")
-    assert wp.classify(weak, _finding(confidence="medium"), _ctx()).tier == wp.TIER_REJECT
-    assert wp.classify(weak, _finding(confidence="high"), _ctx()).tier == wp.TIER_SUGGEST
+    assert wp.classify(weak, _initech_finding(confidence="medium"), _ctx()).tier == wp.TIER_REJECT
+    assert wp.classify(weak, _initech_finding(confidence="high"), _ctx()).tier == wp.TIER_SUGGEST
 
 
 def test_own_source_uses_the_site_label_only() -> None:
@@ -282,7 +298,7 @@ def test_quiet_defaults_add_keywords_and_medium_floor() -> None:
 
 
 def test_apply_adds_direct_and_files_suggestion(db: Path) -> None:
-    findings = [_finding(), _finding(title="Initech raised", summary="Initech raised.", confidence="high")]
+    findings = [_finding(), _initech_finding(confidence="high")]
     proposals = [
         _proposal(),
         _proposal(slug="rss-initech", target="https://initech.com/feed.xml",
@@ -300,14 +316,15 @@ def test_apply_adds_direct_and_files_suggestion(db: Path) -> None:
 
 
 def test_apply_honours_budgets_and_duplicate_targets(db: Path) -> None:
-    findings = [_finding()]
+    findings = [_finding(), _stripe_finding(), _initech_finding(confidence="high")]
     proposals = [
         _proposal(slug="stock-acme", signal_type="stock", target="ACME"),
         _proposal(slug="stock-acme-2", signal_type="stock", target="acme"),  # same target
         _proposal(slug="vendor-stripe", signal_type="vendor_status",
-                  target="https://status.stripe.com/feed.atom", grounding_entity="Stripe"),
+                  target="https://status.stripe.com/feed.atom", grounding_entity="Stripe", finding_index=1),
         _proposal(slug="rss-acme-blog"),  # third direct → budget → suggestion
-        _proposal(slug="rss-initech", target="https://initech.com/feed.xml", grounding_entity="Initech"),
+        _proposal(slug="rss-initech", target="https://initech.com/feed.xml", grounding_entity="Initech",
+                  finding_index=2),
         _proposal(slug="rss-globex", target="https://globex.com/feed.xml", grounding_entity="Globex",
                   certainty="unsure"),  # suggestion budget spent → rejected
     ]
@@ -505,12 +522,33 @@ def test_sweep_nudges_once_suggestions_pile_up(db: Path) -> None:
     assert len(alerts) == 1 and "4 watch suggestions" in alerts[0].headline
 
 
-def test_initiative_or_priority_grounding_is_never_direct() -> None:
-    p = _proposal(
-        slug="rss-helios", target="https://helios-news.example/feed.xml",
-        grounding_entity="Helios API",
-    )
+def test_finding_points_need_a_finding_about_this_source() -> None:
+    # A strong finding about Acme lends nothing to an unrelated attacker URL.
+    p = _proposal(target="https://totally-unrelated.attacker.net/feed", grounding_entity="Acme Corp")
     d = wp.classify(p, _finding(verification="confirmed", source_specialist="cso,cfo"), _ctx())
+    assert d.score == 2 and d.tier == wp.TIER_SUGGEST
+    assert "does not mention this source" in " ".join(d.reasons)
+    # A finding that names the entity does support a ticker watch on it.
+    p2 = _proposal(slug="stock-acme", signal_type="stock", target="ACME", grounding_entity="Acme Corp")
+    assert wp.classify(p2, _finding(), _ctx()).tier == wp.TIER_DIRECT
+
+
+def test_direct_add_requires_the_entitys_own_source() -> None:
+    # A well-corroborated third-party page about a competitor is the
+    # principal's call, never a direct add.
+    p = _proposal(target="https://news.example.com/acme-feed.xml", grounding_entity="Acme Corp")
+    f = _finding(verification="confirmed", source_specialist="cso,cfo",
+                 relevant_urls=["https://news.example.com/acme-pricing"])
+    d = wp.classify(p, f, _ctx())
+    assert d.score >= wp.DIRECT_THRESHOLD and d.tier == wp.TIER_SUGGEST
+    assert "not the entity's own source" in d.reasons
+
+
+def test_initiative_or_priority_grounding_is_never_direct() -> None:
+    p = _proposal(slug="rss-helios", target="https://helios.com/feed.xml", grounding_entity="Helios API")
+    f = _finding(title="Helios API launch", summary="Launch Helios API shipped.",
+                 verification="confirmed", relevant_urls=["https://helios.com/launch"])
+    d = wp.classify(p, f, _ctx())
     assert d.grounding_kind == wp.KIND_INITIATIVE and d.score >= wp.DIRECT_THRESHOLD
     assert d.tier == wp.TIER_SUGGEST and "needs a named competitor" in d.reasons[-1]
 
