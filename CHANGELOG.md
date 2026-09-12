@@ -122,12 +122,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stripped the web-search tool for non-Claude models, so a research
   specialist or the Executive pinned to Gemini, GPT, Llama, DeepSeek or
   Grok ran without search (and the research prompt then told it to emit
-  nothing). The tool is now kept for any OpenRouter model and translated
-  into OpenRouter's web plugin, as it already was for Claude via
-  OpenRouter; only a self-hosted OpenAI-compatible backend still strips
-  it. The plugin runs one search per request and reports no search count;
-  a configured domain allow/block list cannot be applied to it, so on that
-  path such a setting disables search rather than widening it.
+  nothing). The tool is now kept for any OpenRouter model and replaced by
+  OpenRouter's own `openrouter:web_search` server tool (the deprecated web
+  plugin is no longer used); only a self-hosted OpenAI-compatible backend
+  still strips it. The server tool carries the same contract as
+  Anthropic's: the model decides when to search, `max_uses` caps searches
+  server-side, the domain allow/block lists apply, and the search count is
+  reported, so `RESEARCH_WEB_SEARCH_MAX_USES` and `WEB_SEARCH_MAX_USES`
+  mean the same thing on both deployment types.
 - **Every model call is recorded.** Research specialists, the research
   routing and watchlist passes, triage and the chat memory extractor now
   write the same `cache_event` audit row the Executive's chat turns always

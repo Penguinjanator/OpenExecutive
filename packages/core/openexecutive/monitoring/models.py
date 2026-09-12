@@ -21,7 +21,7 @@ SOURCE_KIND_VENDOR_STATUS = "vendor_status"
 SOURCE_KIND_RSS = "rss"  # reserved for PR-B
 SOURCE_KIND_STOCK = "stock"  # reserved for PR-B
 # Standing web-search query — runs a natural-language query on a cadence via
-# the provider's web_search tool (Anthropic native or OpenRouter web plugin),
+# the provider's web_search tool (Anthropic native or OpenRouter's server tool),
 # so the watchlist can monitor *arbitrary* conditions, not just feeds.
 SOURCE_KIND_QUERY = "query"
 # SEC EDGAR filings — polls a company's recent filings (8-K / 10-K / 10-Q /

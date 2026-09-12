@@ -133,13 +133,11 @@ _CLAUDE_FEATURE_SPEC = FeatureSpec(
 # Per-non-Claude OpenRouter model spec. ``supports_tool_use`` is universal
 # across the curated set; cache_control and thinking are off (no
 # OpenAI-format equivalent). ``supports_web_search`` is ON: the Anthropic
-# web_search tool never reaches the upstream model — the translator drops
-# it from ``tools`` and attaches OpenRouter's ``web`` plugin instead, and
-# that plugin works for any model OpenRouter serves, not only Claude. What
-# the plugin gives differs from Anthropic's tool (one prompt-derived search
-# per request, results injected; ``max_uses`` becomes a result count; no
-# domain lists; no search count in usage), but a specialist told to emit
-# nothing it cannot confirm by search gets a search.
+# web_search tool never reaches the upstream model — the translator replaces
+# it with OpenRouter's own ``openrouter:web_search`` server tool, which works
+# for any model OpenRouter serves and carries the same contract (the model
+# decides when to search, ``max_uses`` caps searches, domain lists apply,
+# the search count is reported).
 _DEFAULT_NON_CLAUDE_SPEC = FeatureSpec(
     supports_cache_control=False,
     supports_thinking=False,
@@ -159,7 +157,7 @@ _NON_CLAUDE_REASONING_SPEC = FeatureSpec(
 )
 
 # Self-hosted OpenAI-compatible backend: tools only. There is no search
-# plugin on that path, so the web_search tool is stripped (it would be
+# tool on that path, so the web_search tool is stripped (it would be
 # rejected or silently ignored by the server).
 _LOCAL_FEATURE_SPEC = FeatureSpec(
     supports_cache_control=False,
@@ -248,7 +246,7 @@ def _openrouter_model_resolver(model: str) -> tuple[str, FeatureSpec] | None:
       to Anthropic for these, so stripping them would only cost money.
     * Non-Claude slug the catalog marks reasoning-capable → unchanged,
       thinking kept (translated to OpenRouter ``reasoning``), web search
-      kept (translated to the ``web`` plugin), cache stripped.
+      kept (translated to OpenRouter's server tool), cache stripped.
     * Anything else → unchanged, the non-Claude default (tools + web
       search; cache and thinking stripped).
     """
@@ -308,7 +306,7 @@ def _local() -> OpenAICompatibleProvider:
             )
         # Local models get the tools-only spec: no cache_control, thinking,
         # or web_search — a self-hosted OpenAI-compatible server has no
-        # search plugin and would 400 (or silently ignore) the rest.
+        # search tool and would 400 (or silently ignore) the rest.
         spec_lookup: dict[str, FeatureSpec] = {
             m: _LOCAL_FEATURE_SPEC for m in _local_models(settings)
         }

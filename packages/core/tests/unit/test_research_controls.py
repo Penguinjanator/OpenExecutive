@@ -110,7 +110,8 @@ def test_non_claude_openrouter_models_keep_web_search_but_local_models_do_not(
 
     assert not registry._LOCAL_FEATURE_SPEC.supports_web_search
 
-    # End to end through the gate + translator: the plugin is attached.
+    # End to end through the gate + translator: OpenRouter's server tool
+    # replaces the Anthropic one with the same cap.
     kwargs = {
         "model": "google/gemini-2.5-flash", "max_tokens": 10, "messages": [],
         "tools": [
@@ -120,11 +121,12 @@ def test_non_claude_openrouter_models_keep_web_search_but_local_models_do_not(
     }
     gated = apply_feature_gates(spec, dict(kwargs))
     body = to_openai_request("google/gemini-2.5-flash", gated)
-    assert body.get("plugins") == [{"id": "web", "max_results": 5}]  # plugin default is the floor
-    assert [t["function"]["name"] for t in body["tools"]] == ["emit"]
+    assert body["tools"][-1] == {"type": "openrouter:web_search", "parameters": {"max_uses": 3}}
+    assert [t["function"]["name"] for t in body["tools"][:-1]] == ["emit"]
 
     stripped = apply_feature_gates(registry._LOCAL_FEATURE_SPEC, dict(kwargs))
-    assert "plugins" not in to_openai_request("local-model", stripped)
+    local_body = to_openai_request("local-model", stripped)
+    assert all(t["type"] == "function" for t in local_body["tools"])
 
 
 def test_local_backend_provider_never_carries_web_search(monkeypatch: pytest.MonkeyPatch) -> None:

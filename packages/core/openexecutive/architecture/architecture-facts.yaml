@@ -129,21 +129,24 @@ caching:
     those backends have no equivalent feature and would reject the
     field. The two-block layout above is unchanged either way.
     Web search via OpenRouter — for Claude and non-Claude models alike —
-    is preserved by translating the Anthropic web_search server tool into
-    OpenRouter's ``web`` plugin (see providers.translator_shapes), so a
-    research specialist or the Executive pinned to e.g. Gemini still
-    searches. The plugin is not the Anthropic tool: it runs one
-    prompt-derived search per request and injects the results (the model
-    cannot search again), ``max_uses`` becomes a result count capped at
-    10 with the plugin's own default (5) as the floor, and OpenRouter
-    reports no search count, so `web_search_requests` on those usage rows
-    reads 0 even though search ran. The plugin has no domain filter, so
-    when WEB_SEARCH_ALLOWED_DOMAINS / BLOCKED_DOMAINS is set the translator
-    attaches NO plugin (fail closed, with a warning) rather than an
-    unrestricted search. The plugin's ``<cite>`` markup is stripped from
-    tool-call arguments before they are parsed, so a citation inside an
+    is preserved by replacing the Anthropic web_search server tool with
+    OpenRouter's own ``openrouter:web_search`` server tool (see
+    providers.translator_shapes), so a research specialist or the
+    Executive pinned to e.g. Gemini still searches, and with the SAME
+    contract as Anthropic-direct: the model decides when to search,
+    ``max_uses`` caps searches server-side (so RESEARCH_WEB_SEARCH_MAX_USES
+    and WEB_SEARCH_MAX_USES mean the same thing on both deployment types),
+    WEB_SEARCH_ALLOWED_DOMAINS / BLOCKED_DOMAINS map to allowed_domains /
+    excluded_domains, and the response's ``usage.web_search_requests`` is
+    surfaced as ``server_tool_use`` so the usage rows record searches on
+    this path too. The engine is left on OpenRouter's ``auto`` (native
+    provider search for Claude / GPT / Gemini / Grok, Exa otherwise).
+    OpenRouter search's ``<cite>`` markup is stripped from tool-call
+    arguments before they are parsed, so a citation inside an
     `emit_research_findings` string cannot empty the payload. Only the
-    self-hosted OpenAI-compatible backend strips the tool (no plugin there).
+    self-hosted OpenAI-compatible backend strips the tool (no server tool
+    there). The older ``plugins:[{"id":"web"}]`` plugin is deprecated by
+    OpenRouter and no longer used.
 
 providers:
   module: openexecutive.providers
@@ -165,8 +168,8 @@ providers:
     thinking + output_config, and — for the local backend only — the
     Anthropic server-side web_search tool; every OpenRouter model keeps
     web_search (supports_web_search=True on both non-Claude specs) so the
-    translator can turn it into the ``web`` plugin. A misrouted call
-    cannot ship an unsupported field.
+    translator can turn it into OpenRouter's ``openrouter:web_search``
+    server tool. A misrouted call cannot ship an unsupported field.
     supports_thinking is TRUE for the Claude family and for any non-Claude
     catalog slug whose OpenRouter entry lists "reasoning" in
     supported_parameters (registry._openrouter_model_resolver consults
@@ -216,12 +219,14 @@ providers:
     already wired should deep reasoning ever be added to them).
     The Anthropic
     server-side web_search tool (no input_schema) cannot be executed by
-    OpenRouter, so its intent is translated into OpenRouter's
-    ``plugins:[{"id":"web","max_results":N}]`` web-search plugin (N derived
-    from the tool's max_uses, capped) for ANY model routed via OpenRouter,
-    Claude or not — without this a call routed
+    OpenRouter, so it is replaced in ``tools[]`` by OpenRouter's
+    ``{"type": "openrouter:web_search", "parameters": {max_uses,
+    allowed_domains, excluded_domains}}`` server tool for ANY model routed
+    via OpenRouter, Claude or not — without this a call routed
     via OpenRouter would silently lose web search (the executive_research
-    council emitted zero findings). The plugin makes the model cite sources
+    council emitted zero findings). Server-side tool calls in the response
+    (``tool_calls[].type != "function"``) are skipped, never surfaced as
+    tool_use blocks for the caller to run. OpenRouter search makes the model cite sources
     with inline ``<cite index="...">…</cite>`` markup; the response path
     strips those wrapper tags from both text and tool-call arguments so they
     don't leak into findings / chat replies. Streaming SSE chunks

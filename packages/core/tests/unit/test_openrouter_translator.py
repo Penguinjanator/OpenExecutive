@@ -247,7 +247,7 @@ def test_request_flattens_user_content_to_string_when_no_cache_control() -> None
     assert user_msg["content"] == "Part one\n\nPart two"
 
 
-def test_request_drops_web_search_tool_but_injects_web_plugin() -> None:
+def test_request_replaces_anthropic_web_search_with_openrouter_server_tool() -> None:
     body = to_openai_request(
         "anthropic/claude-opus-4.7",
         {
@@ -257,69 +257,57 @@ def test_request_drops_web_search_tool_but_injects_web_plugin() -> None:
             ],
         },
     )
-    # The Anthropic server tool has no OpenAI equivalent — it's still dropped
-    # from ``tools`` so the body doesn't carry a phantom function entry...
-    assert "tools" not in body or body["tools"] == []
-    # ...but its intent is reproduced via OpenRouter's ``web`` plugin so search
-    # actually runs (the bug this fixes: research specialists got no search and
-    # emitted zero findings). Default max_results when no max_uses is given.
-    assert body["plugins"] == [{"id": "web", "max_results": 5}]
+    # The Anthropic server tool has no OpenAI equivalent, so it is replaced
+    # in ``tools`` by OpenRouter's own server tool (the bug this fixes:
+    # research specialists got no search and emitted zero findings). With
+    # no max_uses or domain lists there are no parameters.
+    assert body["tools"] == [{"type": "openrouter:web_search"}]
+    assert "plugins" not in body
 
 
-def test_request_web_search_max_uses_maps_to_capped_max_results() -> None:
-    # max_uses within the cap is honored verbatim.
+def test_request_web_search_translates_cap_and_domain_lists() -> None:
+    # max_uses is a search count on both sides: it passes through unchanged,
+    # so RESEARCH_WEB_SEARCH_MAX_USES caps searches via OpenRouter too.
     body = to_openai_request(
+        "google/gemini-2.5-flash",
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"name": "emit", "input_schema": {"type": "object"}},
+                {"type": "web_search_20250305", "name": "web_search", "max_uses": 3,
+                 "allowed_domains": ["sec.gov", "federalregister.gov"]},
+            ],
+        },
+    )
+    assert body["tools"] == [
+        {"type": "function", "function": {"name": "emit", "description": "", "parameters": {"type": "object"}}},
+        {"type": "openrouter:web_search",
+         "parameters": {"max_uses": 3, "allowed_domains": ["sec.gov", "federalregister.gov"]}},
+    ]
+    blocked = to_openai_request(
         "anthropic/claude-opus-4.7",
         {
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [
-                {"type": "web_search_20250305", "name": "web_search", "max_uses": 8},
+                {"type": "web_search_20250305", "name": "web_search", "max_uses": 8,
+                 "blocked_domains": ["example.com"]},
             ],
         },
     )
-    assert body["plugins"] == [{"id": "web", "max_results": 8}]
-
-    # A small search budget never becomes a tiny result count: the plugin
-    # runs one search, so its own default (5) is the floor.
-    small = to_openai_request(
-        "anthropic/claude-opus-4.7",
-        {
-            "messages": [{"role": "user", "content": "hi"}],
-            "tools": [
-                {"type": "web_search_20250305", "name": "web_search", "max_uses": 2},
-            ],
-        },
-    )
-    assert small["plugins"] == [{"id": "web", "max_results": 5}]
-
-    # A configured domain list cannot be applied by the plugin: fail closed.
-    for key in ("allowed_domains", "blocked_domains"):
-        restricted = to_openai_request(
+    assert blocked["tools"] == [
+        {"type": "openrouter:web_search",
+         "parameters": {"max_uses": 8, "excluded_domains": ["example.com"]}},
+    ]
+    # A bool or non-positive max_uses is not a cap.
+    for bad in (True, 0, -1, "3"):
+        odd = to_openai_request(
             "anthropic/claude-opus-4.7",
-            {
-                "messages": [{"role": "user", "content": "hi"}],
-                "tools": [
-                    {"type": "web_search_20250305", "name": "web_search", "max_uses": 3, key: ["sec.gov"]},
-                ],
-            },
+            {"messages": [], "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": bad}]},
         )
-        assert "plugins" not in restricted
-
-    # An oversized max_uses is capped so a search *count* can't become an
-    # unbounded result *count* (Exa bills per result).
-    capped = to_openai_request(
-        "anthropic/claude-opus-4.7",
-        {
-            "messages": [{"role": "user", "content": "hi"}],
-            "tools": [
-                {"type": "web_search_20250305", "name": "web_search", "max_uses": 50},
-            ],
-        },
-    )
-    assert capped["plugins"] == [{"id": "web", "max_results": 10}]
+        assert odd["tools"] == [{"type": "openrouter:web_search"}]
 
 
-def test_request_no_web_plugin_without_web_search_tool() -> None:
+def test_request_no_server_tool_without_web_search_tool() -> None:
     body = to_openai_request(
         "anthropic/claude-opus-4.7",
         {
@@ -333,9 +321,33 @@ def test_request_no_web_plugin_without_web_search_tool() -> None:
             ],
         },
     )
-    # Ordinary client tools must not trigger the web plugin.
-    assert "plugins" not in body
+    # Ordinary client tools must not trigger the web-search server tool.
+    assert [t["type"] for t in body["tools"]] == ["function"]
     assert body["tools"][0]["function"]["name"] == "consult_specialist"
+
+
+def test_response_reports_search_count_and_skips_server_tool_calls() -> None:
+    msg = from_openai_response({
+        "id": "x", "model": "anthropic/claude-sonnet-5",
+        "choices": [{"finish_reason": "tool_calls", "message": {
+            "role": "assistant", "content": "done",
+            "tool_calls": [
+                {"id": "s1", "type": "openrouter:web_search", "function": {"name": "web_search", "arguments": "{}"}},
+                {"id": "c1", "type": "function",
+                 "function": {"name": "emit_research_findings", "arguments": "{\"findings\": []}"}},
+            ],
+        }}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "web_search_requests": 3},
+    })
+    assert msg.usage.server_tool_use.web_search_requests == 3
+    assert [b.name for b in msg.content if b.type == "tool_use"] == ["emit_research_findings"]
+    # Absent → 0, never missing (audit usage reads it on every row).
+    plain = from_openai_response({
+        "id": "y", "model": "m",
+        "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    })
+    assert plain.usage.server_tool_use.web_search_requests == 0
 
 
 def test_request_lifts_assistant_tool_use_blocks_to_tool_calls() -> None:
@@ -1011,3 +1023,12 @@ def test_stream_accumulator_emits_legitimate_trailing_text_with_angle_bracket() 
             if ev.type == "content_block_delta" and ev.delta.type == "text_delta":
                 streamed += ev.delta.text
     assert streamed == "5 < 10 is true."
+
+
+def test_stream_accumulator_reports_search_count() -> None:
+    acc = StreamAccumulator()
+    acc.feed({"id": "s", "model": "m", "choices": [{"delta": {"content": "hi"}, "finish_reason": None}]})
+    acc.feed({"id": "s", "model": "m", "choices": [{"delta": {}, "finish_reason": "stop"}],
+              "usage": {"prompt_tokens": 5, "completion_tokens": 1, "web_search_requests": 2}})
+    msg = acc.finalize()
+    assert msg.usage.server_tool_use.web_search_requests == 2
