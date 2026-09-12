@@ -445,6 +445,8 @@ export default function DepartmentDetailPage() {
     slack_channel_id: "",
     discord_channel_id: "",
     telegram_chat_id: "",
+    // One entity per line in the textarea; split + trimmed on save.
+    watched_entities: "",
   });
   const [savingSettings, setSavingSettings] = useState(false);
   const [settingsErr, setSettingsErr] = useState<string | null>(null);
@@ -503,6 +505,7 @@ export default function DepartmentDetailPage() {
           slack_channel_id: d.config.slack_channel_id ?? "",
           discord_channel_id: d.config.discord_channel_id ?? "",
           telegram_chat_id: d.config.telegram_chat_id ?? "",
+          watched_entities: (d.config.watched_entities ?? []).join("\n"),
         });
       }
       if (isInitial && d.config.head_person_id != null) {
@@ -572,6 +575,11 @@ export default function DepartmentDetailPage() {
         slack_channel_id: settingsForm.slack_channel_id.trim() || null,
         discord_channel_id: settingsForm.discord_channel_id.trim() || null,
         telegram_chat_id: settingsForm.telegram_chat_id.trim() || null,
+        // Always sent: an emptied textarea clears the list.
+        watched_entities: settingsForm.watched_entities
+          .split("\n")
+          .map((line) => line.trim())
+          .filter((line) => line.length > 0),
       });
       setDept(updated);
       setEditingSettings(false);
@@ -621,6 +629,7 @@ export default function DepartmentDetailPage() {
                           slack_channel_id: dept.config.slack_channel_id ?? "",
                           discord_channel_id: dept.config.discord_channel_id ?? "",
                           telegram_chat_id: dept.config.telegram_chat_id ?? "",
+                          watched_entities: (dept.config.watched_entities ?? []).join("\n"),
                         });
                         setSettingsErr(null);
                       }
@@ -846,6 +855,28 @@ export default function DepartmentDetailPage() {
                     </div>
                   </section>
 
+                  {/* Card 5: Watched entities — strong grounding for the research watch policy */}
+                  <section className="rounded-xl border border-line bg-surface-elevated px-4 py-4">
+                    <h3 className="text-xs font-semibold uppercase tracking-wide text-fg-muted mb-1">Watched entities</h3>
+                    <p className="text-[10px] text-fg-muted mb-3">
+                      Vendors, competitors or tickers this department cares about, one per line. Named here,
+                      the Executive will start watching their status pages, filings and feeds on its own and
+                      route what it finds to this department and its head.
+                    </p>
+                    <label className="text-xs text-fg-muted flex flex-col gap-1">
+                      Watched entities (one per line)
+                      <textarea
+                        value={settingsForm.watched_entities}
+                        onChange={(e) =>
+                          setSettingsForm((f) => ({ ...f, watched_entities: e.target.value }))
+                        }
+                        rows={4}
+                        placeholder={"Brex\nStripe\nACME"}
+                        className="px-2 py-1.5 rounded-lg bg-surface-input border border-line text-sm focus:outline-none focus:border-indigo-500"
+                      />
+                    </label>
+                  </section>
+
                   {settingsErr && <p className="text-xs text-rose-300">{settingsErr}</p>}
                   <button
                     disabled={savingSettings}
@@ -879,6 +910,9 @@ export default function DepartmentDetailPage() {
                       ...(dept.config.slack_channel_id ? [["Slack channel", dept.config.slack_channel_id]] : []),
                       ...(dept.config.discord_channel_id ? [["Discord channel", dept.config.discord_channel_id]] : []),
                       ...(dept.config.telegram_chat_id ? [["Telegram chat", dept.config.telegram_chat_id]] : []),
+                      ...((dept.config.watched_entities ?? []).length > 0
+                        ? [["Watched entities", (dept.config.watched_entities ?? []).join(", ")]]
+                        : []),
                     ].map(([label, value]) => (
                       <div key={label} className="flex items-start gap-3 py-2">
                         <div className="w-36 flex-shrink-0 text-xs text-fg-muted pt-0.5">{label}</div>

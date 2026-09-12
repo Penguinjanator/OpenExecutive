@@ -25,6 +25,10 @@ def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monitoring_store.initialize_db(db_path)
     monkeypatch.setattr("openexecutive.people.store.DB_PATH", db_path)
     initialize_people_db(db_path)
+    monkeypatch.setattr("openexecutive.departments.store.DB_PATH", db_path)
+    from openexecutive.departments import store as dept_store
+
+    dept_store.initialize_db(db_path)
     audit_db = AuditLogger(db_path=db_path)
     audit_db.initialize_db()
     set_audit_logger(audit_db)
@@ -65,6 +69,39 @@ def test_state_hash_ignores_suggestions_and_disabled_rows(db: Path) -> None:
         slug="stock-off", signal_type="stock", target="OFF", enabled=False, db_path=db,
     )
     assert research_scheduler.compute_research_state_hash(db_path=db) == before
+
+
+def test_state_hash_tracks_department_watch_interests(db: Path) -> None:
+    from openexecutive.departments import store as dept_store
+
+    dept_store.seed_default_departments(db)
+    before = research_scheduler.compute_research_state_hash(db_path=db)
+    dept_store.update_department("finance", watched_entities=["Brex"], db_path=db)
+    after = research_scheduler.compute_research_state_hash(db_path=db)
+    assert before != after
+
+
+def test_state_hash_moves_only_for_decisions_that_name_known_entities(
+    db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.departments import store as dept_store
+    from openexecutive.memory.company_profile import CompanyProfile
+    from openexecutive.memory.episodic import store_decision
+
+    profile = CompanyProfile.model_validate({"name": "Sente Labs", "vendors": ["Stripe"]})
+    monkeypatch.setattr(
+        "openexecutive.onboarding.profile_builder.load_or_create_profile", lambda: profile,
+    )
+    dept_store.seed_default_departments(db)
+    dept_store.update_department("finance", watched_entities=["Brex"], db_path=db)
+    before = research_scheduler.compute_research_state_hash(db_path=db)
+    store_decision("ops", "Hire two SDRs in Q4", db_path=db)
+    assert research_scheduler.compute_research_state_hash(db_path=db) == before
+    store_decision("finance", "Evaluate Brex for expense cards", db_path=db)
+    after = research_scheduler.compute_research_state_hash(db_path=db)
+    assert after != before
+    store_decision("finance", "Move Stripe to annual billing", db_path=db)
+    assert research_scheduler.compute_research_state_hash(db_path=db) not in (before, after)
 
 
 def test_state_hash_changes_when_initiative_added(db: Path) -> None:

@@ -8,6 +8,7 @@ import {
   createWatchlistItem,
   declineWatchSuggestion,
   deleteWatchlistItem,
+  listDepartments,
   listWatchlist,
   patchWatchlistItem,
   type WatchDeclineReason,
@@ -151,11 +152,13 @@ function SuggestionCard({
   busy,
   onApprove,
   onDecline,
+  departmentTitle,
 }: {
   item: WatchlistItem;
   busy: boolean;
   onApprove: (slug: string) => void;
   onDecline: (slug: string, reason: WatchDeclineReason) => void;
+  departmentTitle?: string;
 }) {
   const stamp = policyStamp(item);
   return (
@@ -176,6 +179,11 @@ function SuggestionCard({
       {item.notes && <p className="text-xs text-fg mt-2">{item.notes}</p>}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-fg-muted mt-2">
         {stamp.entity && <span>about: {stamp.entity}</span>}
+        {item.route_to_department && (
+          <span title="This department's head was asked to review it">
+            for: {departmentTitle ?? item.route_to_department}
+          </span>
+        )}
         <span>suggested {formatRelTime(item.created_at)} ago</span>
         <span>seen in shadow: {item.fired_count} signal{item.fired_count === 1 ? "" : "s"}</span>
         {stamp.source_url && (
@@ -204,11 +212,13 @@ function WatchCard({
   onToggle,
   toggleBusy,
   onStopWatching,
+  departmentTitle,
 }: {
   item: WatchlistItem;
   onToggle: (slug: string, enabled: boolean) => void;
   toggleBusy: boolean;
   onStopWatching?: (slug: string, reason: WatchDeclineReason) => void;
+  departmentTitle?: string;
 }) {
   const isResearch = item.origin === "research";
   const stamp = policyStamp(item);
@@ -234,6 +244,7 @@ function WatchCard({
         <p className="text-[11px] text-fg-muted mb-2">
           <span className="text-indigo-300">Added by the Executive</span>
           {stamp.entity ? ` · about ${stamp.entity}` : ""}
+          {item.route_to_department ? ` · for ${departmentTitle ?? item.route_to_department}` : ""}
           {item.notes ? ` · ${item.notes}` : ""}
         </p>
       )}
@@ -502,6 +513,8 @@ export default function WatchlistPage() {
   const [showAdd, setShowAdd] = useState(false);
   const [busySlugs, setBusySlugs] = useState<Set<string>>(new Set());
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  // slug → title for the "for: <department>" label on routed watches.
+  const [departmentTitles, setDepartmentTitles] = useState<Record<string, string>>({});
 
   const toggleCollapsed = (key: string) =>
     setCollapsed((c) => ({ ...c, [key]: !c[key] }));
@@ -544,6 +557,11 @@ export default function WatchlistPage() {
 
   useEffect(() => {
     refresh();
+    listDepartments()
+      .then((states) =>
+        setDepartmentTitles(Object.fromEntries(states.map((d) => [d.config.slug, d.config.title]))),
+      )
+      .catch(() => {});
   }, []);
 
   function markBusy(slug: string, busy: boolean) {
@@ -702,6 +720,7 @@ export default function WatchlistPage() {
                     busy={busySlugs.has(item.slug)}
                     onApprove={approve}
                     onDecline={decline}
+                    departmentTitle={departmentTitles[item.route_to_department]}
                   />
                 ))}
               </div>
@@ -742,6 +761,7 @@ export default function WatchlistPage() {
                           onToggle={toggle}
                           toggleBusy={busySlugs.has(item.slug)}
                           onStopWatching={stopWatching}
+                          departmentTitle={departmentTitles[item.route_to_department]}
                         />
                       ))}
                     </div>

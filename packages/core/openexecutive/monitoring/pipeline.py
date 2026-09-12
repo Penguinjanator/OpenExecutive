@@ -278,6 +278,13 @@ def _signal_to_alert_event(
         # into the existing card (alerts.pipeline) while the signal-level
         # dedup_key keeps every observation in external_signals.
         dedup_hint=f"watch:{item.slug}",
+        # A watch that belongs to a department (set by the research policy
+        # from the department's watched entities, or by hand) sends its
+        # alerts to that department's head and tags them department:<slug>
+        # (alerts.pipeline reads both), so they queue on the head's /today
+        # instead of the principal's.
+        routed_to_person_id=item.route_to_person_id,
+        channel=f"department:{item.route_to_department}" if item.route_to_department else None,
     )
 
 

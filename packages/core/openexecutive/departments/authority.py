@@ -171,6 +171,8 @@ def propose_via_alert(
     body: str,
     suggested_action: str = "",
     extra_tags: list[str] | None = None,
+    *,
+    external_id_suffix: str = "",
 ) -> int | None:
     """Persist a proposal as an alert routed to a specific Person.
 
@@ -180,19 +182,31 @@ def propose_via_alert(
     and future resolvers can filter/match without parsing the body;
     ``extra_tags`` lets a caller carry the originating alert's tags (e.g.
     a ``comp`` / ``legal`` marker) onto the proposal.
+
+    ``external_id_suffix`` turns the card into a recurring one: an open
+    (unread) card with the same dedup key is refreshed in place with the new
+    body instead of a second row being inserted, and once the person has
+    acted on it a fresh card is minted only when the suffix changes (callers
+    pass e.g. the ISO week). Without a suffix the proposal is one-shot and a
+    repeat with the same summary is suppressed for good.
     """
-    from openexecutive.alerts.store import insert_alert
+    from openexecutive.alerts.store import coalesce_alert, insert_alert
 
     topic_tags = [f"department:{department_slug}", f"person:{person_id}"]
     for tag in extra_tags or []:
         if tag not in topic_tags:
             topic_tags.append(tag)
     dedup_key = f"proposal:{department_slug}:{person_id}:{summary[:60]}"
+    external_id = f"{dedup_key}:{external_id_suffix}" if external_id_suffix else dedup_key
 
     try:
+        if external_id_suffix and coalesce_alert(
+            source="authority_gate", dedup_key=dedup_key, severity="medium", body=body,
+        ):
+            return None
         return insert_alert(
             source="authority_gate",
-            external_id=dedup_key,
+            external_id=external_id,
             severity="medium",
             headline=summary,
             body=body,

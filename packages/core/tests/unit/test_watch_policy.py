@@ -46,13 +46,26 @@ def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     db_path = tmp_path / "policy.db"
     monkeypatch.setattr("openexecutive.memory.episodic.DB_PATH", db_path)
     monkeypatch.setattr("openexecutive.alerts.store.DB_PATH", db_path)
+    monkeypatch.setattr("openexecutive.departments.store.DB_PATH", db_path)
+    monkeypatch.setattr("openexecutive.people.store.DB_PATH", db_path)
     initialize_episodic_db(db_path)
     initialize_alerts_db(db_path)
     ms.initialize_db(db_path)
+    from openexecutive.departments import registry as dept_registry
+    from openexecutive.departments import store as dept_store
+    from openexecutive.people import registry as people_registry
+    from openexecutive.people import store as people_store
+
+    dept_store.initialize_db(db_path)
+    people_store.initialize_db(db_path)
+    dept_registry.invalidate()
+    people_registry.invalidate()
     audit = AuditLogger(db_path=db_path)
     audit.initialize_db()
     set_audit_logger(audit)
-    return db_path
+    yield db_path
+    dept_registry.invalidate()
+    people_registry.invalidate()
 
 
 def _profile() -> CompanyProfile:
@@ -114,12 +127,13 @@ def test_vocabulary_covers_profile_initiatives_and_watch_labels(db: Path) -> Non
     vocab = wp.grounding_vocabulary(
         _profile(), [SimpleNamespace(title="Launch Helios API")], ms.list_watchlist(db_path=db),
     )
-    assert vocab["sente labs"] == wp.KIND_COMPANY
-    assert vocab["acme corp"] == wp.KIND_COMPETITOR
-    assert vocab["stripe"] == wp.KIND_VENDOR
-    assert vocab["acme"] == wp.KIND_TICKER
-    assert vocab["launch helios api"] == wp.KIND_INITIATIVE
-    assert vocab["hubspot"] == wp.KIND_WATCH and vocab["hubs"] == wp.KIND_WATCH
+    assert vocab["sente labs"].kind == wp.KIND_COMPANY
+    assert vocab["acme corp"].kind == wp.KIND_COMPETITOR
+    assert vocab["stripe"].kind == wp.KIND_VENDOR
+    assert vocab["acme"].kind == wp.KIND_TICKER
+    assert vocab["launch helios api"].kind == wp.KIND_INITIATIVE
+    assert vocab["hubspot"].kind == wp.KIND_WATCH and vocab["hubs"].kind == wp.KIND_WATCH
+    assert all(entry.department == "" for entry in vocab.values())
 
 
 def test_match_entity_is_token_based_and_prefers_company_data() -> None:
@@ -269,7 +283,7 @@ def test_own_source_uses_the_site_label_only() -> None:
 def test_vocabulary_prefers_the_strongest_kind() -> None:
     profile = CompanyProfile.model_validate({"name": "Acme", "vendors": ["Acme"], "tickers": ["ACME"]})
     vocab = wp.grounding_vocabulary(profile, [SimpleNamespace(title="Acme")], [])
-    assert vocab["acme"] == wp.KIND_COMPANY
+    assert vocab["acme"].kind == wp.KIND_COMPANY
 
 
 def test_history_adjusts_only_with_enough_samples() -> None:
@@ -575,7 +589,7 @@ def test_vocabulary_from_url_targets_uses_the_site_label(db: Path) -> None:
     ms.insert_watchlist_item(slug="vendor-stripe", signal_type="vendor_status",
                              target="https://status.stripe.com/history.atom", db_path=db)
     vocab = wp.grounding_vocabulary(CompanyProfile(name="X"), [], ms.list_watchlist(db_path=db))
-    assert vocab.get("stripe") == wp.KIND_WATCH
+    assert vocab["stripe"].kind == wp.KIND_WATCH
     assert not any(t.startswith("https") for t in vocab)
     assert wp.match_entity("Status Labs", vocab) is None
 
@@ -641,3 +655,203 @@ def test_insert_failure_is_reported_without_exception_text(db: Path, monkeypatch
     out = wp.apply_proposals([_proposal()], [_finding()], _ctx(), db_path=db)
     assert out[0]["outcome"] == "rejected" and "see server log" in out[0]["result_preview"]
     assert "/secret/path" not in out[0]["result_preview"]
+
+
+# --------------------------------------------------------------------- #
+# Departments + episodic decisions
+# --------------------------------------------------------------------- #
+
+
+def _department(slug: str, title: str, *, watched: list[str] | None = None,
+                scope: list[str] | None = None, head: int | None = None,
+                goals: list[str] | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        config=SimpleNamespace(
+            slug=slug, title=title, head_person_id=head,
+            watched_entities=list(watched or []),
+            charter=SimpleNamespace(scope=list(scope or [])),
+        ),
+        goals=[SimpleNamespace(key_result=g) for g in (goals or [])],
+    )
+
+
+def _finance(head: int | None = 7) -> SimpleNamespace:
+    return _department(
+        "finance", "Finance", watched=["Brex"], scope=["Expense card programs"],
+        goals=["Close the books in 5 days"], head=head,
+    )
+
+
+def _dept_ctx(*departments: Any, existing: list[Any] | None = None, **kw: Any) -> wp.PolicyContext:
+    profile = _profile()
+    departments = departments or (_finance(),)
+    existing = existing or []
+    return wp.PolicyContext(
+        vocabulary=wp.grounding_vocabulary(profile, [], existing, list(departments)),
+        priority_terms=wp.priority_terms(profile),
+        existing=existing,
+        departments=wp.department_refs(list(departments)),
+        **kw,
+    )
+
+
+def _brex_finding(**kw: Any) -> ResearchFinding:
+    return _finding(
+        title="Brex outage", summary="Brex card authorizations failed for 2h on 2026-09-01.",
+        relevant_urls=["https://status.brex.com/incidents/1"], source_specialist="cfo", **kw,
+    )
+
+
+def _brex_proposal(**kw: Any) -> wp.WatchProposal:
+    return _proposal(
+        slug="vendor-brex", signal_type="vendor_status", target="https://status.brex.com",
+        grounding_entity="Brex", rationale="Finance is on Brex cards", **kw,
+    )
+
+
+def test_department_vocabulary_kinds_and_department_merge() -> None:
+    finance = _department("finance", "Finance", watched=["Brex", "Acme Corp"],
+                          scope=["Expense card programs"], goals=["Close the books in 5 days"])
+    vocab = wp.grounding_vocabulary(_profile(), [], [], [finance])
+    assert vocab["brex"] == wp.VocabEntry(wp.KIND_DEPARTMENT_ENTITY, "finance")
+    assert vocab["expense card programs"] == wp.VocabEntry(wp.KIND_DEPARTMENT_SCOPE, "finance")
+    assert vocab["close the books in 5 days"].kind == wp.KIND_DEPARTMENT_SCOPE
+    # A profile competitor that Finance also lists keeps the stronger kind
+    # and still routes to Finance.
+    assert vocab["acme corp"] == wp.VocabEntry(wp.KIND_COMPETITOR, "finance")
+    # Legacy plain-kind dicts still match.
+    assert wp.match_entity("Brex Inc", vocab) == ("brex", wp.KIND_DEPARTMENT_ENTITY)
+    assert wp.match_entity("Brex", {"brex": wp.KIND_VENDOR}) == ("brex", wp.KIND_VENDOR)
+    assert wp.department_refs([_finance(head=7)]) == {"finance": wp.DepartmentRef("Finance", 7)}
+
+
+def test_department_watched_entity_grounds_a_direct_add_and_routes(db: Path) -> None:
+    d = wp.classify(_brex_proposal(), _brex_finding(), _dept_ctx())
+    assert d.tier == wp.TIER_DIRECT and d.grounding_kind == wp.KIND_DEPARTMENT_ENTITY
+    assert d.department == "finance" and "Finance watched entity" in d.reasons[0]
+    out = wp.apply_proposals([_brex_proposal()], [_brex_finding()], _dept_ctx(), db_path=db)
+    assert [o["outcome"] for o in out] == ["added"]
+    row = ms.get_watchlist_item_by_slug("vendor-brex", db_path=db)
+    assert row is not None and row.mode == MODE_ACTIVE
+    assert row.route_to_department == "finance" and row.route_to_person_id == 7
+    assert wp.policy_stamp_of(row)["department"] == "finance"
+
+
+def test_department_scope_grounding_is_suggestion_only(db: Path) -> None:
+    p = _proposal(slug="rss-expense", signal_type="rss", target="https://expensecards.example/feed",
+                  grounding_entity="Expense card programs")
+    f = _finding(title="Expense card programs shift", summary="New expense card programs launched.",
+                 relevant_urls=["https://expensecards.example/feed"], verification="confirmed",
+                 source_specialist="cfo,coo")
+    d = wp.classify(p, f, _dept_ctx())
+    assert d.tier == wp.TIER_SUGGEST and d.department == "finance"
+    assert d.grounding_kind == wp.KIND_DEPARTMENT_SCOPE and "Finance scope item" in d.reasons[0]
+    # Even on its own source a scope item cannot be direct.
+    own = _proposal(slug="rss-programs", signal_type="rss", target="https://programs.example/feed",
+                    grounding_entity="Expense card programs")
+    own_f = _finding(title="programs", summary="s", relevant_urls=["https://programs.example/feed"],
+                     verification="confirmed", source_specialist="cfo,coo")
+    own_d = wp.classify(own, own_f, _dept_ctx())
+    assert own_d.tier == wp.TIER_SUGGEST and any("grounded only in a department_scope" in r for r in own_d.reasons)
+    out = wp.apply_proposals([p], [f], _dept_ctx(), db_path=db)
+    assert out[0]["outcome"] == "suggested"
+    row = ms.get_watchlist_item_by_slug("rss-expense", db_path=db)
+    assert row is not None and row.mode == MODE_DRY_RUN and row.route_to_department == "finance"
+
+
+def test_recent_decision_adds_a_point_and_a_routing_hint() -> None:
+    decided = SimpleNamespace(summary="Evaluate Stripe as the EU payments vendor",
+                              department="finance", timestamp="2026-09-01T00:00:00+00:00")
+    p = _proposal(slug="vendor-stripe", signal_type="vendor_status", target="https://status.stripe.com",
+                  grounding_entity="Stripe")
+    f = _finding(title="Stripe incident", summary="Stripe API errors on 2026-09-01.",
+                 relevant_urls=["https://status.stripe.com/"], confidence="medium")
+    base = wp.classify(p, f, _dept_ctx())
+    with_decision = wp.classify(p, f, _dept_ctx(recent_decisions=[decided]))
+    assert with_decision.score == base.score + 1 and "named in a recent decision" in with_decision.reasons
+    # Stripe is a profile vendor with no department; the decision's is used.
+    assert base.department == "" and with_decision.department == "finance"
+    # A decision for an unknown department is not a routing hint, and one
+    # that names nothing relevant scores nothing.
+    other = SimpleNamespace(summary="Move Stripe to annual billing", department="ops", timestamp="")
+    assert wp.classify(p, f, _dept_ctx(recent_decisions=[other])).department == ""
+    unrelated = SimpleNamespace(summary="Hire two SDRs in Q4", department="finance", timestamp="")
+    assert wp.classify(p, f, _dept_ctx(recent_decisions=[unrelated])).score == base.score
+    assert wp.named_in_decision("acme corp", SimpleNamespace(summary="Acme Corp pricing review"))
+    assert not wp.named_in_decision("acme corp", SimpleNamespace(summary="The corp retreat"))
+
+
+def test_recent_decisions_apply_the_lookback(db: Path) -> None:
+    from openexecutive.memory.episodic import store_decision
+
+    store_decision("finance", "Evaluate Brex for expense cards", db_path=db)
+    store_decision("ops", "Retire the old CRM", db_path=db)
+    import sqlite3
+
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE decisions SET timestamp = ? WHERE summary = 'Retire the old CRM'",
+                     ((datetime.now(UTC) - timedelta(days=120)).isoformat(),))
+    rows = wp.recent_decisions(db_path=db)
+    assert [r.summary for r in rows] == ["Evaluate Brex for expense cards"]
+
+
+def test_department_head_gets_one_card_per_run_coalesced_weekly(db: Path) -> None:
+    from openexecutive.alerts.store import list_alerts, set_status
+    from openexecutive.people import store as people_store
+
+    head = people_store.upsert_person(full_name="Sarah", department_slugs=["finance"])
+    finance = _finance(head=head)
+
+    def _run(slug: str, now: datetime) -> None:
+        p = _proposal(slug=slug, signal_type="rss", target=f"https://{slug}.example/feed",
+                      grounding_entity="Expense card programs")
+        f = _finding(title="Expense card programs", summary="expense card programs news",
+                     relevant_urls=[f"https://{slug}.example/feed"])
+        wp.apply_proposals([p], [f], _dept_ctx(finance, now=now), db_path=db)
+
+    now = datetime(2026, 9, 8, 9, tzinfo=UTC)
+    _run("rss-a", now)
+    cards = [a for a in list_alerts(limit=20, db_path=db) if a.source == "authority_gate"]
+    assert len(cards) == 1 and cards[0].routed_to_person_id == head
+    assert cards[0].headline == "Watch suggestions for Finance" and "rss-a" in cards[0].body
+    assert "department:finance" in cards[0].topic_tags and "watchlist" in cards[0].topic_tags
+    # Same week again: the open card is refreshed, not duplicated.
+    _run("rss-b", now + timedelta(days=1))
+    cards = [a for a in list_alerts(limit=20, db_path=db) if a.source == "authority_gate"]
+    assert len(cards) == 1 and "rss-b" in cards[0].body
+    # Once the head acted on it, nothing more this week ...
+    set_status(cards[0].id, "acknowledged", db_path=db)
+    _run("rss-c", now + timedelta(days=2))
+    assert len([a for a in list_alerts(limit=20, db_path=db) if a.source == "authority_gate"]) == 1
+    # ... and a fresh card next week.
+    _run("rss-d", now + timedelta(days=7))
+    assert len([a for a in list_alerts(limit=20, db_path=db) if a.source == "authority_gate"]) == 2
+
+
+def test_department_card_falls_back_to_the_principal(db: Path) -> None:
+    from openexecutive.alerts.store import list_alerts
+    from openexecutive.people import store as people_store
+
+    principal = people_store.upsert_person(full_name="Jo", is_principal=True)
+    p = _proposal(slug="rss-x", signal_type="rss", target="https://x.example/feed",
+                  grounding_entity="Expense card programs")
+    f = _finding(title="Expense card programs", summary="s", relevant_urls=["https://x.example/feed"])
+    wp.apply_proposals([p], [f], _dept_ctx(_finance(head=None)), db_path=db)
+    cards = [a for a in list_alerts(limit=20, db_path=db) if a.source == "authority_gate"]
+    assert len(cards) == 1 and cards[0].routed_to_person_id == principal
+    row = ms.get_watchlist_item_by_slug("rss-x", db_path=db)
+    assert row is not None and row.route_to_department == "finance" and row.route_to_person_id is None
+
+
+def test_nudge_counts_only_the_principals_suggestions(db: Path) -> None:
+    from openexecutive.alerts.store import list_alerts
+
+    for i in range(3):
+        ms.insert_watchlist_item(
+            slug=f"rss-d{i}", signal_type="rss", target=f"https://d{i}.com/feed",
+            mode=MODE_DRY_RUN, origin=ORIGIN_RESEARCH_PROPOSED, route_to_department="finance",
+            db_path=db,
+        )
+        _backdate(db, f"rss-d{i}", 8)
+    assert wp.sweep(datetime.now(UTC), db_path=db)["nudged"] == 0
+    assert not [a for a in list_alerts(limit=10, db_path=db) if a.source == wp.NUDGE_ALERT_SOURCE]

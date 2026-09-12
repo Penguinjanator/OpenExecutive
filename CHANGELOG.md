@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Research watch policy grounds in departments and recent decisions, and
+  routes to department heads.** Departments gain a `watched_entities` list
+  (`PATCH /departments/{slug}`, edited one per line on the department page).
+  Named there, an entity is strong grounding for the research watch policy —
+  like a profile vendor or ticker — so a proposal about it can be added on
+  its own, and the watch is inserted with `route_to_department` /
+  `route_to_person_id` (the head). Those columns now actually route: every
+  watch alert carries the department's head and a `department:<slug>` tag,
+  so it queues on the head's briefing instead of the principal's. Charter
+  scope phrases and goal key results ground suggestions only. Suggestions in
+  a department's area go to its head as one "Watch suggestions for
+  <Department>" card per run (refreshed in place, re-issued weekly after it
+  is handled; the principal when the department has no head), and the
+  principal's pile-up nudge counts only their own. The ten most recent
+  episodic decisions from the last 90 days are rendered to the research
+  council and add a point to a proposal whose entity they name (with the
+  decision's department as a routing hint). The research fingerprint tracks
+  department watch interests and the decisions that name a known entity, so
+  a new watched entity or a relevant decision triggers the next scan.
+  `/watchlist` shows "for: <department>" on routed rows.
 - **Research watchlist policy — grounded watches go straight in, uncertain
   ones become suggestions.** The research council's watchlist pass no longer
   adds watches itself; its only tool is `propose_watch`, and deterministic

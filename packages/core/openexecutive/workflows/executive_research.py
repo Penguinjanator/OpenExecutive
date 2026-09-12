@@ -242,7 +242,8 @@ def _build_watchlist_system(max_direct: int, max_suggest: int) -> str:
         "## WHAT BELONGS ON THE WATCHLIST\n\n"
         "An ongoing, externally-observable source tied to a NAMED company "
         "entity — a competitor, vendor, ticker or initiative from the company "
-        "context — that we'd want flagged when it next changes: a public "
+        "context, or an entity a department watches or a recent decision "
+        "names — that we'd want flagged when it next changes: a public "
         "competitor's ticker or filings, a vendor's status page, a competitor's "
         "own blog / changelog feed. A one-off event already fully known is NOT "
         "watchlist material; the *ongoing source* behind it might be. "
@@ -402,11 +403,26 @@ class ExecutiveResearchWorkflow(Workflow):
             logger.exception("research: list_watchlist failed")
             existing_watchlist = []
 
+        # Departments (watched entities, scope, goals) and recent decisions
+        # are current company intent the static profile lacks; both feed
+        # the watch policy's grounding and routing.
+        try:
+            from openexecutive.departments.store import list_departments
+
+            departments = list(list_departments())
+        except Exception:
+            logger.exception("research: list_departments failed")
+            departments = []
+        from openexecutive.monitoring.research.watch_policy import recent_decisions
+
+        decisions = recent_decisions()
+
         research_context = _render_research_context(
             profile=profile,
             initiatives=initiatives,
             existing_watchlist=existing_watchlist,
             note=inputs.note,
+            decisions=decisions,
         )
 
         yield WorkflowEvent(
@@ -415,7 +431,8 @@ class ExecutiveResearchWorkflow(Workflow):
             summary=(
                 f"profile_loaded={profile is not None and not profile.is_empty()} "
                 f"initiatives={len(initiatives)} "
-                f"existing_watchlist={len(existing_watchlist)}"
+                f"existing_watchlist={len(existing_watchlist)} "
+                f"departments={len(departments)} decisions={len(decisions)}"
             ),
         )
 
@@ -591,6 +608,7 @@ class ExecutiveResearchWorkflow(Workflow):
             watchlist_calls = await _watchlist_analysis_loop(
                 deduped, existing_watchlist,
                 profile=profile, initiatives=initiatives,
+                departments=departments, decisions=decisions,
             )
         except Exception:
             logger.exception("research: watchlist-analysis pass failed")
@@ -897,6 +915,8 @@ async def _watchlist_analysis_loop(
     *,
     profile: Any = None,
     initiatives: list[Any] | None = None,
+    departments: list[Any] | None = None,
+    decisions: list[Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Dedicated forward-looking pass: the model PROPOSES sources to monitor
     via ``propose_watch``; ``watch_policy.apply_proposals`` then decides,
@@ -951,6 +971,7 @@ async def _watchlist_analysis_loop(
                 findings, existing_watchlist,
                 declines=declines, outcome_counts=outcome_counts,
                 specialist_counts=specialist_counts,
+                departments=departments,
             ),
         },
     ]
@@ -1035,12 +1056,14 @@ async def _watchlist_analysis_loop(
 
     ctx = watch_policy.PolicyContext(
         vocabulary=watch_policy.grounding_vocabulary(
-            profile, list(initiatives or []), list(existing_watchlist),
+            profile, list(initiatives or []), list(existing_watchlist), list(departments or []),
         ),
         priority_terms=watch_policy.priority_terms(profile),
         existing=list(existing_watchlist),
         outcome_counts=outcome_counts,
         settings=policy_settings,
+        departments=watch_policy.department_refs(departments),
+        recent_decisions=list(decisions or []),
     )
     decided = watch_policy.apply_proposals(proposals, findings, ctx)
     return refused + decided
@@ -1088,6 +1111,7 @@ def _render_research_context(
     initiatives: list[Any],
     existing_watchlist: list[Any],
     note: str,
+    decisions: list[Any] | None = None,
 ) -> str:
     """Build the user-turn block passed to every specialist call."""
     from datetime import UTC, datetime, timedelta
@@ -1144,6 +1168,22 @@ def _render_research_context(
             target = getattr(item, "target", "")
             if slug:
                 parts.append(f"- {slug} [{signal_type}] target={target}")
+        parts.append("")
+
+    if decisions:
+        # What the company recently decided is the freshest statement of
+        # what matters; the static profile lags it by design.
+        parts.append("RECENT DECISIONS:")
+        for d in decisions[:10]:
+            summary = str(getattr(d, "summary", "") or "").strip()
+            if not summary:
+                continue
+            when = str(getattr(d, "timestamp", "") or "")[:10]
+            dept = str(getattr(d, "department", "") or "")
+            line = f"- {when}" if when else "-"
+            if dept:
+                line += f" [{dept}]"
+            parts.append(f"{line}: {summary[:160]}")
         parts.append("")
 
     parts.append(
@@ -1237,10 +1277,12 @@ def _render_watchlist_turn(
     declines: list[Any] | None = None,
     outcome_counts: dict[tuple[str, str], dict[str, int]] | None = None,
     specialist_counts: dict[str, dict[str, int]] | None = None,
+    departments: list[Any] | None = None,
 ) -> str:
     """User-turn for the watchlist-analysis pass: the findings (with URLs),
     the current watchlist with its trust record, targets the principal
-    declined, and how the policy's past guesses turned out."""
+    declined, what each department has asked to watch, and how the
+    policy's past guesses turned out."""
     parts: list[str] = ["FINDINGS FROM THIS RESEARCH RUN:\n"]
     for i, f in enumerate(findings, start=1):
         block = (
@@ -1311,6 +1353,20 @@ def _render_watchlist_turn(
     if history_lines:
         parts.append("\nHOW PAST PROPOSALS TURNED OUT:")
         parts.extend(history_lines[:12])
+
+    interest_lines: list[str] = []
+    for state in departments or []:
+        config = getattr(state, "config", None)
+        slug = getattr(config, "slug", "")
+        entities = [str(e) for e in (getattr(config, "watched_entities", None) or []) if str(e).strip()]
+        if slug and entities:
+            interest_lines.append(f"- {slug}: {', '.join(entities[:20])}")
+    if interest_lines:
+        parts.append(
+            "\nDEPARTMENT WATCH INTERESTS (entities a department asked to have "
+            "watched — ground a proposal about one in that entity):"
+        )
+        parts.extend(interest_lines[:20])
 
     parts.append(
         "\nDecide which ongoing sources are worth monitoring and call "

@@ -251,3 +251,29 @@ def test_propose_via_alert_dedup() -> None:
     assert first is not None
     second = propose_via_alert("finance", cfo_id, "Same summary", "body")
     assert second is None  # duplicate suppressed
+
+
+def test_propose_via_alert_suffix_coalesces_then_reissues() -> None:
+    """With an external_id_suffix the card is recurring: an open one is
+    refreshed in place, an acknowledged one is left alone until the suffix
+    changes."""
+    from openexecutive.alerts import store as alert_store
+
+    _set_dept_level("finance", AuthorityLevel.PROPOSE_ONLY)
+    cfo_id = people_store.upsert_person(full_name="Sarah")
+
+    first = propose_via_alert("finance", cfo_id, "Watch suggestions", "body one",
+                              external_id_suffix="2026-W37")
+    assert first is not None
+    # Open card: refreshed, no new row.
+    assert propose_via_alert("finance", cfo_id, "Watch suggestions", "body two",
+                             external_id_suffix="2026-W37") is None
+    refreshed = alert_store.get_alert(first)
+    assert refreshed is not None and refreshed.body == "body two" and refreshed.occurrence_count == 2
+    # Acknowledged: same week stays quiet, next week mints a new card.
+    alert_store.set_status(first, "acknowledged")
+    assert propose_via_alert("finance", cfo_id, "Watch suggestions", "body three",
+                             external_id_suffix="2026-W37") is None
+    nxt = propose_via_alert("finance", cfo_id, "Watch suggestions", "body four",
+                            external_id_suffix="2026-W38")
+    assert nxt is not None and nxt != first

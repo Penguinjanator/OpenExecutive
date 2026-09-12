@@ -43,10 +43,23 @@ def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     db_path = tmp_path / "test_research.db"
     monkeypatch.setattr("openexecutive.memory.episodic.DB_PATH", db_path)
     monkeypatch.setattr("openexecutive.alerts.store.DB_PATH", db_path)
+    monkeypatch.setattr("openexecutive.departments.store.DB_PATH", db_path)
+    monkeypatch.setattr("openexecutive.people.store.DB_PATH", db_path)
     initialize_episodic_db(db_path)
     initialize_alerts_db(db_path)
     monitoring_store.initialize_db(db_path)
-    return db_path
+    from openexecutive.departments import registry as dept_registry
+    from openexecutive.departments import store as dept_store
+    from openexecutive.people import registry as people_registry
+    from openexecutive.people import store as people_store
+
+    dept_store.initialize_db(db_path)
+    people_store.initialize_db(db_path)
+    dept_registry.invalidate()
+    people_registry.invalidate()
+    yield db_path
+    dept_registry.invalidate()
+    people_registry.invalidate()
 
 
 def _finding(title: str = "TSLA: Tesla cut prices", url: str = "https://example.com/feed.xml") -> ResearchFinding:
@@ -238,6 +251,59 @@ def test_watchlist_turn_renders_trust_declines_and_history(db: Path) -> None:
     assert "stock watches grounded in a competitor: 4 approved / 1 declined or dropped" in text
     assert "proposals from cso: 2 approved / 1 declined or dropped" in text
     assert "propose_watch" in text
+    assert "DEPARTMENT WATCH INTERESTS" not in text
+
+
+def test_watchlist_turn_lists_department_interests() -> None:
+    from types import SimpleNamespace
+
+    finance = SimpleNamespace(config=SimpleNamespace(slug="finance", watched_entities=["Brex", "Stripe"]))
+    empty = SimpleNamespace(config=SimpleNamespace(slug="ops", watched_entities=[]))
+    text = er._render_watchlist_turn([_finding()], [], departments=[finance, empty])
+    assert "DEPARTMENT WATCH INTERESTS" in text and "- finance: Brex, Stripe" in text
+    assert "- ops" not in text
+
+
+def test_research_context_renders_recent_decisions() -> None:
+    from types import SimpleNamespace
+
+    decisions = [
+        SimpleNamespace(summary="Evaluate Brex for expense cards", department="finance",
+                        timestamp="2026-09-01T10:00:00+00:00"),
+        SimpleNamespace(summary="", department="", timestamp=""),
+    ]
+    text = er._render_research_context(
+        profile=_profile(), initiatives=[], existing_watchlist=[], note="", decisions=decisions,
+    )
+    assert "RECENT DECISIONS:" in text
+    assert "- 2026-09-01 [finance]: Evaluate Brex for expense cards" in text
+    without = er._render_research_context(profile=_profile(), initiatives=[], existing_watchlist=[], note="")
+    assert "RECENT DECISIONS" not in without
+
+
+@pytest.mark.asyncio
+async def test_watchlist_pass_routes_department_grounded_watch(
+    db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.departments import store as dept_store
+    from openexecutive.people import store as people_store
+
+    dept_store.seed_default_departments(db)
+    head = people_store.upsert_person(full_name="Sarah", department_slugs=["finance"])
+    dept_store.update_department("finance", watched_entities=["Brex"], head_person_id=head, db_path=db)
+    _stub_provider(monkeypatch, [
+        _resp([_propose("vendor-brex", "vendor_status", "https://status.brex.com", entity="Brex")]),
+        _resp([]),
+    ])
+    finding = _finding(title="Brex outage", url="https://status.brex.com/incidents/1")
+    # finding_index is 1-based in the tool (matches the "#1" render).
+    out = await er._watchlist_analysis_loop(
+        [finding, _finding()], [], profile=_profile(), initiatives=[],
+        departments=dept_store.list_departments(db), decisions=[],
+    )
+    assert [c["outcome"] for c in out] == ["added"]
+    row = monitoring_store.get_watchlist_item_by_slug("vendor-brex", db_path=db)
+    assert row is not None and row.route_to_department == "finance" and row.route_to_person_id == head
 
 
 @pytest.mark.asyncio

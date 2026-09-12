@@ -75,9 +75,17 @@ def compute_research_state_hash(db_path: Path | None = None) -> str:
     """Hash the inputs the research workflow reads.
 
     The inputs are: the company profile's prompt-form text, the
-    titles + statuses of every active initiative, and the slug+target
-    list of every enabled, ACTIVE watchlist row. A change to any of these
-    invalidates the prior research; everything else is irrelevant.
+    titles + statuses of every active initiative, the slug+target list of
+    every enabled, ACTIVE watchlist row, each department's watched
+    entities / charter scope / goal key results, and the recent episodic
+    decisions that name something in the grounding vocabulary. A change
+    to any of these invalidates the prior research; everything else is
+    irrelevant.
+
+    Only *matching* decisions count: the chat memory extractor writes
+    decisions freely, and one that names nothing the policy knows cannot
+    change what the policy would do, so it must not trigger a 7-specialist
+    re-run.
 
     Dry-run rows are excluded on purpose: the research pass files its own
     suggestions as dry-run rows, and the principal approving or declining
@@ -143,6 +151,36 @@ def compute_research_state_hash(db_path: Path | None = None) -> str:
     except Exception:
         logger.exception("research.scheduler: watchlist load failed")
         parts.append("WATCHLIST_ERROR")
+
+    departments: list = []
+    try:
+        from openexecutive.departments.store import list_departments
+
+        departments = list(list_departments())
+        parts.append("DEPARTMENTS:")
+        for state in sorted(departments, key=lambda d: d.config.slug):
+            parts.append(
+                f"{state.config.slug}::"
+                + "|".join(state.config.watched_entities)
+                + "::" + "|".join(state.config.charter.scope)
+                + "::" + "|".join(g.key_result for g in state.goals)
+            )
+    except Exception:
+        logger.exception("research.scheduler: departments load failed")
+        parts.append("DEPARTMENTS_ERROR")
+
+    try:
+        from openexecutive.monitoring.research import watch_policy
+
+        vocabulary = watch_policy.grounding_vocabulary(profile, [], [], departments)
+        parts.append("DECISIONS:")
+        for decision in watch_policy.recent_decisions(db_path=db_path):
+            summary = str(getattr(decision, "summary", "") or "")
+            if any(watch_policy.named_in_decision(term, decision) for term in vocabulary):
+                parts.append(f"{getattr(decision, 'id', '')}::{summary[:120]}")
+    except Exception:
+        logger.exception("research.scheduler: decisions load failed")
+        parts.append("DECISIONS_ERROR")
 
     digest = hashlib.sha256("\n".join(parts).encode()).hexdigest()
     return digest

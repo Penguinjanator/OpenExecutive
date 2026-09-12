@@ -94,6 +94,13 @@ class DepartmentConfig(BaseModel):
     slack_channel_id: str | None = None
     discord_channel_id: str | None = None
     telegram_chat_id: str | None = None
+    # Named external entities this department wants monitored (vendors it
+    # is evaluating, competitors in its lane, tickers it tracks). The
+    # research watch policy treats these as strong grounding — like the
+    # company profile's `vendors` / `tickers` — so a proposal about one of
+    # them can be added to the watchlist directly and routed to this
+    # department (and its head) instead of waiting on the principal.
+    watched_entities: list[str] = Field(default_factory=list)
 
 
 class DepartmentState(BaseModel):

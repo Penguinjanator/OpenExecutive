@@ -1040,6 +1040,20 @@ departments:
   completeness: openexecutive.departments.completeness — measures how much of a department's required state is filled in (used by the Getting Started checklist).
   prompt_block: openexecutive.departments.prompt_block.render_org_block — produces the cached org block in system block 1.
   charters_dir: openexecutive.departments.charters — per-department playbooks loaded into the head persona.
+  watched_entities: |
+    `DepartmentConfig.watched_entities: list[str]` — external entities
+    (vendors under evaluation, competitors in the department's lane,
+    tickers) the department wants monitored. Column
+    `watched_entities_json TEXT NOT NULL DEFAULT '[]'`, added additively by
+    `_migrate_add_watched_entities_column` (same PRAGMA-guarded pattern as
+    the channel columns); a corrupt value reads back as []. PATCH
+    /departments/{slug} accepts `watched_entities` (<= 50 items, each
+    whitespace-collapsed, <= 128 chars, case-insensitive de-duplicated;
+    `[]` clears). Edited on /departments/{slug} ("Watched entities", one
+    per line). The research watch policy treats each as a strong
+    `department_entity` grounding term tagged with the department, so a
+    proposal about one can be added directly and is routed to the
+    department and its head — see research_watch_policy.
   channels: |
     Each department can optionally configure `slack_channel_id`,
     `discord_channel_id`, and `telegram_chat_id` on its row. When set,
@@ -1367,11 +1381,24 @@ external_monitoring:
     finding_index). `monitoring.research.watch_policy` decides deterministically:
     - grounding vocabulary = company name + competitive_landscape.primary_competitors
       + profile.vendors + profile.tickers + active initiative titles +
-      strategic_priorities.current_year (+ existing watch labels, which only
-      corroborate). The entity MUST match a company-data term for a direct add.
+      strategic_priorities.current_year + each department's `watched_entities`
+      (kind department_entity, strong) + each department's charter scope
+      phrases and goal key results (kind department_scope, suggestion-only)
+      (+ existing watch labels, which only corroborate). The entity MUST
+      match a company-data term for a direct add. Every vocabulary value is
+      a VocabEntry(kind, department): terms that came from a department carry
+      its slug, and a profile term a department also lists keeps the profile
+      kind but gains the department (stronger kind wins, department is kept).
     - vocabulary precedence when a term appears in several sources:
-      company > competitor > vendor > ticker > initiative > priority > watch.
+      company > competitor > department_entity > vendor > ticker > initiative
+      > priority > department_scope > watch.
       Partial (token) matching ignores stopwords and tokens < 4 chars.
+    - episodic decisions: the run loads the 10 most recent `decisions` rows
+      from the last 90 days (watch_policy.recent_decisions); a proposal whose
+      matched entity is named in one scores +1 ("named in a recent
+      decision"), and when the term has no department but the decision was
+      recorded for one, that department becomes the routing hint. Decisions
+      are rendered to every specialist as RECENT DECISIONS (user turn).
     - score ledger: +2 entity in company data (mandatory), +1 entity already
       watched under another source, +1 target is the entity's own source (for
       stock/edgar the grounding entity IS the ticker / a URL whose SITE LABEL —
@@ -1385,8 +1412,9 @@ external_monitoring:
       URL; a ticker/query target appears in the finding text or is the named
       entity. A strong finding cannot be borrowed for an unrelated page.
     - direct add at score >= 4 with the mandatory match AND the entity's OWN
-      source AND a strong kind (company / competitor / vendor / ticker —
-      initiative- or priority-grounded proposals are suggestions at most); model
+      source AND a strong kind (company / competitor / vendor / ticker /
+      department_entity — initiative-, priority- or department_scope-grounded
+      proposals are suggestions at most); model
       `certainty` can only downgrade; `query` never direct; a suggestion needs
       a linked finding and score >= 1 (SUGGEST_THRESHOLD) — nothing vouching
       for it is rejected; at or above WATCHLIST_MAX_ENABLED (40) enabled rows
@@ -1406,9 +1434,27 @@ external_monitoring:
       not_relevant decline on an ungrounded suggestion still blacklists it.
     - direct → mode=active, origin=research; suggestion → mode=dry_run,
       origin=research_proposed; rationale in `notes`; policy stamp (entity,
-      grounding_kind, specialist, score, reasons, source_url) in
+      grounding_kind, department, specialist, score, reasons, source_url) in
       config_json._policy. Reject: invalid target, same site + signal_type
       already watched, declined target, spent budget.
+    - routing: a department-grounded row is inserted with
+      route_to_department=<slug> and route_to_person_id=<the department's
+      head at insert time> (a later head change does not re-route existing
+      rows). monitoring.pipeline._signal_to_alert_event maps these onto the
+      AlertEvent (routed_to_person_id, channel="department:<slug>") for EVERY
+      watch, manual ones included, so alerts.pipeline routes the alert to the
+      head and tags it department:<slug> and it queues on the head's /today.
+    - department head approval: after the apply loop, suggestions are grouped
+      by department and ONE "Watch suggestions for <Title>" card per
+      department is filed via departments.authority.propose_via_alert
+      (source=authority_gate, routed to the head, or to the principal when
+      the department has no head; tags department:<slug>, person:<id>,
+      watchlist). propose_via_alert's new `external_id_suffix` (the ISO week)
+      makes the card recurring: an open card is refreshed in place
+      (coalesce_alert), an acknowledged one is not re-minted until the next
+      week. The principal's pile-up nudge counts only suggestions with no
+      route_to_department. /watchlist shows "for: <department>" on routed
+      suggestion and research cards. Approve/decline stay identity-free.
     - declines (`watchlist_declines`, keyed by normalized target — https
       forced, www. dropped, host/path lower-cased, query/fragment/trailing
       slash removed): explicit (Decline button, "Stop watching…",
@@ -1446,6 +1492,11 @@ external_monitoring:
       suggestion never spawns another nudge.
     - the research state fingerprint hashes only enabled + active rows, so
       approving / declining a suggestion never triggers a fresh research run.
+      It also hashes each department's watched_entities / charter scope /
+      goal key results, and the recent decisions whose summary names a
+      vocabulary term (only those: the chat extractor writes decisions
+      freely, and one naming nothing the policy knows cannot change what
+      the policy would do).
     - surfaces: /watchlist "Suggested by the Executive" (Approve / Decline…
       with reason), "Added by the Executive · rationale" on research cards
       with "Stop watching…", the morning brief's HANDLED block (watching /

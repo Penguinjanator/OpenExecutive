@@ -1870,6 +1870,10 @@ export interface DepartmentConfig {
   slack_channel_id: string | null;
   discord_channel_id: string | null;
   telegram_chat_id: string | null;
+  // Named external entities this department wants monitored. The research
+  // watch policy treats them as strong grounding: a proposal about one can
+  // be added to the watch list on its own and is routed to this department.
+  watched_entities: string[];
 }
 
 export type PeriodType = "week" | "month" | "quarter" | "year" | "ongoing";
@@ -1924,6 +1928,7 @@ export interface DepartmentPatch {
   slack_channel_id?: string | null;
   discord_channel_id?: string | null;
   telegram_chat_id?: string | null;
+  watched_entities?: string[];
 }
 
 export async function updateDepartment(slug: string, patch: DepartmentPatch): Promise<DepartmentState> {
