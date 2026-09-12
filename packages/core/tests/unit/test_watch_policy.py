@@ -1133,7 +1133,8 @@ def test_budgets_go_to_the_strongest_proposals_not_the_earliest(db: Path) -> Non
     """The dev run that motivated this: two score-3 suggestions filed first
     took the whole suggestion budget, and a score-4 Finance watched-entity
     proposal filed third was rejected as over budget. Proposals are now
-    applied strongest first; summaries keep file order."""
+    applied strongest first; summaries keep file order; ties keep file
+    order (the first-filed of the two score-3 proposals survives)."""
     ctx = _dept_ctx(settings=wp.PolicySettings(max_direct_adds=2, max_suggestions=2))
     # Two query watches (always suggestions) grounded in a competitor and a
     # vendor: score 3 each. Brex on its own status page, a Finance watched
@@ -1151,12 +1152,44 @@ def test_budgets_go_to_the_strongest_proposals_not_the_earliest(db: Path) -> Non
         _brex_finding(),
     ]
     out = wp.apply_proposals([weak_a, weak_b, strong], findings, ctx, db_path=db)
-    by_slug = {o["slug"]: o for o in out}
-    assert [o["slug"] for o in out] == ["q-globex", "q-stripe", strong.slug]  # file order kept
-    assert by_slug[strong.slug]["outcome"] == "suggested"
-    rejected = [slug for slug, o in by_slug.items() if o["outcome"] == "rejected"]
-    assert len(rejected) == 1 and rejected[0] in ("q-globex", "q-stripe")
-    assert "suggestion budget spent this run" in by_slug[rejected[0]]["result_preview"]
-    # A later, stronger proposal on the same site as an inserted one still
-    # counts it as already watched (the score is recomputed at insert time).
-    assert ms.get_watchlist_item_by_slug(strong.slug, db_path=db) is not None
+    assert [(o["slug"], o["outcome"]) for o in out] == [
+        ("q-globex", "suggested"), ("q-stripe", "rejected"), (strong.slug, "suggested"),
+    ]
+    assert "suggestion budget spent this run" in out[1]["result_preview"]
+
+
+def test_duplicate_target_keeps_its_strongest_filing(db: Path) -> None:
+    weak = _proposal(slug="rss-weak", grounding_entity="Initech")  # not in company data
+    strong = _proposal(slug="rss-strong", grounding_entity="Acme Corp")  # same target, direct
+    out = wp.apply_proposals([weak, strong], [_finding()], _ctx(), db_path=db)
+    assert [(o["slug"], o["outcome"]) for o in out] == [("rss-weak", "rejected"), ("rss-strong", "added")]
+    assert "duplicate target" in out[0]["result_preview"]
+
+
+def test_a_direct_add_outranks_a_higher_scoring_suggestion_for_the_last_slot(db: Path) -> None:
+    """Score is not the whole story: a standing query can outscore a direct
+    add but can only ever be a suggestion, so at the enabled-watch ceiling
+    the live add must take the slot."""
+    ctx = _ctx(settings=wp.PolicySettings(max_enabled=1, max_direct_adds=2, max_suggestions=2),
+               recent_decisions=[SimpleNamespace(summary="Globex pricing review", department="")])
+    direct = _proposal(slug="rss-acme-blog", finding_index=1)
+    query = _proposal(slug="q-globex", signal_type="query", target="Globex pricing moves",
+                      grounding_entity="Globex", finding_index=0)
+    findings = [
+        _finding(title="Globex cuts prices", summary="Globex cut list prices 10%.", confidence="high",
+                 source_specialist="cso,cfo"),
+        _finding(),
+    ]
+    out = wp.apply_proposals([direct, query], findings, ctx, db_path=db)
+    assert [(o["slug"], o["outcome"]) for o in out] == [("rss-acme-blog", "added"), ("q-globex", "rejected")]
+
+
+def test_a_stronger_insert_makes_a_weaker_same_site_proposal_already_watched(db: Path) -> None:
+    """The persisting pass classifies again, so the row inserted for the
+    stronger proposal is 'already watched' for a weaker one on its site."""
+    strong = _proposal(slug="rss-acme-blog", target="https://www.acme.com/blog/feed.xml")
+    weaker = _proposal(slug="rss-acme-news", target="https://www.acme.com/news/feed.xml",
+                       certainty="unsure")  # same site, a suggestion at most
+    out = wp.apply_proposals([weaker, strong], [_finding()], _ctx(), db_path=db)
+    assert [(o["slug"], o["outcome"]) for o in out] == [("rss-acme-news", "rejected"), ("rss-acme-blog", "added")]
+    assert "already watched" in out[0]["result_preview"]

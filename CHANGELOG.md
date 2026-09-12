@@ -131,10 +131,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reported, so `RESEARCH_WEB_SEARCH_MAX_USES` and `WEB_SEARCH_MAX_USES`
   mean the same thing on both deployment types.
 - **Per-run watch budgets go to the strongest proposals.** The policy
-  scores every proposal first and applies them in descending score order,
-  so when the model files more candidates than the budgets allow, a
-  better-grounded proposal filed later no longer loses its slot to weaker
-  ones filed earlier.
+  classifies every proposal first and applies them by tier (direct adds
+  before suggestions) and descending score, so when the model files more
+  candidates than the budgets or the ceiling allow, a better-grounded
+  proposal filed later no longer loses its slot to weaker ones filed
+  earlier, and a duplicate target keeps its strongest filing.
 - **Every model call is recorded.** Research specialists, the research
   routing and watchlist passes, triage and the chat memory extractor now
   write the same `cache_event` audit row the Executive's chat turns always

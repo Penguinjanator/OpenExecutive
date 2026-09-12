@@ -1092,6 +1092,11 @@ def policy_stamp_of(item: WatchlistItem) -> dict[str, Any]:
     return dict(stamp) if isinstance(stamp, dict) else {}
 
 
+# Order in which proposals are persisted: what could go live first, then what
+# could be suggested, then what is already rejected (consumes no budget).
+_TIER_RANK: dict[str, int] = {TIER_DIRECT: 0, TIER_SUGGEST: 1, TIER_REJECT: 2}
+
+
 def _link_evidence(
     proposal: WatchProposal,
     findings: list[ResearchFinding],
@@ -1148,13 +1153,16 @@ def apply_proposals(
     one per proposal in the order they were filed, so the run's artifact and
     audit accounting stay uniform.
 
-    Proposals are applied strongest first: each is scored once against the
-    run's starting state, then persisted in descending score order (ties keep
-    file order), so when the model files more candidates than the per-run
-    budgets allow, the budgets go to the best-grounded ones rather than the
-    earliest. The score used for persisting is recomputed at that point, so a
-    row inserted for a stronger proposal still counts as "already watched"
-    for a weaker one on the same site."""
+    Proposals are applied strongest first: each is classified once against
+    the run's starting state, then persisted in order of tier (direct adds,
+    then suggestions, then rejects) and descending score, ties in file order.
+    So when the model files more candidates than the per-run budgets or the
+    enabled-watch ceiling allow, the slots go to the best-grounded ones
+    rather than the earliest, and a duplicate target keeps its strongest
+    filing. The score itself does not depend on what was inserted earlier,
+    but the tier does: the persisting pass classifies again so a row
+    inserted for a stronger proposal counts as "already watched" for a
+    weaker one on the same site."""
     summaries: list[dict[str, Any] | None] = [None] * len(proposals)
     direct_left = max(0, ctx.settings.max_direct_adds)
     suggest_left = max(0, ctx.settings.max_suggestions)
@@ -1165,21 +1173,22 @@ def apply_proposals(
     live_existing = list(ctx.existing)
     ctx = dataclasses.replace(ctx, existing=live_existing)
 
-    # Pass 1 (file order): drop duplicate targets, link each proposal to its
-    # evidence, and score it against the starting state to fix the order.
-    prepared: list[tuple[int, int, WatchProposal, ResearchFinding | None, bool, str]] = []
+    # Pass 1 (file order): link each proposal to its evidence and classify
+    # it against the starting state to fix the order.
+    prepared: list[tuple[tuple[int, int, int], WatchProposal, ResearchFinding | None, bool, str]] = []
     for index, proposal in enumerate(proposals):
+        proposal, finding, supported, linked_note = _link_evidence(proposal, findings, ctx)
+        first_look = classify(proposal, finding, ctx)
+        key = (_TIER_RANK.get(first_look.tier, len(_TIER_RANK)), -first_look.score, index)
+        prepared.append((key, proposal, finding, supported, linked_note))
+    prepared.sort(key=lambda item: item[0])
+
+    # Pass 2 (strongest first): duplicates, budgets, inserts, audit rows.
+    for (_tier_rank, _neg_score, index), proposal, finding, supported, linked_note in prepared:
         if proposal.normalized_target in seen_targets:
             summaries[index] = _summary(proposal, "rejected", "duplicate target in this run")
             continue
         seen_targets.add(proposal.normalized_target)
-        proposal, finding, supported, linked_note = _link_evidence(proposal, findings, ctx)
-        rank = classify(proposal, finding, ctx).score
-        prepared.append((-rank, index, proposal, finding, supported, linked_note))
-    prepared.sort(key=lambda item: (item[0], item[1]))
-
-    # Pass 2 (strongest first): budgets, inserts, audit rows.
-    for _rank, index, proposal, finding, supported, linked_note in prepared:
         decision = classify(proposal, finding, ctx)
         if linked_note:
             decision.reasons.insert(0, linked_note)
