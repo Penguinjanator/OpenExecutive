@@ -108,8 +108,8 @@ class DeclineBody(BaseModel):
 class DeclineResponse(BaseModel):
     slug: str
     reason: str
-    # "removed" (declined + deleted) or "kept_quiet" (too_noisy: converted
-    # to an active watch with a high severity floor instead).
+    # "removed" (declined + deleted) or "kept_high_floor" (too_noisy: goes
+    # live as a research watch that only surfaces high-severity signals).
     result: str
 
 
@@ -472,7 +472,8 @@ def approve_watchlist_suggestion(slug: str) -> WatchlistItem:
 def decline_watchlist_suggestion(slug: str, body: DeclineBody | None = None) -> DeclineResponse:
     """Decline a research suggestion. The reason picks the remedy:
     not_relevant / wrong_source remove it and blacklist (entity / target);
-    too_noisy keeps it, live, with a high severity floor."""
+    too_noisy keeps the source, live, but only high-severity signals ever
+    surface — the one way a suggestion goes live without an approve."""
     from openexecutive.monitoring.research import watch_policy
 
     reason = (body.reason if body else DECLINE_REASON_NOT_RELEVANT)
@@ -486,8 +487,10 @@ def decline_watchlist_suggestion(slug: str, body: DeclineBody | None = None) -> 
     if reason == DECLINE_REASON_TOO_NOISY:
         if not ms.quiet_pending_suggestion(item.id):
             raise HTTPException(status_code=409, detail=f"{slug!r} is not a pending research suggestion")
-        watch_policy.record_outcome_for(item, watch_policy.OUTCOME_APPROVED)
-        result = "kept_quiet"
+        # The principal kept the source but objected to the shape of the
+        # guess — that is a decline for calibration, not an approval.
+        watch_policy.record_outcome_for(item, watch_policy.OUTCOME_DECLINED)
+        result = "kept_high_floor"
     else:
         if not ms.delete_pending_suggestion(item.id):
             raise HTTPException(status_code=409, detail=f"{slug!r} is not a pending research suggestion")

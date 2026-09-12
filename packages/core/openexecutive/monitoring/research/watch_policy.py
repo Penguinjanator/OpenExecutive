@@ -19,12 +19,15 @@ Two tiers:
   ``origin=research_proposed``; the principal approves or declines it on
   ``/watchlist``. This is the "not sure" case.
 
-Everything else is rejected, and a target the principal declined is
-rejected in the tool handler before the model can route around it with a
+A proposal with nothing vouching for it (no linked finding, score 0), one
+for a source already watched, one past the enabled-watch ceiling or the
+per-run budgets, is rejected; a target or entity the principal declined is
+refused in the tool handler before the model can route around it with a
 new slug. Every decision is audited with its score and reasons.
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 import re
 from dataclasses import dataclass, field
@@ -77,8 +80,10 @@ TIER_DIRECT = "direct"
 TIER_SUGGEST = "suggest"
 TIER_REJECT = "reject"
 
-# Score needed to add without asking. See classify() for the ledger.
+# Score needed to add without asking, and the minimum for a suggestion to
+# be worth the principal's time at all. See classify() for the ledger.
 DIRECT_THRESHOLD = 4
+SUGGEST_THRESHOLD = 1
 # History only moves the score once the policy has a real sample.
 _HISTORY_MIN_SAMPLES = 5
 
@@ -89,8 +94,7 @@ PRIMARY_SOURCE_HOSTS: frozenset[str] = frozenset({
     "federalregister.gov", "eur-lex.europa.eu",
 })
 
-# Grounding-vocabulary kinds, in the order a term is attributed when it
-# appears in more than one source.
+# Grounding-vocabulary kinds.
 KIND_COMPANY = "company"
 KIND_COMPETITOR = "competitor"
 KIND_VENDOR = "vendor"
@@ -108,6 +112,11 @@ GROUNDING_KINDS: frozenset[str] = frozenset({
 STRONG_GROUNDING_KINDS: frozenset[str] = frozenset({
     KIND_COMPANY, KIND_COMPETITOR, KIND_VENDOR, KIND_TICKER,
 })
+# When one term appears in several sources the strongest kind wins.
+_KIND_RANK: dict[str, int] = {
+    KIND_COMPANY: 7, KIND_COMPETITOR: 6, KIND_VENDOR: 5, KIND_TICKER: 4,
+    KIND_INITIATIVE: 3, KIND_PRIORITY: 2, KIND_WATCH: 1,
+}
 
 # Material-event words every research feed trigger carries, so a competitor
 # blog surfaces "we raised / we launched / pricing" and not every post.
@@ -142,11 +151,12 @@ _STOCK_DEFAULT_PCT = 5
 _DISABLE_MIN_FIRED = 5
 _DISABLE_MIN_DISMISSED = 2
 _DISABLE_MAX_TRUST = 0.5
-_DEAD_SOURCE_DAYS = 30
-_DEAD_SOURCE_KINDS: frozenset[str] = frozenset({
-    SOURCE_KIND_RSS, SOURCE_KIND_PAGE_WATCH, SOURCE_KIND_VENDOR_STATUS,
-})
+# "No signals for N days" is deliberately NOT a retirement rule: page_watch
+# and vendor_status emit nothing while the page is unchanged / the vendor
+# is healthy, which is exactly a working watch. Only poll failures say a
+# source is broken.
 _POLL_FAILURES_TO_DISABLE = 3
+_POLL_HISTORY_TO_READ = 10
 # Nudge the principal only when suggestions have piled up unreviewed.
 _NUDGE_MIN_PENDING = 3
 _NUDGE_MIN_AGE_DAYS = 7
@@ -244,7 +254,7 @@ def grounding_vocabulary(
         n = _norm(term)
         if len(n) < 2:
             return
-        if n not in vocab or (vocab[n] == KIND_WATCH and kind != KIND_WATCH):
+        if n not in vocab or _KIND_RANK[kind] > _KIND_RANK[vocab[n]]:
             vocab[n] = kind
 
     for item in existing:
@@ -341,19 +351,41 @@ def _is_own_source(proposal: WatchProposal, entity_term: str, vocabulary: dict[s
     """The target is the entity's own primary source: its ticker for
     stock/edgar, its own domain for a URL, or an allowlisted primary host."""
     if proposal.signal_type in (SOURCE_KIND_STOCK, SOURCE_KIND_EDGAR):
-        return vocabulary.get(_norm(proposal.target)) in (KIND_TICKER, KIND_WATCH) or (
-            _norm(proposal.target) == entity_term
-        )
+        # The ticker is the entity itself, or one the profile explicitly
+        # tracks (`tickers`). A ticker that merely appears as some other
+        # watch's target says nothing about THIS entity.
+        target_norm = _norm(proposal.target)
+        return target_norm == entity_term or vocabulary.get(target_norm) == KIND_TICKER
     host = registrable_domain(proposal.target)
     if not host:
         return False
     if host in PRIMARY_SOURCE_HOSTS or any(host.endswith("." + h) for h in PRIMARY_SOURCE_HOSTS):
         return True
-    host_tokens = set(_TOKEN_RE.findall(host.replace(".", " ")))
+    # Only the site's own label counts ("acme" in status.acme.com / acme.co.uk);
+    # subdomain labels and the TLD never do, so "api" or ".cloud" cannot
+    # make an unrelated host look like the entity's.
     entity_tokens = {
         t for t in entity_term.split() if len(t) >= _MIN_PARTIAL_TOKEN and t not in _STOPWORDS
     }
-    return bool(entity_tokens & host_tokens)
+    return _site_label(host) in entity_tokens
+
+
+# Second-level labels under which the real site label sits one step deeper
+# (acme.co.uk → "acme").
+_PUBLIC_SECOND_LEVEL: frozenset[str] = frozenset({
+    "co", "com", "org", "net", "gov", "ac", "edu", "or", "ne", "gob",
+})
+
+
+def _site_label(host: str) -> str:
+    """The label that names the site: "acme" for acme.com, status.acme.com
+    and acme.co.uk. Empty for a bare TLD / IP-like host."""
+    labels = [label for label in host.split(".") if label]
+    if len(labels) < 2:
+        return ""
+    if len(labels) >= 3 and labels[-2] in _PUBLIC_SECOND_LEVEL and len(labels[-1]) == 2:
+        return labels[-3]
+    return labels[-2]
 
 
 def _history_adjustment(
@@ -439,6 +471,19 @@ def classify(
         reasons.append("same source already watched")
         return Decision(TIER_REJECT, score, entity_term, kind, reasons)
 
+    enabled_count = sum(1 for i in ctx.existing if i.enabled)
+    if enabled_count >= ctx.settings.max_enabled:
+        # Suggestions poll too, so the ceiling has to stop them as well or
+        # it would latch: every run would add polling rows and no proposal
+        # could ever be direct again.
+        reasons.append(f"watchlist at its ceiling ({enabled_count} enabled)")
+        return Decision(TIER_REJECT, score, entity_term, kind, reasons)
+    if finding is None or score < SUGGEST_THRESHOLD:
+        # Nothing vouches for it: no linked finding, or neither company data
+        # nor evidence scored a point. Not worth the principal's time.
+        reasons.append("no evidence to put in front of the principal")
+        return Decision(TIER_REJECT, score, entity_term, kind, reasons)
+
     tier = TIER_SUGGEST
     if grounded and score >= DIRECT_THRESHOLD:
         tier = TIER_DIRECT
@@ -451,10 +496,6 @@ def classify(
     if tier == TIER_DIRECT and proposal.certainty != "confident":
         tier = TIER_SUGGEST
         reasons.append("model marked it unsure")
-    enabled_count = sum(1 for i in ctx.existing if i.enabled)
-    if tier == TIER_DIRECT and enabled_count >= ctx.settings.max_enabled:
-        tier = TIER_SUGGEST
-        reasons.append(f"watchlist at its ceiling ({enabled_count})")
     return Decision(tier, score, entity_term, kind, reasons)
 
 
@@ -464,7 +505,7 @@ def classify(
 
 
 def quiet_defaults(
-    proposal: WatchProposal, entity_term: str, priority_words: list[str],
+    proposal: WatchProposal, priority_words: list[str],
 ) -> tuple[str, AlertSeverity, dict[str, Any]]:
     """``(cadence, severity_floor, trigger)`` a research row lands with.
 
@@ -476,11 +517,12 @@ def quiet_defaults(
         if not isinstance(trigger.get("abs_change_pct_gte"), (int, float)):
             trigger["abs_change_pct_gte"] = _STOCK_DEFAULT_PCT
     elif proposal.signal_type in (SOURCE_KIND_RSS, SOURCE_KIND_PAGE_WATCH, SOURCE_KIND_QUERY):
+        # Material-event words + priority terms only. The entity's own name
+        # must NOT be a keyword: feed summaries are rendered as
+        # "[<feed label>] <title>", so a keyword equal to the label would
+        # match every entry and turn the trigger into a no-op.
         existing_kw = trigger.get("keywords")
         keywords: list[str] = [str(k) for k in existing_kw] if isinstance(existing_kw, list) else []
-        for tok in entity_term.split():
-            if len(tok) >= 3 and tok not in keywords:
-                keywords.append(tok)
         for kw in list(_EVENT_KEYWORDS) + priority_words:
             if kw not in keywords:
                 keywords.append(kw)
@@ -536,7 +578,10 @@ def apply_proposals(
     direct_left = max(0, ctx.settings.max_direct_adds)
     suggest_left = max(0, ctx.settings.max_suggestions)
     seen_targets: set[str] = set()
+    # Rows inserted earlier in this loop must count as "already watched" for
+    # later proposals; work on a copy so the caller's context is untouched.
     live_existing = list(ctx.existing)
+    ctx = dataclasses.replace(ctx, existing=live_existing)
 
     for proposal in proposals:
         finding = (
@@ -549,7 +594,6 @@ def apply_proposals(
             continue
         seen_targets.add(proposal.normalized_target)
 
-        ctx.existing = live_existing
         decision = classify(proposal, finding, ctx)
         if decision.tier == TIER_DIRECT and direct_left <= 0:
             decision.tier = TIER_SUGGEST
@@ -569,7 +613,7 @@ def apply_proposals(
             summaries.append(_summary(proposal, "rejected", decision.reasons[-1] if decision.reasons else ""))
             continue
 
-        cadence, floor, trigger = quiet_defaults(proposal, decision.entity, ctx.priority_terms)
+        cadence, floor, trigger = quiet_defaults(proposal, ctx.priority_terms)
         config = dict(proposal.config)
         config["_policy"] = _policy_stamp(decision, proposal, finding)
         is_direct = decision.tier == TIER_DIRECT
@@ -680,7 +724,7 @@ def _consecutive_poll_failures(slug: str) -> int:
         from openexecutive.audit.logger import get_audit_logger
 
         rows = get_audit_logger().query(
-            event_type="external_monitor_poll", q=f"Polled {slug} (", limit=_POLL_FAILURES_TO_DISABLE,
+            event_type="external_monitor_poll", q=f"Polled {slug} (", limit=_POLL_HISTORY_TO_READ,
         )
     except Exception:
         return 0
@@ -695,22 +739,13 @@ def _consecutive_poll_failures(slug: str) -> int:
     return n
 
 
-def _auto_disable_reason(item: WatchlistItem, now: datetime, db_path: Path | None) -> str:
+def _auto_disable_reason(item: WatchlistItem) -> str:
     if (
         item.fired_count >= _DISABLE_MIN_FIRED
         and item.dismiss_count >= _DISABLE_MIN_DISMISSED
         and item.trust_score <= _DISABLE_MAX_TRUST
     ):
         return f"dismissed {item.dismiss_count} of {item.fired_count} alerts (trust {item.trust_score:.2f})"
-    created = _parse(item.created_at)
-    if (
-        item.signal_type in _DEAD_SOURCE_KINDS
-        and created is not None
-        and now - created >= timedelta(days=_DEAD_SOURCE_DAYS)
-        and item.id is not None
-        and ms.count_signals_since(item.id, now - timedelta(days=_DEAD_SOURCE_DAYS), db_path=db_path) == 0
-    ):
-        return f"no signals in {_DEAD_SOURCE_DAYS} days"
     if _consecutive_poll_failures(item.slug) >= _POLL_FAILURES_TO_DISABLE:
         return f"{_POLL_FAILURES_TO_DISABLE} consecutive poll failures"
     return ""
@@ -771,7 +806,7 @@ def _auto_disable(now: datetime, db_path: Path | None) -> int:
     for item in ms.list_watchlist(enabled_only=True, db_path=db_path):
         if item.origin != ORIGIN_RESEARCH or item.mode != MODE_ACTIVE or item.id is None:
             continue
-        reason = _auto_disable_reason(item, now, db_path)
+        reason = _auto_disable_reason(item)
         if not reason:
             continue
         ms.set_enabled(item.id, False, db_path=db_path)
@@ -800,27 +835,37 @@ def _nudge_if_piled_up(now: datetime, db_path: Path | None) -> int:
     pending = ms.list_pending_suggestions(db_path=db_path)
     if len(pending) < _NUDGE_MIN_PENDING:
         return 0
-    oldest = pending[0]
-    created = _parse(oldest.created_at)
+    created = _parse(pending[0].created_at)
     if created is None or now - created < timedelta(days=_NUDGE_MIN_AGE_DAYS):
         return 0
-    from openexecutive.alerts.store import insert_alert
+    from openexecutive.alerts.store import coalesce_alert, insert_alert
 
-    key = f"{NUDGE_ALERT_SOURCE}:{oldest.slug}"
+    # One card for the whole pile: an open card is refreshed in place
+    # (coalesce), and a card the principal already dismissed is not
+    # re-minted until next week — acting on one suggestion must never
+    # spawn another nudge.
+    dedup_key = f"{NUDGE_ALERT_SOURCE}:pending"
+    year, week, _ = now.isocalendar()
+    external_id = f"{dedup_key}:{year}-W{week:02d}"
     lines = [f"- {i.slug} ({i.signal_type}) — {i.notes or i.target}"[:200] for i in pending[:10]]
+    body = (
+        "The Executive suggested these sources to monitor and is not sure "
+        "enough to add them on its own. Approve or decline them on the "
+        "Watch list page.\n\n" + "\n".join(lines)
+    )
+    if coalesce_alert(
+        source=NUDGE_ALERT_SOURCE, dedup_key=dedup_key, severity="medium", body=body, db_path=db_path,
+    ):
+        return 0
     alert_id = insert_alert(
         source=NUDGE_ALERT_SOURCE,
-        external_id=key,
+        external_id=external_id,
         severity="medium",
         headline=f"{len(pending)} watch suggestions are waiting for you",
-        body=(
-            "The Executive suggested these sources to monitor and is not sure "
-            "enough to add them on its own. Approve or decline them on the "
-            "Watch list page.\n\n" + "\n".join(lines)
-        ),
+        body=body,
         suggested_action="Review the suggestions on /watchlist",
         topic_tags=["watchlist"],
-        dedup_key=key,
+        dedup_key=dedup_key,
         db_path=db_path,
     )
     return 1 if alert_id else 0
@@ -828,6 +873,7 @@ def _nudge_if_piled_up(now: datetime, db_path: Path | None) -> int:
 
 __all__ = [
     "DIRECT_THRESHOLD",
+    "SUGGEST_THRESHOLD",
     "EVENT_ADDED",
     "EVENT_AUTO_DISABLED",
     "EVENT_REJECTED",

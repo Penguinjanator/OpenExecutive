@@ -564,9 +564,12 @@ async def handle_propose_watch(tool_input: dict[str, Any], collector: list[Any])
     raw_index = tool_input.get("finding_index")
     finding_index: int | None
     try:
-        finding_index = int(raw_index) - 1 if raw_index is not None else None
+        # 1-based "#N" from the findings turn; 0 or negative means "none".
+        finding_index = int(raw_index) - 1 if raw_index is not None and int(raw_index) >= 1 else None
     except (TypeError, ValueError):
         finding_index = None
+    if any(getattr(p, "slug", "") == slug for p in collector):
+        return _err(tool, f"slug {slug!r} was already proposed this run")
 
     collector.append(WatchProposal(
         slug=slug,

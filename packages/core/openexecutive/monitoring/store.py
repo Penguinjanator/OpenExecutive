@@ -719,7 +719,10 @@ def is_declined(
         return True
     if declined_at.tzinfo is None:
         declined_at = declined_at.replace(tzinfo=UTC)
-    return (now or datetime.now(UTC)) - declined_at < timedelta(days=DECLINE_EXPIRED_RETRY_DAYS)
+    now = now or datetime.now(UTC)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    return now - declined_at < timedelta(days=DECLINE_EXPIRED_RETRY_DAYS)
 
 
 def record_policy_outcome(

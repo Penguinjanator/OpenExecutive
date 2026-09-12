@@ -94,12 +94,15 @@ def test_decline_defaults_to_not_relevant_without_a_body(client: TestClient, db:
 def test_decline_too_noisy_keeps_it_live_at_a_high_floor(client: TestClient, db: Path) -> None:
     _suggest(db)
     res = client.post("/watchlist/rss-initech/decline", json={"reason": "too_noisy"})
-    assert res.status_code == 200 and res.json()["result"] == "kept_quiet"
+    assert res.status_code == 200 and res.json()["result"] == "kept_high_floor"
     row = ms.get_watchlist_item_by_slug("rss-initech", db_path=db)
     assert row is not None
     assert row.mode == "active" and row.origin == "research" and row.severity_floor.value == "high"
     assert ms.list_declines(db_path=db) == []
-    assert ms.policy_outcome_counts(db_path=db) == {("rss", ""): {"approved": 1}}
+    # For calibration it is a decline: the principal objected to the guess.
+    assert ms.policy_outcome_counts(db_path=db) == {("rss", ""): {"declined": 1}}
+    # A second decline / approve now 409s: no longer pending.
+    assert client.post("/watchlist/rss-initech/decline", json={"reason": "too_noisy"}).status_code == 409
 
 
 def test_decline_validates_reason_and_state(client: TestClient, db: Path) -> None:

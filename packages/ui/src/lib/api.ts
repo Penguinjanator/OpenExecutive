@@ -2902,8 +2902,8 @@ export async function approveWatchSuggestion(slug: string): Promise<WatchlistIte
 export interface WatchDeclineResponse {
   slug: string;
   reason: string;
-  /** "removed" (declined + deleted) or "kept_quiet" (too_noisy → live with a high floor). */
-  result: "removed" | "kept_quiet" | string;
+  /** "removed" (declined + deleted) or "kept_high_floor" (too_noisy → live, only high-severity signals surface). */
+  result: "removed" | "kept_high_floor" | string;
 }
 
 /** Decline a research suggestion. The reason picks the remedy server-side. */

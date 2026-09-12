@@ -211,12 +211,40 @@ def test_same_site_already_watched_is_rejected(db: Path) -> None:
     assert d.tier == wp.TIER_REJECT and "already watched" in d.reasons[-1]
 
 
-def test_ceiling_turns_direct_into_suggestion(db: Path) -> None:
+def test_ceiling_rejects_adds_and_suggestions(db: Path) -> None:
     for i in range(3):
         ms.insert_watchlist_item(slug=f"stock-x{i}", signal_type="stock", target=f"X{i}", db_path=db)
     ctx = _ctx(ms.list_watchlist(db_path=db), settings=wp.PolicySettings(max_enabled=3))
     d = wp.classify(_proposal(), _finding(), ctx)
-    assert d.tier == wp.TIER_SUGGEST and "ceiling" in d.reasons[-1]
+    assert d.tier == wp.TIER_REJECT and "ceiling" in d.reasons[-1]
+    unsure = _proposal(grounding_entity="Initech", target="https://initech.com/feed.xml", certainty="unsure")
+    assert wp.classify(unsure, _finding(), ctx).tier == wp.TIER_REJECT
+
+
+def test_nothing_vouching_is_rejected_not_suggested() -> None:
+    bare = _proposal(grounding_entity="", target="https://randomblog.example/feed", certainty="unsure",
+                     finding_index=None)
+    assert wp.classify(bare, None, _ctx()).tier == wp.TIER_REJECT
+    weak = _proposal(grounding_entity="Initech", target="https://initech.com/feed.xml", certainty="unsure")
+    assert wp.classify(weak, _finding(confidence="medium"), _ctx()).tier == wp.TIER_REJECT
+    assert wp.classify(weak, _finding(confidence="high"), _ctx()).tier == wp.TIER_SUGGEST
+
+
+def test_own_source_uses_the_site_label_only() -> None:
+    assert wp._site_label("status.acme.com") == "acme"
+    assert wp._site_label("acme.co.uk") == "acme"
+    assert wp._site_label("api.unrelated-vendor.com") == "unrelated-vendor"
+    p = _proposal(slug="pw", signal_type="page_watch", target="https://api.unrelated.com/pricing",
+                  grounding_entity="Launch Helios API")
+    assert "own source" not in " ".join(wp.classify(p, _finding(), _ctx()).reasons)
+    p2 = _proposal(slug="stock-msft", signal_type="stock", target="MSFT", grounding_entity="Acme Corp")
+    assert "own source" not in " ".join(wp.classify(p2, _finding(), _ctx()).reasons)
+
+
+def test_vocabulary_prefers_the_strongest_kind() -> None:
+    profile = CompanyProfile.model_validate({"name": "Acme", "vendors": ["Acme"], "tickers": ["ACME"]})
+    vocab = wp.grounding_vocabulary(profile, [SimpleNamespace(title="Acme")], [])
+    assert vocab["acme"] == wp.KIND_COMPANY
 
 
 def test_history_adjusts_only_with_enough_samples() -> None:
@@ -233,16 +261,17 @@ def test_history_adjusts_only_with_enough_samples() -> None:
 
 
 def test_quiet_defaults_add_keywords_and_medium_floor() -> None:
-    cadence, floor, trigger = wp.quiet_defaults(_proposal(), "acme corp", ["enterprise"])
+    cadence, floor, trigger = wp.quiet_defaults(_proposal(), ["accounts"])
     assert cadence == "daily" and floor.value == "medium"
     kws = trigger["keywords"]
-    assert kws[:2] == ["acme", "corp"] and "pricing" in kws and "enterprise" in kws
-    _, _, stock_trigger = wp.quiet_defaults(
-        _proposal(signal_type="stock", target="ACME"), "acme", [],
-    )
+    assert "pricing" in kws and "accounts" in kws
+    # The entity's own name is never a keyword: feed summaries carry the
+    # feed label, so it would match every entry.
+    assert "acme" not in kws and "corp" not in kws
+    _, _, stock_trigger = wp.quiet_defaults(_proposal(signal_type="stock", target="ACME"), [])
     assert stock_trigger == {"abs_change_pct_gte": 5}
     cadence_pw, _, _ = wp.quiet_defaults(
-        _proposal(signal_type="page_watch", target="https://acme.com/pricing"), "acme", [],
+        _proposal(signal_type="page_watch", target="https://acme.com/pricing"), [],
     )
     assert cadence_pw == "weekly"
 
@@ -253,7 +282,7 @@ def test_quiet_defaults_add_keywords_and_medium_floor() -> None:
 
 
 def test_apply_adds_direct_and_files_suggestion(db: Path) -> None:
-    findings = [_finding(), _finding(title="Initech raised", summary="Initech raised.", confidence="medium")]
+    findings = [_finding(), _finding(title="Initech raised", summary="Initech raised.", confidence="high")]
     proposals = [
         _proposal(),
         _proposal(slug="rss-initech", target="https://initech.com/feed.xml",
@@ -289,6 +318,8 @@ def test_apply_honours_budgets_and_duplicate_targets(db: Path) -> None:
     ]
     assert "duplicate" in out[1]["result_preview"]
     assert "budget" in out[5]["result_preview"]
+    # The caller's context is not mutated by the run.
+    assert ctx.existing == []
 
 
 # --------------------------------------------------------------------- #
@@ -355,6 +386,11 @@ async def test_propose_handler_refuses_declined_target_under_new_slug(
     }, collector)
     assert '"queued": "stock-acme"' in ok
     assert len(collector) == 2 and collector[-1].finding_index == 0
+    dup = await wt.handle_propose_watch({
+        "slug": "stock-acme", "signal_type": "stock", "target": "ACME2",
+        "grounding_entity": "Acme Corp", "rationale": "y", "certainty": "confident", "finding_index": 0,
+    }, collector)
+    assert "already proposed" in dup and len(collector) == 2
 
 
 # --------------------------------------------------------------------- #
@@ -409,13 +445,13 @@ def test_sweep_expires_a_suggestion_that_already_recorded_signals(db: Path) -> N
     assert ms.list_signals_for_watchlist(wid, db_path=db) == []
 
 
-def test_sweep_auto_disables_noisy_and_dead_research_watches(db: Path) -> None:
+def test_sweep_auto_disables_noisy_research_watches_only(db: Path) -> None:
     import sqlite3
 
     ms.insert_watchlist_item(slug="rss-noisy", signal_type="rss", target="https://noisy.com/feed",
                              origin=ORIGIN_RESEARCH, db_path=db)
-    ms.insert_watchlist_item(slug="rss-dead", signal_type="rss", target="https://dead.com/feed",
-                             origin=ORIGIN_RESEARCH, db_path=db)
+    ms.insert_watchlist_item(slug="pw-quiet", signal_type="page_watch", target="https://quiet.com/pricing",
+                             origin=ORIGIN_RESEARCH, db_path=db)  # silent = unchanged page, still working
     ms.insert_watchlist_item(slug="rss-mine", signal_type="rss", target="https://mine.com/feed",
                              db_path=db)  # manual: never auto-disabled
     with sqlite3.connect(db) as conn:
@@ -423,12 +459,25 @@ def test_sweep_auto_disables_noisy_and_dead_research_watches(db: Path) -> None:
             "UPDATE watchlist SET fired_count = 6, dismiss_count = 3, trust_score = 0.4 "
             "WHERE slug IN ('rss-noisy', 'rss-mine')"
         )
-    _backdate(db, "rss-dead", 31)
-    _backdate(db, "rss-mine", 31)
+    _backdate(db, "pw-quiet", 45)
     counts = wp.sweep(datetime.now(UTC), db_path=db)
-    assert counts["disabled"] == 2
+    assert counts["disabled"] == 1
     enabled = {w.slug: w.enabled for w in ms.list_watchlist(db_path=db)}
-    assert enabled == {"rss-noisy": False, "rss-dead": False, "rss-mine": True}
+    assert enabled == {"rss-noisy": False, "pw-quiet": True, "rss-mine": True}
+
+
+def test_sweep_auto_disables_after_consecutive_poll_failures(db: Path) -> None:
+    from openexecutive.audit import log_event
+
+    ms.insert_watchlist_item(slug="rss-broken", signal_type="rss", target="https://broken.com/feed",
+                             origin=ORIGIN_RESEARCH, db_path=db)
+    for _ in range(2):
+        log_event("external_monitor_poll", "Polled rss-broken (rss) — FAILED", actor="external_monitor",
+                  details={"watchlist_slug": "rss-broken", "failed": True})
+    assert wp.sweep(datetime.now(UTC), db_path=db)["disabled"] == 0
+    log_event("external_monitor_poll", "Polled rss-broken (rss) — FAILED", actor="external_monitor",
+              details={"watchlist_slug": "rss-broken", "failed": True})
+    assert wp.sweep(datetime.now(UTC), db_path=db)["disabled"] == 1
 
 
 def test_sweep_nudges_once_suggestions_pile_up(db: Path) -> None:
@@ -441,10 +490,19 @@ def test_sweep_nudges_once_suggestions_pile_up(db: Path) -> None:
         )
     assert wp.sweep(datetime.now(UTC), db_path=db)["nudged"] == 0  # too fresh
     _backdate(db, "rss-s0", 8)
+    _backdate(db, "rss-s1", 8)
+    ms.insert_watchlist_item(
+        slug="rss-s3", signal_type="rss", target="https://s3.com/feed",
+        mode=MODE_DRY_RUN, origin=ORIGIN_RESEARCH_PROPOSED, db_path=db,
+    )
     assert wp.sweep(datetime.now(UTC), db_path=db)["nudged"] == 1
-    assert wp.sweep(datetime.now(UTC), db_path=db)["nudged"] == 0  # coalesced
+    assert wp.sweep(datetime.now(UTC), db_path=db)["nudged"] == 0  # coalesced into the open card
+    # Acting on the oldest suggestion must not spawn another nudge.
+    first = ms.get_watchlist_item_by_slug("rss-s0", db_path=db)
+    assert first is not None and first.id is not None and ms.approve_suggestion(first.id, db_path=db)
+    assert wp.sweep(datetime.now(UTC), db_path=db)["nudged"] == 0
     alerts = [a for a in list_alerts(limit=10, db_path=db) if a.source == wp.NUDGE_ALERT_SOURCE]
-    assert len(alerts) == 1 and "3 watch suggestions" in alerts[0].headline
+    assert len(alerts) == 1 and "4 watch suggestions" in alerts[0].headline
 
 
 def test_initiative_or_priority_grounding_is_never_direct() -> None:

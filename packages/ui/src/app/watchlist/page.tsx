@@ -571,10 +571,11 @@ export default function WatchlistPage() {
     markBusy(slug, true);
     try {
       const res = await declineWatchSuggestion(slug, reason);
-      if (res.result === "kept_quiet") {
-        refresh();
-      } else {
+      if (res.result === "removed") {
         setItems((prev) => prev.filter((it) => it.slug !== slug));
+      } else {
+        // too_noisy: the row went live with a high floor — reload it.
+        refresh();
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Decline failed");
