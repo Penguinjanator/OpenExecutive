@@ -166,6 +166,7 @@ async def enrich_signal(
     try:
         message = await agent.analyze_with_tools(
             user_content,
+            actor="signal_enrichment",
             tools=[EMIT_RELEVANCE_TOOL],
             timeout_seconds=_ENRICH_TIMEOUT_SECONDS,
             model_override=get_research_model(),

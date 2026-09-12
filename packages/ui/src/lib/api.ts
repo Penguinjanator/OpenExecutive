@@ -1606,9 +1606,10 @@ export async function getAuditSession(
   return res.json();
 }
 
-// Cross-session token-usage aggregate used by /audit/usage. Totals plus by-day
-// and by-model breakdowns, summed from cache_event rows. `cost_usd` is the
-// actual OpenRouter charge captured per call (0 for rows that predate capture).
+// Cross-session token-usage aggregate used by /audit/usage. Totals plus by-day,
+// by-model and by-source breakdowns, summed from cache_event rows. `cost_usd` is
+// the actual OpenRouter charge captured per call (0 for rows that predate
+// capture); `web_search_requests` counts server-side searches the calls made.
 
 export interface UsageTotals {
   calls: number;
@@ -1616,6 +1617,7 @@ export interface UsageTotals {
   cache_read_input_tokens: number;
   cache_creation_input_tokens: number;
   output_tokens: number;
+  web_search_requests: number;
   cost_usd: number;
 }
 
@@ -1627,12 +1629,19 @@ export interface UsageByModel extends UsageTotals {
   model: string;
 }
 
+// One row per call source (the audit `actor`): executive, specialist_research,
+// research_synthesis, research_watchlist, triage, memory_extractor, …
+export interface UsageBySource extends UsageTotals {
+  source: string;
+}
+
 export interface UsageSummary {
   since: string | null;
   until: string | null;
   totals: UsageTotals;
   by_day: UsageByDay[];
   by_model: UsageByModel[];
+  by_source: UsageBySource[];
 }
 
 export async function getAuditUsage(

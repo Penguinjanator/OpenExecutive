@@ -188,6 +188,7 @@ class QuerySource:
         try:
             message = await agent.analyze_with_tools(
                 user_content,
+                actor="query_watch",
                 tools=tools,
                 timeout_seconds=_QUERY_TIMEOUT_SECONDS,
                 model_override=get_research_model(),

@@ -17,6 +17,7 @@ from openexecutive.audit.redaction import (
     audit_tool_result,
     audit_tool_result_full,
 )
+from openexecutive.audit.usage import log_model_usage
 from openexecutive.config import get_settings
 from openexecutive.memory.honcho_client import ReasoningLevel as HonchoReasoningLevel
 from openexecutive.orchestrator.action_chips import summarize_action
@@ -322,45 +323,17 @@ def _emit_cache_event(
     model: str,
     actor: str = "executive",
 ) -> None:
-    """Capture token + cache stats from an Anthropic streaming response.
-
-    Reads from `final_msg.usage` (a SimpleNamespace from the provider
-    abstraction in providers/translator.py). All getattrs are guarded so
-    a provider that doesn't surface a particular field still emits a row
-    with what it does have — never blocks the caller.
-    """
-    usage = getattr(final_msg, "usage", None)
-    if usage is None:
-        return
-    inp = int(getattr(usage, "input_tokens", 0) or 0)
-    out = int(getattr(usage, "output_tokens", 0) or 0)
-    cache_create = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
-    cache_read = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
-    stop_reason = getattr(final_msg, "stop_reason", None)
-    # Actual USD charged for this call, surfaced by OpenRouter when usage
-    # accounting is enabled. None on the Anthropic-direct path (no cost wire);
-    # stored as-is so aggregation treats a missing cost as 0.
-    raw_cost = getattr(usage, "cost", None)
-    try:
-        cost_usd = float(raw_cost) if raw_cost is not None else None
-    except (TypeError, ValueError):
-        cost_usd = None
-    audit_log(
-        "cache_event",
-        f"{model} iter={iteration} in={inp} out={out} cache_read={cache_read} cache_create={cache_create} cost={cost_usd} stop={stop_reason}",
+    """Record the token + cache stats of one Executive response as a
+    ``cache_event`` row (see ``audit.usage.log_model_usage``, which every
+    other model call site uses too). Reads ``final_msg.usage`` after the
+    call, never touches the request, never raises."""
+    log_model_usage(
+        final_msg,
+        model=model,
+        actor=actor,
+        iteration=iteration,
         session_id=session_id,
         turn_id=turn_id,
-        actor=actor,
-        details={
-            "model": model,
-            "iteration": iteration,
-            "input_tokens": inp,
-            "output_tokens": out,
-            "cache_creation_input_tokens": cache_create,
-            "cache_read_input_tokens": cache_read,
-            "cost_usd": cost_usd,
-            "stop_reason": stop_reason,
-        },
     )
 
 

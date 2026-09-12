@@ -306,6 +306,9 @@ async def test_workflow_runs_end_to_end_with_stubbed_specialists(
     assert "cfo" in result_data["findings"][0]["source_specialist"]
     assert len(result_data["tool_calls"]) == 1
     assert result_data["tool_calls"][0]["tool"] == "send_slack_dm"
+    # The run reports what it did; the stubs made no model calls.
+    assert result_data["usage"]["calls"] == 0
+    assert result_data["usage"]["by_source"] == {}
 
 
 @pytest.mark.asyncio

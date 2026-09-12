@@ -484,9 +484,10 @@ async def run_watchlist_research_scan(
         artifact = ""
         findings: list[dict[str, Any]] = []
         tool_calls: list[dict[str, Any]] = []
+        usage: dict[str, Any] | None = None
 
         async def _drive() -> None:
-            nonlocal artifact, findings, tool_calls
+            nonlocal artifact, findings, tool_calls, usage
             async for event in workflow.run(
                 inputs=wf_inputs, store=effective_store,
             ):
@@ -497,6 +498,9 @@ async def run_watchlist_research_scan(
                     raw_calls = event.data.get("tool_calls")
                     if isinstance(raw_calls, list):
                         tool_calls = raw_calls
+                    raw_usage = event.data.get("usage")
+                    if isinstance(raw_usage, dict):
+                        usage = raw_usage
                 elif event.type == "artifact" and event.content:
                     artifact = event.content
                 elif event.type == "error" and event.message:
@@ -531,21 +535,31 @@ async def run_watchlist_research_scan(
         # next tick — bounded, not lost.
         post_state_hash = compute_research_state_hash(db_path=db_path)
         ok_tool_calls = sum(1 for t in tool_calls if t.get("ok"))
+        usage_note = ""
+        if usage:
+            usage_note = (
+                f", {usage.get('calls', 0)} model call(s), "
+                f"{usage.get('web_search_requests', 0)} search(es)"
+            )
+        details: dict[str, Any] = {
+            "state_hash": post_state_hash,
+            "trigger": run_trigger,
+            "findings": len(findings),
+            "tool_calls": len(tool_calls),
+            "ok_tool_calls": ok_tool_calls,
+            "run_id": run_id,
+        }
+        if usage:
+            # What the run did: calls, tokens and searches, per source.
+            details["usage"] = usage
         audit_log(
             EVENT_RAN,
             (
                 f"Executive research ran — {len(findings)} finding(s), "
-                f"{ok_tool_calls}/{len(tool_calls)} tool call(s) ok"
+                f"{ok_tool_calls}/{len(tool_calls)} tool call(s) ok{usage_note}"
             ),
             actor="scheduler",
-            details={
-                "state_hash": post_state_hash,
-                "trigger": run_trigger,
-                "findings": len(findings),
-                "tool_calls": len(tool_calls),
-                "ok_tool_calls": ok_tool_calls,
-                "run_id": run_id,
-            },
+            details=details,
         )
         return len(findings)
     except TimeoutError:

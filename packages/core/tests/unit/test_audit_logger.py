@@ -233,10 +233,32 @@ def test_usage_summary_empty_db_returns_zeros(tmp_path: Path) -> None:
         "cache_read_input_tokens": 0,
         "cache_creation_input_tokens": 0,
         "output_tokens": 0,
+        "web_search_requests": 0,
         "cost_usd": 0.0,
     }
     assert s["by_day"] == []
     assert s["by_model"] == []
+    assert s["by_source"] == []
+
+
+def test_usage_summary_groups_by_source_and_sums_searches(audit: AuditLogger) -> None:
+    audit.log("cache_event", "chat", actor="executive",
+              details={"model": "m", "input_tokens": 100, "web_search_requests": 1})
+    audit.log("cache_event", "research 1", actor="specialist_research",
+              details={"model": "m", "input_tokens": 40, "web_search_requests": 3})
+    audit.log("cache_event", "research 2", actor="specialist_research",
+              details={"model": "m", "input_tokens": 60, "web_search_requests": 2})
+    audit.log("cache_event", "legacy row, no actor",
+              details={"model": "m", "input_tokens": 5})
+
+    s = audit.usage_summary()
+    assert s["totals"]["web_search_requests"] == 6
+    by_source = {r["source"]: r for r in s["by_source"]}
+    assert set(by_source) == {"executive", "specialist_research", "unknown"}
+    assert by_source["specialist_research"]["calls"] == 2
+    assert by_source["specialist_research"]["input_tokens"] == 100
+    assert by_source["specialist_research"]["web_search_requests"] == 5
+    assert by_source["unknown"]["input_tokens"] == 5
 
 
 def test_usage_summary_aggregates_across_sessions_and_models(audit: AuditLogger) -> None:

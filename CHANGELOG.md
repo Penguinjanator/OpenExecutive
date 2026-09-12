@@ -118,6 +118,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   routing pass can no longer start a workflow (`run_workflow` is withheld,
   `suggest_workflow` remains); the periodic run's default interval moves
   from 120 to 360 minutes.
+- **Every model call is recorded.** Research specialists, the research
+  routing and watchlist passes, triage and the chat memory extractor now
+  write the same `cache_event` audit row the Executive's chat turns always
+  did (tokens, cache hits, cost, and the server-side web searches the call
+  made). A research run's result and its `watchlist_research_periodic_ran`
+  audit row carry a `usage` block summing its calls per source, and
+  `GET /audit/usage` (and the usage page) gain a by-source breakdown.
 
 ### Removed
 - **The xcrawl scrape service and everything that depended on it.** The

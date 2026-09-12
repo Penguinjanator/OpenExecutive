@@ -40,11 +40,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
 from pydantic import BaseModel, Field
 
+from openexecutive.audit.usage import UsageRollup, bind_research_run, log_model_usage
 from openexecutive.knowledge.store import ChromaDBStore
 from openexecutive.monitoring.research.dedup import dedup_findings
 from openexecutive.monitoring.research.models import (
@@ -381,7 +383,19 @@ class ExecutiveResearchWorkflow(Workflow):
         store: ChromaDBStore,
     ) -> AsyncIterator[WorkflowEvent]:
         assert isinstance(inputs, ExecutiveResearchInput)
+        # Every model call the run makes (specialists, synthesis, watchlist
+        # pass) records a cache_event row tagged with this id and summed into
+        # the rollup, which the result event reports as `usage`.
+        with bind_research_run(f"research-{uuid.uuid4().hex[:12]}") as rollup:
+            async for event in self._run_events(inputs, store, rollup):
+                yield event
 
+    async def _run_events(
+        self,
+        inputs: ExecutiveResearchInput,
+        store: ChromaDBStore,
+        rollup: UsageRollup,
+    ) -> AsyncIterator[WorkflowEvent]:
         # ------------------------------------------------------------------
         # Step 1: gather_context
         # ------------------------------------------------------------------
@@ -553,7 +567,10 @@ class ExecutiveResearchWorkflow(Workflow):
         if not deduped:
             yield WorkflowEvent(
                 type="result",
-                data={"findings": [], "tool_calls": [], "narrative": ""},
+                data={
+                    "findings": [], "tool_calls": [], "narrative": "",
+                    "usage": rollup.as_dict(),
+                },
             )
             yield WorkflowEvent(
                 type="artifact",
@@ -678,6 +695,7 @@ class ExecutiveResearchWorkflow(Workflow):
                 ],
                 "tool_calls": tool_calls,
                 "narrative": narrative,
+                "usage": rollup.as_dict(),
             },
         )
         yield WorkflowEvent(type="artifact", content=artifact)
@@ -796,6 +814,9 @@ async def _executive_synthesis_loop(
                     iteration,
                 )
                 break
+            log_model_usage(
+                response, model=model, actor="research_synthesis", iteration=iteration,
+            )
 
             ok_so_far = _routing_ok(tool_calls)
             budget_remaining = max(0, _MAX_ROUTING_TOOLS_PER_RUN - ok_so_far)
@@ -972,6 +993,9 @@ async def _watchlist_analysis_loop(
         except Exception:
             logger.exception("research.watchlist: provider call failed")
             break
+        log_model_usage(
+            response, model=model, actor="research_watchlist", iteration=_iteration,
+        )
 
         budget_remaining = max(0, _MAX_WATCHLIST_PROPOSALS_PER_RUN - len(proposals))
         iter_calls = await execute_tool_calls(

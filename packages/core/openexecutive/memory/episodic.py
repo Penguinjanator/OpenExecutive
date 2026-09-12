@@ -1776,6 +1776,7 @@ async def extract_and_store(
     Runs as a background task — never blocks the response stream.
     """
     try:
+        from openexecutive.audit.usage import log_model_usage
         from openexecutive.config import get_settings
         from openexecutive.providers import get_provider
 
@@ -1816,6 +1817,8 @@ async def extract_and_store(
                 }
             ],
         )
+
+        log_model_usage(response, model=routing_model, actor="memory_extractor")
 
         for block in response.content:
             if block.type != "tool_use" or block.name != "store_memories":

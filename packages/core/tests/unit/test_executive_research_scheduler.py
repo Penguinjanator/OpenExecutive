@@ -181,6 +181,42 @@ def _make_workflow_stub(
 
 
 @pytest.mark.asyncio
+async def test_scan_audit_row_carries_the_runs_usage(
+    db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The workflow's `usage` rollup lands on the `_ran` audit row so a run's
+    weight can be read from the audit log."""
+    usage = {
+        "calls": 9, "input_tokens": 1200, "cache_read_input_tokens": 300,
+        "cache_creation_input_tokens": 0, "output_tokens": 400, "web_search_requests": 14,
+        "by_source": {"specialist_research": {"calls": 7, "web_search_requests": 14}},
+    }
+
+    async def fake_run(*, inputs, store):
+        from openexecutive.workflows.base import WorkflowEvent
+        yield WorkflowEvent(
+            type="result", data={"findings": [], "tool_calls": [], "usage": usage},
+        )
+        yield WorkflowEvent(type="artifact", content="(empty)")
+        yield WorkflowEvent(type="done")
+
+    workflow = MagicMock()
+    workflow.run = fake_run
+    workflow.input_model.return_value = _MinimalInput
+    workflow.title = "Executive Research"
+    monkeypatch.setitem(
+        __import__("openexecutive.workflows", fromlist=["WORKFLOW_REGISTRY"]).WORKFLOW_REGISTRY,
+        "executive_research", workflow,
+    )
+    await research_scheduler.run_watchlist_research_scan(db_path=db, store=MagicMock())
+
+    from openexecutive.audit import get_audit_logger
+    ran = get_audit_logger().query(event_type=research_scheduler.EVENT_RAN, limit=1)
+    assert (ran[0].details or {}).get("usage") == usage
+    assert "9 model call(s), 14 search(es)" in ran[0].summary
+
+
+@pytest.mark.asyncio
 async def test_scan_skips_when_state_unchanged(
     db: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

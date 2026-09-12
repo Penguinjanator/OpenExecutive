@@ -65,6 +65,7 @@ async def research_one_specialist(
     try:
         message = await agent.analyze_with_tools(
             research_context,
+            actor="specialist_research",
             tools=tools,
             system_addendum=research_addendum_for(specialist_slug),
             timeout_seconds=_RESEARCH_TIMEOUT_SECONDS,
