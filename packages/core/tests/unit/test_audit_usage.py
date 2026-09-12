@@ -38,6 +38,10 @@ def test_usage_counts_reads_tokens_cost_and_server_searches() -> None:
 
 def test_usage_counts_tolerates_missing_fields_and_no_usage() -> None:
     assert au.usage_counts(SimpleNamespace(content=[])) is None
+    # A mock (or a usage object without integer counts) is not usage.
+    from unittest.mock import MagicMock
+    assert au.usage_counts(MagicMock()) is None
+    assert au.usage_counts(SimpleNamespace(usage=SimpleNamespace(cost="0.1"))) is None
     counts = au.usage_counts(_message(input_tokens=5, cost="not-a-number"))
     assert counts is not None
     assert counts["output_tokens"] == 0 and counts["web_search_requests"] == 0
@@ -94,6 +98,13 @@ async def test_rollup_collects_calls_made_in_gathered_tasks(audit: AuditLogger) 
     assert rollup.as_dict()["calls"] == 3 and rollup.as_dict()["input_tokens"] == 6
 
 
+def test_log_model_usage_never_raises_on_a_malformed_usage_block(audit: AuditLogger) -> None:
+    msg = _message(input_tokens=float("inf"), output_tokens=3)
+    assert au.log_model_usage(msg, model="m", actor="triage") is not None
+    row = audit.query(event_type="cache_event")[0]
+    assert row.details["input_tokens"] == 0 and row.details["output_tokens"] == 3
+
+
 def test_log_model_usage_returns_none_without_usage(audit: AuditLogger) -> None:
     assert au.log_model_usage(SimpleNamespace(content=[]), model="m", actor="triage") is None
     assert audit.query(event_type="cache_event") == []
@@ -104,13 +115,21 @@ def test_usage_rollup_sums_per_source() -> None:
     roll.add("specialist_research", {"input_tokens": 10, "output_tokens": 2, "web_search_requests": 3})
     roll.add("specialist_research", {"input_tokens": 5, "output_tokens": 1, "web_search_requests": 1})
     roll.add("research_synthesis", {"input_tokens": 7, "cache_read_input_tokens": 100})
-    roll.add("research_watchlist", None)  # a call without usage is not counted
+    roll.add("research_watchlist", None)  # a call without usage still counts as a call
     out = roll.as_dict()
-    assert out["calls"] == 3
+    assert out["calls"] == 4
+    assert out["by_source"]["research_watchlist"]["calls"] == 1
     assert out["input_tokens"] == 22 and out["web_search_requests"] == 4
     assert out["cache_read_input_tokens"] == 100
     assert out["by_source"]["specialist_research"] == {
         "calls": 2, "input_tokens": 15, "cache_read_input_tokens": 0,
         "cache_creation_input_tokens": 0, "output_tokens": 3, "web_search_requests": 4,
     }
-    assert list(out["by_source"]) == ["research_synthesis", "specialist_research"]
+    assert list(out["by_source"]) == ["research_synthesis", "research_watchlist", "specialist_research"]
+
+
+def test_log_model_usage_counts_a_call_without_usage_in_the_rollup(audit: AuditLogger) -> None:
+    with au.bind_research_run("run-x") as rollup:
+        assert au.log_model_usage(SimpleNamespace(content=[]), model="m", actor="triage") is None
+    assert rollup.as_dict()["calls"] == 1
+    assert audit.query(event_type="cache_event") == []  # no row without counts

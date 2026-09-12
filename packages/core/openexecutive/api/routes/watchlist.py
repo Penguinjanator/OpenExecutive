@@ -230,7 +230,7 @@ async def create_watchlist_entry(body: WatchlistCreate) -> WatchlistItem:
             config.setdefault("display_name", body.display_label)
 
     # Insert-time validation: a non-feed rss target is converted to a
-    # scrape-backed page_watch (when scrapeable) or rejected, so a dead
+    # page_watch (when the page has readable text) or rejected, so a dead
     # row never reaches the scan loop. Non-rss types pass through untouched.
     try:
         signal_type, target, config = await validate_and_normalize_target(

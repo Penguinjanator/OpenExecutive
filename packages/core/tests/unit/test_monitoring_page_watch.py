@@ -264,6 +264,24 @@ def test_page_watch_state_roundtrip(db: Path) -> None:
     assert st2["text_snapshot"] == "text B"
 
 
+def test_html_to_text_is_linear_on_unterminated_openers() -> None:
+    """A page full of unterminated comment / script openers must reduce in
+    linear time: the insert-time conversion runs this on whatever a server
+    sends, on the request thread."""
+    import time
+
+    for body in (b"<!--" * 100_000, b"<script>" * 60_000, b"<style" * 80_000):
+        t0 = time.monotonic()
+        assert html_to_text(body) == ""
+        assert time.monotonic() - t0 < 1.0
+    # Block stripping still behaves: content of script/style/noscript and
+    # comments is gone, an unrelated tag such as <scripts> is only a tag.
+    assert html_to_text(
+        b"<p>a</p><script type=x>js()</script>b<STYLE>c</STYLE><!-- x -->d"
+        b"<noscript>n</noscript><scripts>e</scripts>"
+    ) == "a b d e"
+
+
 def test_page_watch_registered() -> None:
     assert "page_watch" in list_registered_kinds()
 

@@ -309,6 +309,14 @@ class ExecutiveResearchInput(BaseModel):
             "competitor signals')."
         ),
     )
+    run_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional id the caller already recorded for this run (the "
+            "periodic scheduler's workflow_runs id). Every model-usage row "
+            "the run writes carries it; generated when omitted."
+        ),
+    )
 
 
 class ExecutiveResearchWorkflow(Workflow):
@@ -383,18 +391,41 @@ class ExecutiveResearchWorkflow(Workflow):
         store: ChromaDBStore,
     ) -> AsyncIterator[WorkflowEvent]:
         assert isinstance(inputs, ExecutiveResearchInput)
+        run_id = inputs.run_id or f"research-{uuid.uuid4().hex[:12]}"
         # Every model call the run makes (specialists, synthesis, watchlist
-        # pass) records a cache_event row tagged with this id and summed into
-        # the rollup, which the result event reports as `usage`.
-        with bind_research_run(f"research-{uuid.uuid4().hex[:12]}") as rollup:
-            async for event in self._run_events(inputs, store, rollup):
+        # pass) records a cache_event row tagged with the run id and summed
+        # into a rollup the result event reports as `usage`. The body runs in
+        # its own task so the binding lives in that task's context: set
+        # inside this generator it would land in the consumer's context and
+        # outlive an abandoned run.
+        queue: asyncio.Queue[WorkflowEvent | None] = asyncio.Queue()
+
+        async def _produce() -> None:
+            try:
+                with bind_research_run(run_id) as rollup:
+                    async for event in self._run_events(inputs, store, rollup, run_id):
+                        queue.put_nowait(event)
+            finally:
+                queue.put_nowait(None)
+
+        producer = asyncio.create_task(_produce())
+        try:
+            while True:
+                event = await queue.get()
+                if event is None:
+                    break
                 yield event
+            await producer  # surface a crash inside the run to the consumer
+        finally:
+            if not producer.done():
+                producer.cancel()
 
     async def _run_events(
         self,
         inputs: ExecutiveResearchInput,
         store: ChromaDBStore,
         rollup: UsageRollup,
+        run_id: str,
     ) -> AsyncIterator[WorkflowEvent]:
         # ------------------------------------------------------------------
         # Step 1: gather_context
@@ -569,7 +600,7 @@ class ExecutiveResearchWorkflow(Workflow):
                 type="result",
                 data={
                     "findings": [], "tool_calls": [], "narrative": "",
-                    "usage": rollup.as_dict(),
+                    "usage": {"run_id": run_id, **rollup.as_dict()},
                 },
             )
             yield WorkflowEvent(
@@ -695,7 +726,7 @@ class ExecutiveResearchWorkflow(Workflow):
                 ],
                 "tool_calls": tool_calls,
                 "narrative": narrative,
-                "usage": rollup.as_dict(),
+                "usage": {"run_id": run_id, **rollup.as_dict()},
             },
         )
         yield WorkflowEvent(type="artifact", content=artifact)
@@ -1222,11 +1253,17 @@ def _render_research_context(
     return "\n".join(parts)
 
 
+# Bounds on the DEPARTMENT WATCH INTERESTS block: departments listed and
+# entities named per department. Generous for any real org chart; they only
+# stop a runaway list from crowding the specialist turn.
+_MAX_INTEREST_DEPARTMENTS = 20
+_MAX_INTEREST_ENTITIES = 20
+
+
 def _render_department_interests(departments: list[Any] | None) -> list[str]:
     """One ``- <slug>: <entities>`` line per department with watched
-    entities (at most 20 departments, 20 entities each). Shared by the
-    specialist context and the watchlist turn so both name the same
-    interests."""
+    entities. Shared by the specialist context and the watchlist turn so
+    both name the same interests."""
     lines: list[str] = []
     for state in departments or []:
         config = getattr(state, "config", None)
@@ -1237,8 +1274,8 @@ def _render_department_interests(departments: list[Any] | None) -> list[str]:
             if str(e).strip()
         ]
         if slug and entities:
-            lines.append(f"- {slug}: {', '.join(entities[:20])}")
-    return lines[:20]
+            lines.append(f"- {slug}: {', '.join(entities[:_MAX_INTEREST_ENTITIES])}")
+    return lines[:_MAX_INTEREST_DEPARTMENTS]
 
 
 def _render_team_roster(people: list[Any]) -> str:

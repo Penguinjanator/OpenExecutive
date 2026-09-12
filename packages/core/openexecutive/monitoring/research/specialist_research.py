@@ -47,8 +47,8 @@ async def research_one_specialist(
     )
 
     tools: list[dict[str, Any]] = [EMIT_RESEARCH_FINDINGS_TOOL]
-    # The research fan-out has its own search cap: the shared chat knob is
-    # multiplied by the number of specialists here.
+    # The research fan-out has its own search cap (each specialist gets
+    # this many searches; the chat knob stays with chat and standing queries).
     web_search = build_web_search_tool(
         max_uses=get_settings().research_web_search_max_uses,
     )
@@ -111,15 +111,7 @@ def _extract_findings(
         block_input = getattr(block, "input", None) or {}
         items = block_input.get("findings")
         if isinstance(items, list):
-            if len(items) > PER_SPECIALIST_FINDING_CAP:
-                # The schema's maxItems already refuses this on Anthropic;
-                # a translated provider may not enforce it, so keep the
-                # first N — the model was told to lead with the material ones.
-                logger.warning(
-                    "research: specialist=%s emitted %d findings — keeping the first %d",
-                    specialist_slug, len(items), PER_SPECIALIST_FINDING_CAP,
-                )
-            raw_findings.extend(items[:PER_SPECIALIST_FINDING_CAP])
+            raw_findings.extend(items)
 
     if not raw_findings:
         # Empty research is a valid answer ("nothing in my domain
@@ -143,6 +135,15 @@ def _extract_findings(
             )
             continue
         parsed.append(finding)
+    if len(parsed) > PER_SPECIALIST_FINDING_CAP:
+        # The schema states the cap; a provider may not enforce it. Applied
+        # after parsing so malformed items never crowd out valid ones — the
+        # model was told to lead with the material findings.
+        logger.warning(
+            "research: specialist=%s emitted %d findings — keeping the first %d",
+            specialist_slug, len(parsed), PER_SPECIALIST_FINDING_CAP,
+        )
+        parsed = parsed[:PER_SPECIALIST_FINDING_CAP]
     return parsed
 
 

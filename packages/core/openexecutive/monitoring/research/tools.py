@@ -28,9 +28,9 @@ EMIT_RESEARCH_FINDINGS_TOOL: dict[str, Any] = {
         "properties": {
             "findings": {
                 "type": "array",
-                # The cap is part of the schema, not only the prompt: a
-                # longer list is refused at the API, and the parser slices
-                # to the same number for providers that do not enforce it.
+                # The cap is part of the schema, not only the prompt; the
+                # parser applies the same number after parsing, so it holds
+                # whether or not the provider honours maxItems.
                 "maxItems": PER_SPECIALIST_FINDING_CAP,
                 "description": (
                     f"At most {PER_SPECIALIST_FINDING_CAP} findings. Prefer "

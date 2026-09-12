@@ -309,6 +309,46 @@ async def test_workflow_runs_end_to_end_with_stubbed_specialists(
     # The run reports what it did; the stubs made no model calls.
     assert result_data["usage"]["calls"] == 0
     assert result_data["usage"]["by_source"] == {}
+    assert result_data["usage"]["run_id"].startswith("research-")
+
+
+@pytest.mark.asyncio
+async def test_abandoned_run_leaves_no_usage_binding_behind(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A consumer that stops iterating mid-run must not keep the run's id
+    bound in its own context (later usage rows would be mis-tagged), and
+    the run's own cleanup must not raise."""
+    import asyncio
+
+    from openexecutive.audit import usage as au
+
+    async def slow_research_one(slug, agent, ctx):
+        await asyncio.sleep(0.01)
+        return []
+
+    monkeypatch.setattr(
+        "openexecutive.workflows.executive_research.research_one_specialist", slow_research_one,
+    )
+    workflow = ExecutiveResearchWorkflow()
+    gen = workflow.run(inputs=ExecutiveResearchInput(note="t", run_id="run-abandon"), store=MagicMock())
+    first = await gen.__anext__()
+    assert first.type == "step_start"
+    assert au.get_research_run_id() is None  # the binding lives in the run's task
+    await gen.aclose()
+    await asyncio.sleep(0.05)
+    assert au.get_research_run_id() is None
+
+
+def test_finding_cap_applies_after_parsing() -> None:
+    """Malformed items ahead of valid ones must not consume the cap."""
+    from openexecutive.monitoring.research.prompts import PER_SPECIALIST_FINDING_CAP
+
+    bad = {"title": "no summary"}
+    good = {"title": "ok", "summary": "s", "severity_hint": "low",
+            "suggested_audience": "noone", "confidence": "medium"}
+    msg = _make_msg_with_tool_use(
+        "emit_research_findings", {"findings": [bad] * PER_SPECIALIST_FINDING_CAP + [good, good]},
+    )
+    assert len(_extract_findings(msg, "cso")) == 2
 
 
 @pytest.mark.asyncio

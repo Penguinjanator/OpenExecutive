@@ -58,13 +58,14 @@ function UsageRowCells({ u }: { u: UsageTotals }) {
       <td className="px-3 py-1.5 text-right tabular-nums">{fmtInt(u.cache_read_input_tokens)}</td>
       <td className="px-3 py-1.5 text-right tabular-nums">{fmtInt(u.cache_creation_input_tokens)}</td>
       <td className="px-3 py-1.5 text-right tabular-nums">{fmtInt(u.output_tokens)}</td>
+      <td className="px-3 py-1.5 text-right tabular-nums">{fmtInt(u.web_search_requests ?? 0)}</td>
       <td className="px-3 py-1.5 text-right tabular-nums">{cacheHitPct(u)}%</td>
       <td className="px-3 py-1.5 text-right tabular-nums">{fmtCost(u.cost_usd)}</td>
     </>
   );
 }
 
-const COL_HEADERS = ["Calls", "Input", "Cache read", "Cache write", "Output", "Cached", "Cost"];
+const COL_HEADERS = ["Calls", "Input", "Cache read", "Cache write", "Output", "Searches", "Cached", "Cost"];
 
 // Debounce window for refetching as the date-range filter changes (matches
 // the /audit list page).
@@ -186,6 +187,7 @@ export default function TokenUsagePage() {
               <StatCard label="Fresh input" value={fmtInt(totals.input_tokens)} />
               <StatCard label="Cache read" value={fmtInt(totals.cache_read_input_tokens)} />
               <StatCard label="Cache write" value={fmtInt(totals.cache_creation_input_tokens)} />
+              <StatCard label="Searches" value={fmtInt(totals.web_search_requests ?? 0)} hint="server-side web searches" />
             </div>
           ) : null}
 
@@ -201,7 +203,6 @@ export default function TokenUsagePage() {
                   <thead>
                     <tr className="bg-surface-elevated/60 text-fg-muted text-xs">
                       <th className="px-3 py-2 text-left font-medium">Source</th>
-                      <th className="px-3 py-2 text-right font-medium">Searches</th>
                       {COL_HEADERS.map((h) => (
                         <th key={h} className="px-3 py-2 text-right font-medium">{h}</th>
                       ))}
@@ -211,7 +212,6 @@ export default function TokenUsagePage() {
                     {data.by_source.map((s: UsageBySource) => (
                       <tr key={s.source} className="border-t border-line/60">
                         <td className="px-3 py-1.5 font-mono text-xs text-fg">{s.source}</td>
-                        <td className="px-3 py-1.5 text-right tabular-nums">{fmtInt(s.web_search_requests ?? 0)}</td>
                         <UsageRowCells u={s} />
                       </tr>
                     ))}

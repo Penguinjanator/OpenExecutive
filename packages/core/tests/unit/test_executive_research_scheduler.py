@@ -139,8 +139,9 @@ def test_bootstrap_is_idempotent(db: Path) -> None:
 
 
 class _MinimalInput:
-    def __init__(self, note: str = "", **_: Any) -> None:
+    def __init__(self, note: str = "", run_id: str | None = None, **_: Any) -> None:
         self.note = note
+        self.run_id = run_id
 
     def model_dump(self) -> dict[str, Any]:
         return {"note": self.note}
@@ -192,8 +193,11 @@ async def test_scan_audit_row_carries_the_runs_usage(
         "by_source": {"specialist_research": {"calls": 7, "web_search_requests": 14}},
     }
 
+    seen_inputs: list[Any] = []
+
     async def fake_run(*, inputs, store):
         from openexecutive.workflows.base import WorkflowEvent
+        seen_inputs.append(inputs)
         yield WorkflowEvent(
             type="result", data={"findings": [], "tool_calls": [], "usage": usage},
         )
@@ -214,6 +218,8 @@ async def test_scan_audit_row_carries_the_runs_usage(
     ran = get_audit_logger().query(event_type=research_scheduler.EVENT_RAN, limit=1)
     assert (ran[0].details or {}).get("usage") == usage
     assert "9 model call(s), 14 search(es)" in ran[0].summary
+    # The scheduler hands its run id to the workflow so usage rows link to it.
+    assert seen_inputs[0].run_id == (ran[0].details or {}).get("run_id")
 
 
 @pytest.mark.asyncio

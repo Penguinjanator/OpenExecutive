@@ -460,9 +460,9 @@ class Settings(BaseSettings):
     # WEB_SEARCH_MAX_USES for deeper digs.
     web_search_max_uses: int = Field(2, alias="WEB_SEARCH_MAX_USES")
     # Searches per specialist in the executive_research fan-out. Separate
-    # from the chat knob above because the fan-out multiplies it by the
-    # number of specialists (seven by default), and every search adds
-    # results that each later pass re-reads.
+    # from the chat knob above because every specialist in the fan-out
+    # (seven by default) gets this many, and every search adds results that
+    # each later pass re-reads.
     research_web_search_max_uses: int = Field(
         3, alias="RESEARCH_WEB_SEARCH_MAX_USES"
     )

@@ -46,6 +46,10 @@ logger = logging.getLogger(__name__)
 # happen to decode to a few characters; a real article, pricing or news page
 # clears it easily.
 _MIN_PAGE_TEXT_CHARS = 200
+# Only the head of the body is reduced for that check: 200 visible
+# characters never need more, and the insert path runs on the request
+# thread, so the work is bounded whatever the server sends.
+_READABILITY_SCAN_BYTES = 262_144
 
 
 class WatchlistTargetError(Exception):
@@ -116,7 +120,7 @@ def _is_readable_page(body: bytes) -> bool:
     the text threshold rejects shells and one-line error pages."""
     if b"\x00" in body[:4096]:
         return False
-    return len(html_to_text(body)) >= _MIN_PAGE_TEXT_CHARS
+    return len(html_to_text(body[:_READABILITY_SCAN_BYTES])) >= _MIN_PAGE_TEXT_CHARS
 
 
 async def _feed_check(

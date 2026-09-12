@@ -459,11 +459,14 @@ async def run_watchlist_research_scan(
 
         workflow = WORKFLOW_REGISTRY["executive_research"]
         input_cls = workflow.input_model()
+        run_id = str(uuid.uuid4())
+        # The workflow tags every model-usage row it writes with this id, so
+        # a run that times out or crashes is still traceable to its calls.
         wf_inputs = input_cls(
             note=f"periodic research tick at {now.isoformat()}",
+            run_id=run_id,
         )
 
-        run_id = str(uuid.uuid4())
         try:
             create_run(
                 run_id,
@@ -574,7 +577,7 @@ async def run_watchlist_research_scan(
             EVENT_FAILED,
             "Watchlist research timed out",
             actor="scheduler",
-            details={"state_hash": state_hash, "reason": "timeout"},
+            details={"state_hash": state_hash, "reason": "timeout", "run_id": run_id},
         )
         return 0
     except Exception as exc:
@@ -586,7 +589,7 @@ async def run_watchlist_research_scan(
             EVENT_FAILED,
             f"Watchlist research crashed: {exc}",
             actor="scheduler",
-            details={"state_hash": state_hash, "error": str(exc)[:300]},
+            details={"state_hash": state_hash, "error": str(exc)[:300], "run_id": run_id},
         )
         return 0
 

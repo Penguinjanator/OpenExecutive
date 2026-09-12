@@ -1617,7 +1617,8 @@ export interface UsageTotals {
   cache_read_input_tokens: number;
   cache_creation_input_tokens: number;
   output_tokens: number;
-  web_search_requests: number;
+  // Absent on rows written before searches were recorded.
+  web_search_requests?: number;
   cost_usd: number;
 }
 
@@ -1641,7 +1642,8 @@ export interface UsageSummary {
   totals: UsageTotals;
   by_day: UsageByDay[];
   by_model: UsageByModel[];
-  by_source: UsageBySource[];
+  // Absent on a backend older than the by-source breakdown.
+  by_source?: UsageBySource[];
 }
 
 export async function getAuditUsage(

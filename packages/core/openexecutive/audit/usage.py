@@ -40,7 +40,13 @@ def bind_research_run(run_id: str | None) -> Iterator[UsageRollup]:
     """Tag every usage row logged inside the block with ``run_id`` and sum
     it into the yielded :class:`UsageRollup`. Tasks spawned inside the
     block (the specialist fan-out) inherit the binding and share the same
-    rollup object, so their calls count too."""
+    rollup object, so their calls count too.
+
+    Bind in the task that runs the calls, never inside an async generator
+    that a consumer may abandon: a ContextVar set inside a generator lands
+    in the consumer's context, and an abandoned generator's ``finally``
+    runs elsewhere (``executive_research.run`` drives its body in a child
+    task for this reason)."""
     rollup = UsageRollup()
     token_id = _research_run_id.set(run_id)
     token_rollup = _research_rollup.set(rollup)
@@ -58,6 +64,13 @@ def usage_counts(message: Any) -> dict[str, Any] | None:
     provider that omits one still yields the rest."""
     usage = getattr(message, "usage", None)
     if usage is None:
+        return None
+    # A real usage block carries integer token counts; anything else (a
+    # mock, a provider quirk) is not usage and must not become a row.
+    if not any(
+        isinstance(getattr(usage, field, None), int)
+        for field in ("input_tokens", "output_tokens")
+    ):
         return None
     raw_cost = getattr(usage, "cost", None)
     try:
@@ -90,16 +103,21 @@ def log_model_usage(
 
     Never raises and never touches the request: it reads ``message.usage``
     after the call, so prompt caching is unaffected. Returns the counters it
-    recorded (``None`` when the response had no usage block). ``session_id``
-    / ``turn_id`` fall back to the audit ContextVars when omitted, as every
-    other audit row does.
+    recorded (``None`` when the response had no usage block — the call still
+    counts toward a bound research run's rollup, so the run's call count is
+    honest even when a provider omits usage). ``session_id`` / ``turn_id``
+    fall back to the audit ContextVars when omitted, as every other audit
+    row does.
     """
-    counts = usage_counts(message)
+    try:
+        counts = usage_counts(message)
+        rollup = _research_rollup.get()
+        if rollup is not None:
+            rollup.add(actor, counts)
+    except Exception:  # noqa: BLE001 — a malformed usage block is not the caller's problem
+        return None
     if counts is None:
         return None
-    rollup = _research_rollup.get()
-    if rollup is not None:
-        rollup.add(actor, counts)
     stop_reason = getattr(message, "stop_reason", None)
     details: dict[str, Any] = {
         "model": model,
@@ -149,13 +167,13 @@ class UsageRollup:
         self.by_actor: dict[str, dict[str, int]] = {}
 
     def add(self, actor: str, counts: dict[str, Any] | None) -> None:
-        if counts is None:
-            return
+        """Count one call; ``counts`` may be ``None`` for a response that
+        carried no usage block (the call happened, its tokens are unknown)."""
         self.calls += 1
         bucket = self.by_actor.setdefault(actor, {"calls": 0, **dict.fromkeys(self._FIELDS, 0)})
         bucket["calls"] += 1
         for field in self._FIELDS:
-            value = _as_int(counts.get(field, 0))
+            value = _as_int((counts or {}).get(field, 0))
             self.totals[field] += value
             bucket[field] += value
 
@@ -170,7 +188,7 @@ class UsageRollup:
 def _as_int(value: Any) -> int:
     try:
         return int(value or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
 
 

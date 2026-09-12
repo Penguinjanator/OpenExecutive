@@ -418,6 +418,7 @@ def _compute_cost_summary(events: list[Any]) -> CostSummary | None:
         "cache_read_input_tokens",
         "cache_creation_input_tokens",
         "output_tokens",
+        "web_search_requests",
     )
 
     def _as_int(value: Any) -> int:

@@ -452,7 +452,7 @@ async def _validated_target(
 
     config = _display_label_config(signal_type, tool_input.get("display_label"))
     # Validate the target before it lands: a non-feed rss URL is converted
-    # to a scrape-backed page_watch (when scrapeable) or rejected, so the
+    # to a page_watch (when the page has readable text) or rejected, so the
     # research workflow can't seed the watchlist with dead feed rows.
     try:
         signal_type, target, config = await validate_and_normalize_target(
