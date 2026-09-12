@@ -1380,9 +1380,13 @@ external_monitoring:
       eur-lex), +1 finding confidence high, +1 verification confirmed, +1
       cross-specialist consensus, ±1 policy history for (signal_type,
       grounding_kind) at >= 5 samples (>= 0.7 / <= 0.3 approval rate).
-    - direct add at score >= 4 with the mandatory match AND a strong kind
-      (company / competitor / vendor / ticker — initiative- or
-      priority-grounded proposals are suggestions at most); model
+    - finding points (high / verified / consensus) count only when the cited
+      finding concerns THIS source: a URL target shares its site with a cited
+      URL; a ticker/query target appears in the finding text or is the named
+      entity. A strong finding cannot be borrowed for an unrelated page.
+    - direct add at score >= 4 with the mandatory match AND the entity's OWN
+      source AND a strong kind (company / competitor / vendor / ticker —
+      initiative- or priority-grounded proposals are suggestions at most); model
       `certainty` can only downgrade; `query` never direct; a suggestion needs
       a linked finding and score >= 1 (SUGGEST_THRESHOLD) — nothing vouching
       for it is rejected; at or above WATCHLIST_MAX_ENABLED (40) enabled rows
@@ -1415,9 +1419,12 @@ external_monitoring:
     - isolation: the routing/synthesis pass has NO watchlist write tools
       (add/tune/remove are in _SYNTHESIS_EXCLUDED_TOOLS), so every watch a
       research run creates goes through the policy; tune_watchlist_entry
-      refuses mode/enabled on a pending suggestion (only approve/decline
-      move it); URL-typed targets pass validate_target_url at insert time;
-      approve / decline / expiry are compare-and-act on "still pending".
+      accepts only notes on a pending suggestion (approve/decline move it;
+      its quiet defaults cannot be loosened while it waits); URL-typed
+      targets pass validate_target_url at insert time; approve / decline /
+      expiry are compare-and-act on "still pending" (the guarded delete runs
+      under BEGIN IMMEDIATE). Normalized URL keys also fold percent-encoding,
+      dot segments and a trailing host dot.
     - outcomes (`watchlist_policy_outcomes`: approved / declined / expired /
       auto_disabled by signal_type, grounding_kind, specialist) feed the
       history term and are rendered to the model as HOW PAST PROPOSALS TURNED OUT.
