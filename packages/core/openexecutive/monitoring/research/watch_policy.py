@@ -238,11 +238,15 @@ class PolicySettings:
 
 
 class VocabEntry(NamedTuple):
-    """One grounding-vocabulary value: the term's kind and, when the term
-    came from (or is also claimed by) a department, that department's slug."""
+    """One grounding-vocabulary value: the term's kind, the department that
+    supplied or also claims it, and the entity's own domains when the
+    profile / department entry names them ("Brex (brex.com)"). With
+    domains pinned, only those sites are the entity's own source; without,
+    the site label has to be the entity's name."""
 
     kind: str
     department: str = ""
+    domains: tuple[str, ...] = ()
 
 
 class DepartmentRef(NamedTuple):
@@ -297,31 +301,96 @@ def _norm(term: str) -> str:
 # bag of common words that would both hide the name (short names such as BYD
 # never match inside a sentence) and poison own-source checks ("global" in
 # "BYD — global cost leader" would make global.com BYD's own site).
-_ENTRY_SPLIT_RE = re.compile(r"\s+[—–-]\s+|[:;]")
-_PAREN_RE = re.compile(r"\(([^)]*)\)")
-_TICKER_RE = re.compile(r"^(?:[A-Z]{1,5}(?:\.[A-Z]{1,3})?|\d{3,6}\.[A-Z]{2,3})$")
+# Em/en dashes split regardless of spacing (typography varies); a plain
+# hyphen only when spaced, so "Mercedes-Benz" and "T-Mobile" survive.
+_ENTRY_SPLIT_RE = re.compile(r"\s*[—–]\s*| - |[:;]")
+_PAREN_RE = re.compile(r"\(([^()]*)\)")
+_TICKER_RE = re.compile(r"^(?:[A-Z]{2,5}(?:\.[A-Z]{1,3})?|\d{3,6}\.[A-Z]{2,3})$")
+_DOMAIN_RE = re.compile(r"^(?:[a-z0-9-]+\.)+[a-z]{2,}$")
+_URL_RE = re.compile(r"^(?:https?://)?((?:[a-z0-9-]+\.)+[a-z]{2,})(?:[/?#].*)?$", re.IGNORECASE)
+# Upper-case words that appear in parentheses in ordinary profile prose and
+# are not tickers. A parenthesised token is a ticker only when it is alone
+# in its group and not one of these; the profile's own `tickers` list is
+# taken as-is.
+_NOT_TICKERS: frozenset[str] = frozenset({
+    "US", "USA", "EU", "UK", "EV", "EVS", "AI", "ML", "IT", "HR", "PR", "IR", "IP", "ALL", "NOW",
+    "NEW", "OEM", "OEMS", "LFP", "NMC", "EMEA", "APAC", "LATAM", "CEO", "CFO", "COO", "CTO", "CMO",
+    "CPO", "CHRO", "GC", "IPO", "ESG", "API", "SAAS", "B2B", "B2C", "SMB", "SME", "TCO", "ROI",
+    "KPI", "OKR", "GTM", "R2", "R3", "C1", "C2", "Q1", "Q2", "Q3", "Q4", "FY", "YOY", "QOQ",
+})
+# Profile entries are free text; bound what the parser looks at so a
+# pathological value cannot stall the scheduler tick.
+_MAX_ENTRY_CHARS = 256
 
 
-def entity_names(raw: str) -> tuple[list[str], list[str]]:
-    """``(names, tickers)`` parsed from one profile / department entry.
+class ParsedEntity(NamedTuple):
+    names: list[str]
+    tickers: list[str]
+    domains: list[str]
 
-    "Tesla (TSLA) — Model Y is the benchmark" → (["Tesla"], ["TSLA"]);
-    "GM / Chevrolet (Equinox EV, Blazer EV) — direct competitor" →
-    (["GM", "Chevrolet"], []); "Stripe" → (["Stripe"], [])."""
-    text = str(raw or "").strip()
+
+def _strip_parens(text: str) -> tuple[str, list[str]]:
+    """Remove parenthesised groups (innermost first, a few levels deep) and
+    return the bare text plus the groups' contents."""
+    groups: list[str] = []
+    for _ in range(3):
+        found = _PAREN_RE.findall(text)
+        if not found:
+            break
+        groups.extend(found)
+        text = _PAREN_RE.sub(" ", text)
+    return text, groups
+
+
+def entity_names(raw: str) -> ParsedEntity:
+    """``(names, tickers, domains)`` parsed from one profile / department entry.
+
+    "Tesla (TSLA) — Model Y is the benchmark" → names ["Tesla"], tickers
+    ["TSLA"]; "GM / Chevrolet (Equinox EV, Blazer EV) — direct competitor" →
+    names ["GM", "Chevrolet"]; "Brex (brex.com, status.brex.com)" → names
+    ["Brex"], domains ["brex.com", "status.brex.com"]; a bare URL or host
+    ("https://status.stripe.com") → names ["stripe"], domains
+    ["status.stripe.com"]; "Stripe" → ["Stripe"].
+
+    A parenthesised group counts as a ticker only when it is a single
+    ticker-shaped token (2–5 letters, or a numeric exchange code) that is not
+    an ordinary abbreviation ("US", "EV", "IT") — a list of product names in
+    parentheses is never a ticker. Domains are any dotted host in a group.
+    Parenthesised brand names ("Alphabet (Google)") are NOT aliases: list
+    them as entries of their own."""
+    text = " ".join(str(raw or "").split())[:_MAX_ENTRY_CHARS]
     if not text:
-        return [], []
-    head = _ENTRY_SPLIT_RE.split(text, maxsplit=1)[0]
+        return ParsedEntity([], [], [])
+    url = _URL_RE.match(text)
+    # A URL, or a bare lower-case host ("status.stripe.com"); an upper-case
+    # dotted symbol ("1211.HK") is a ticker, handled by the caller.
+    if url and ("://" in text or "/" in text or (" " not in text and text == text.lower())):
+        host = url.group(1).lower()
+        label = _site_label(host)
+        return ParsedEntity([label] if label else [], [], [host])
+    bare, groups = _strip_parens(text)
+    head = _ENTRY_SPLIT_RE.split(bare, maxsplit=1)[0]
     tickers: list[str] = []
-    for group in _PAREN_RE.findall(head):
-        for part in re.split(r"[,/]", group):
-            candidate = part.strip()
-            if _TICKER_RE.match(candidate) and candidate not in tickers:
+    domains: list[str] = []
+    for group in groups:
+        parts = [part.strip() for part in re.split(r"[,/;]", group) if part.strip()]
+        for part in parts:
+            # A dotted token with lower-case letters is a host; an
+            # upper-case one ("1211.HK", "MBG.DE") is an exchange ticker.
+            if part != part.upper() and _DOMAIN_RE.match(part.lower()) and part.lower() not in domains:
+                domains.append(part.lower())
+        if len(parts) == 1:
+            candidate = parts[0].upper()
+            if (
+                (parts[0] == parts[0].upper() or "." not in parts[0])
+                and _TICKER_RE.match(candidate)
+                and candidate not in _NOT_TICKERS
+                and candidate not in tickers
+            ):
                 tickers.append(candidate)
-    bare = _PAREN_RE.sub(" ", head)
-    names = [n.strip(" ,") for n in re.split(r"\s*/\s*", bare)]
+    names = [n.strip(" ,") for n in head.split("/")]
     names = [n for n in names if len(_norm(n)) >= 2]
-    return names, tickers
+    return ParsedEntity(names, tickers, domains)
 
 
 def grounding_vocabulary(
@@ -345,18 +414,19 @@ def grounding_vocabulary(
     the first one seen keeps it."""
     vocab: Vocabulary = {}
 
-    def add(term: str, kind: str, department: str = "") -> None:
+    def add(term: str, kind: str, department: str = "", domains: tuple[str, ...] = ()) -> None:
         n = _norm(term)
         if len(n) < 2:
             return
         current = vocab.get(n)
         if current is None:
-            vocab[n] = VocabEntry(kind, department)
+            vocab[n] = VocabEntry(kind, department, domains)
             return
+        merged = current.domains + tuple(d for d in domains if d not in current.domains)
         if _KIND_RANK[kind] > _KIND_RANK[current.kind]:
-            vocab[n] = VocabEntry(kind, department or current.department)
+            vocab[n] = VocabEntry(kind, department or current.department, merged)
         else:
-            vocab[n] = VocabEntry(current.kind, current.department or department)
+            vocab[n] = VocabEntry(current.kind, current.department or department, merged)
 
     for item in existing:
         for label_key in ("display_name", "feed_label", "vendor_label", "label"):
@@ -372,18 +442,20 @@ def grounding_vocabulary(
         add(str(getattr(i, "title", "") or ""), KIND_INITIATIVE)
     def add_entity(raw: str, kind: str, department: str = "") -> None:
         # Named-entity lists: only the parsed name(s) ground; a parenthesised
-        # ticker is a ticker term of its own.
-        names, tickers = entity_names(raw)
-        for name in names:
-            add(name, kind, department)
-        for ticker in tickers:
+        # ticker is a ticker term of its own; parenthesised domains pin the
+        # entity's own sites.
+        parsed = entity_names(raw)
+        for name in parsed.names:
+            add(name, kind, department, tuple(parsed.domains))
+        for ticker in parsed.tickers:
             add(ticker, KIND_TICKER, department)
 
     if profile is not None:
         for p in list(getattr(getattr(profile, "strategic_priorities", None), "current_year", []) or []):
             add(str(p), KIND_PRIORITY)
         for t in list(getattr(profile, "tickers", []) or []):
-            add_entity(str(t), KIND_TICKER)
+            # The tickers list is symbols as typed; nothing to parse.
+            add(str(t).strip().upper(), KIND_TICKER)
         for v in list(getattr(profile, "vendors", []) or []):
             add_entity(str(v), KIND_VENDOR)
         for c in list(getattr(getattr(profile, "competitive_landscape", None), "primary_competitors", []) or []):
@@ -488,8 +560,8 @@ def _entry(value: Any) -> VocabEntry:
     or a :class:`VocabEntry`."""
     if isinstance(value, VocabEntry):
         return value
-    if isinstance(value, tuple) and len(value) == 2:
-        return VocabEntry(str(value[0]), str(value[1] or ""))
+    if isinstance(value, tuple) and 2 <= len(value) <= 3:
+        return VocabEntry(str(value[0]), str(value[1] or ""), tuple(value[2]) if len(value) == 3 else ())
     return VocabEntry(str(value), "")
 
 
@@ -525,6 +597,10 @@ def match_vocab(entity: str, vocabulary: dict[str, Any]) -> tuple[str, VocabEntr
         return best
     for term, value in vocabulary.items():
         entry = _entry(value)
+        if entry.kind == KIND_TICKER and term != n:
+            # A ticker symbol grounds only when it IS the entity ("US" is
+            # not "US Foods", "IT" is not "IT Brew").
+            continue
         term_tokens = _distinctive_tokens(term, vocabulary)
         if not term_tokens or not (term_tokens <= tokens or tokens <= term_tokens):
             continue
@@ -580,7 +656,7 @@ def entity_declined(entity: str, declines: list[Any]) -> bool:
         # Exact, or a one-word declined name ("BYD") as a whole word of the
         # entity ("BYD Auto") and vice versa — short names have no
         # distinctive tokens, so the token rule below cannot see them.
-        if dn == n or (" " not in dn and dn in n.split()) or (" " not in n and n in dn.split()):
+        if dn == n or (" " not in dn and dn not in _STOPWORDS and dn in n.split()):
             return True
         d_tokens = {t for t in dn.split() if t not in _STOPWORDS and len(t) >= _MIN_PARTIAL_TOKEN}
         if tokens and d_tokens and (d_tokens <= tokens or tokens <= d_tokens):
@@ -606,6 +682,17 @@ def _is_own_source(proposal: WatchProposal, entity_term: str, vocabulary: dict[s
         return False
     if host in PRIMARY_SOURCE_HOSTS or any(host.endswith("." + h) for h in PRIMARY_SOURCE_HOSTS):
         return True
+    # When the profile / department pins the entity's domains ("GM
+    # (gm.com)"), only those sites are its own source: a look-alike
+    # registration such as gm.co.ke does not qualify however well it
+    # imitates the entity.
+    entry_value = vocabulary.get(entity_term)
+    pinned = _entry(entry_value).domains if entry_value is not None else ()
+    if pinned:
+        return any(
+            host == registrable_domain("https://" + d) or host == d
+            for d in pinned
+        )
     # Only the site's own label counts ("acme" in status.acme.com / acme.co.uk);
     # subdomain labels and the TLD never do, so "api" or ".cloud" cannot
     # make an unrelated host look like the entity's. And the label must be
@@ -656,7 +743,8 @@ def _finding_supports(
     )
     if proposal.signal_type in (SOURCE_KIND_STOCK, SOURCE_KIND_EDGAR):
         # Phrase containment: a dotted ticker normalizes to two words.
-        return f" {_norm(proposal.target)} " in f" {text} " or names_entity
+        target_phrase = _norm(proposal.target)
+        return bool(target_phrase) and f" {target_phrase} " in f" {text} " or names_entity
     if proposal.signal_type == SOURCE_KIND_QUERY:
         return names_entity
     # A URL target must share its site with a cited URL: a finding that
@@ -895,20 +983,52 @@ def _policy_stamp(decision: Decision, proposal: WatchProposal, finding: Research
     }
 
 
+_CONFIDENCE_RANK = {"high": 2, "medium": 1, "low": 0}
+
+
 def auto_link_finding(
     proposal: WatchProposal, findings: list[ResearchFinding], ctx: PolicyContext,
 ) -> int | None:
-    """Index of the first finding that concerns this proposal's source (a
-    cited URL on the target's site; for a ticker or query, the ticker or
-    the grounding entity named in its text), for a proposal the model filed
-    without a ``finding_index``. The link is the same test the score uses,
-    so it can never lend a proposal a finding the score would not honour."""
+    """Index of the finding that best concerns this proposal's source, for a
+    proposal the model filed without a usable ``finding_index``.
+
+    Candidates pass the same test the score uses (:func:`_finding_supports`
+    with the entity term :func:`classify` would use), so the link can never
+    lend a proposal a finding the score would not honour. Among candidates,
+    one that cites the target's site or names the ticker outranks one that
+    only names the entity, then higher confidence, then verification, then
+    the earlier finding — so the evidence URL stamped on the row is the
+    source's own, not an unrelated company's."""
     match = match_vocab(proposal.grounding_entity, ctx.vocabulary)
-    entity_term = match[0] if match else _norm(proposal.grounding_entity)
+    entity_term = match[0] if match else ""
+    target_phrase = _norm(proposal.target)
+    host = registrable_domain(proposal.target)
+    entity_labels = set(_name_tokens(entity_term, ctx.vocabulary)) | {target_phrase.replace(" ", "")}
+    best: tuple[tuple[int, int, int, int, int], int] | None = None
     for index, finding in enumerate(findings):
-        if _finding_supports(proposal, finding, entity_term, ctx.vocabulary):
-            return index
-    return None
+        if not _finding_supports(proposal, finding, entity_term, ctx.vocabulary):
+            continue
+        text = _norm(f"{finding.title} {finding.summary}")
+        cites_source = int(
+            bool(host) and any(registrable_domain(u) == host for u in finding.relevant_urls)
+            or bool(target_phrase) and f" {target_phrase} " in f" {text} "
+        )
+        # A finding whose own citations sit on the entity's site (acme.com
+        # for ACME) outranks one that names it from a rival's page, so the
+        # evidence link stamped on the row is the entity's, not a stranger's.
+        cites_entity_site = int(any(
+            _site_label(registrable_domain(u)) in entity_labels for u in finding.relevant_urls
+        ))
+        key = (
+            cites_source,
+            cites_entity_site,
+            _CONFIDENCE_RANK.get(finding.confidence, 0),
+            int(finding.verification == "confirmed"),
+            -index,
+        )
+        if best is None or key > best[0]:
+            best = (key, index)
+    return best[1] if best else None
 
 
 def policy_stamp_of(item: WatchlistItem) -> dict[str, Any]:
@@ -948,14 +1068,22 @@ def apply_proposals(
         seen_targets.add(proposal.normalized_target)
 
         linked_note = ""
-        if finding is None:
-            # The model routinely omits finding_index; the finding that
-            # cites this source is still the evidence, so link it.
+        cited_term = match_vocab(proposal.grounding_entity, ctx.vocabulary)
+        if finding is None or not _finding_supports(
+            proposal, finding, cited_term[0] if cited_term else "", ctx.vocabulary,
+        ):
+            # The model routinely omits finding_index, or guesses one that
+            # does not concern this source; the finding that does is still
+            # the evidence, so link it (a copy: the caller's proposal is
+            # left as filed).
             auto_index = auto_link_finding(proposal, findings, ctx)
             if auto_index is not None:
+                given = proposal.finding_index
                 finding = findings[auto_index]
-                proposal.finding_index = auto_index
-                linked_note = f"linked to finding #{auto_index + 1} by its cited source"
+                proposal = dataclasses.replace(proposal, finding_index=auto_index)
+                linked_note = f"linked to finding #{auto_index + 1}, which concerns this source"
+                if given is not None:
+                    linked_note += f" (the cited #{given + 1} did not)"
 
         decision = classify(proposal, finding, ctx)
         if linked_note:

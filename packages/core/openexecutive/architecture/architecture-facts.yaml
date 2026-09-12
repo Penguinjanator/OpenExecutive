@@ -1382,13 +1382,25 @@ external_monitoring:
     - grounding vocabulary = company name + competitive_landscape.primary_competitors
       + profile.vendors + profile.tickers + active initiative titles +
       strategic_priorities.current_year + each department's `watched_entities`.
-      Named-entity lists are PARSED (watch_policy.entity_names): only the
-      name(s) before " — " / " - " / ":" ground, "A / B" yields both names, and
-      a parenthesised ticker ("Tesla (TSLA)") becomes a ticker term of its own;
-      the free-text description is dropped (it hid short names such as BYD
-      inside a sentence and would have made "global" BYD's own-source word).
+      Named-entity lists are PARSED (watch_policy.entity_names, input
+      whitespace-collapsed and capped at 256 chars): only the name(s) before
+      an em/en dash (any spacing), " - ", ":" or ";" ground, "A / B" yields
+      both names, a parenthesised group that is ONE ticker-shaped token
+      ("Tesla (TSLA)", "BYD (1211.HK)", not "(US, EU)" nor ordinary
+      abbreviations such as US/EV/IT/NOW) becomes a ticker term, and
+      parenthesised hosts ("Brex (brex.com, status.brex.com)") PIN the
+      entity's own domains. A bare URL / host entry grounds as its site label
+      with the host pinned. The description is dropped (it hid short names
+      such as BYD inside a sentence and would have made "global" BYD's
+      own-source word); parenthesised brand names ("Alphabet (Google)") are
+      not aliases — list them as entries. profile.tickers are taken as typed.
       Short names (BYD, GM, Kia, AWS) match as whole words because a
-      vocabulary term of any length is a distinctive token.
+      vocabulary term of any length is a distinctive token; a TICKER term
+      grounds only when it IS the entity ("US" never grounds "US Foods").
+      Own source with pinned domains: only those sites (a look-alike such as
+      gm.co.ke, which carries the same site label, no longer qualifies);
+      without pinned domains the site label must be the entity's leading
+      name, as before — pin domains for any short-named entity.
       (kind department_entity, strong) + each department's charter scope
       phrases and goal key results (kind department_scope, suggestion-only)
       (+ existing watch labels, which only corroborate). The entity MUST
@@ -1430,12 +1442,16 @@ external_monitoring:
       "1211.HK" is two words once normalized) or is the named entity. A strong
       finding cannot be borrowed for an unrelated page.
     - `finding_index` is REQUIRED in the propose_watch schema and the pass's
-      RULES say so; when the model still omits it (three dev runs on Haiku
-      and Sonnet omitted it on every proposal), apply_proposals auto-links the
-      first finding that concerns the source by the same test
-      (watch_policy.auto_link_finding) and records "linked to finding #N by
-      its cited source" as the first reason. A proposal nothing cites is
-      still rejected as having no evidence.
+      RULES say so; when the model still omits it, or cites a finding that
+      does not concern the source (three dev runs on Haiku and Sonnet omitted
+      it on every proposal), apply_proposals links the finding that best
+      concerns the source by the same test the score uses
+      (watch_policy.auto_link_finding: with the entity term classify would
+      use; ranked by citing the target's site / naming the ticker, then
+      citing the entity's own site, confidence, verification, order) and
+      records "linked to finding #N, which concerns this source" as the
+      first reason. The caller's proposal is not mutated. A proposal nothing
+      cites is still rejected as having no evidence.
     - direct add at score >= 4 with the mandatory match AND the entity's OWN
       source AND a linked finding that concerns this source (company data
       plus a decision mention can reach the bar alone; nothing goes live on
