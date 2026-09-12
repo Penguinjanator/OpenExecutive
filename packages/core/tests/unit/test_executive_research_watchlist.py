@@ -32,6 +32,10 @@ def _passthrough_target_validation(monkeypatch: pytest.MonkeyPatch) -> None:
         return signal_type, target, config
 
     monkeypatch.setattr(wt, "validate_and_normalize_target", _passthrough)
+    monkeypatch.setattr(wt, "validate_target_url", lambda url: (True, ""))
+    from openexecutive.monitoring.research import watch_policy as wp
+
+    monkeypatch.setattr(wp, "validate_target_url", lambda url: (True, ""))
 
 
 @pytest.fixture

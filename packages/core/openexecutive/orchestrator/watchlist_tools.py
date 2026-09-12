@@ -24,13 +24,16 @@ from openexecutive.monitoring import store as ms
 from openexecutive.monitoring.models import (
     DECLINE_KIND_EXPLICIT,
     DECLINE_REASON_NOT_RELEVANT,
+    EXPLICIT_DECLINE_REASONS,
     MODE_ACTIVE,
     ORIGIN_EXECUTIVE,
+    ORIGIN_RESEARCH_PROPOSED,
     RESEARCH_ORIGINS,
     is_valid_cadence,
     is_valid_mode,
 )
 from openexecutive.monitoring.sources import list_registered_kinds
+from openexecutive.monitoring.sources._http import validate_target_url
 from openexecutive.monitoring.target_validation import (
     WatchlistTargetError,
     validate_and_normalize_target,
@@ -49,6 +52,9 @@ logger = logging.getLogger(__name__)
 # Cap returned list sizes so the Executive doesn't drown in a long
 # watchlist when it only wants a quick check.
 _LIST_DEFAULT_LIMIT = 50
+
+# Signal types whose target is a URL (validated at insert time).
+_URL_SIGNAL_TYPES: frozenset[str] = frozenset({"rss", "vendor_status", "page_watch"})
 
 
 # --------------------------------------------------------------------- #
@@ -429,6 +435,15 @@ async def _validated_target(
     if ms.get_watchlist_item_by_slug(slug) is not None:
         return _err(tool, f"slug {slug!r} already exists; use tune_watchlist_entry to modify")
 
+    if signal_type in _URL_SIGNAL_TYPES:
+        # Reject non-public / unparseable URLs at insert time for every
+        # URL-typed kind (the adapters guard again at poll time, but a junk
+        # row must not land — a dry-run suggestion still polls and is shown
+        # to the principal with an Approve button).
+        ok, reason = validate_target_url(target)
+        if not ok:
+            return _err(tool, f"target {target!r} is not a fetchable public URL: {reason}")
+
     config = _display_label_config(signal_type, tool_input.get("display_label"))
     # Validate the target before it lands: a non-feed rss URL is converted
     # to a scrape-backed page_watch (when scrapeable) or rejected, so the
@@ -517,9 +532,22 @@ async def handle_propose_watch(tool_input: dict[str, Any], collector: list[Any])
     model's turn and decides add / suggest / reject. A target the principal
     declined is refused HERE so a new slug cannot route around the decline.
     """
-    from openexecutive.monitoring.research.watch_policy import WatchProposal
+    from openexecutive.monitoring.research.watch_policy import (
+        WatchProposal,
+        entity_declined,
+    )
 
     tool = "propose_watch"
+    # Decline checks come first — before the target is fetched for
+    # validation, so a declined source is never even requested again.
+    raw_type = str(tool_input.get("signal_type", "")).strip()
+    raw_target = str(tool_input.get("target", "")).strip()
+    if raw_target and ms.is_declined(normalize_target(raw_type, raw_target)):
+        return _err(tool, f"target {raw_target!r} was declined by the principal — do not re-propose it")
+    entity = str(tool_input.get("grounding_entity", ""))[:120]
+    if entity_declined(entity, ms.list_declines()):
+        return _err(tool, f"the principal declined watching {entity!r} — do not re-propose it")
+
     validated = await _validated_target(tool, tool_input)
     if isinstance(validated, str):
         return validated
@@ -527,6 +555,7 @@ async def handle_propose_watch(tool_input: dict[str, Any], collector: list[Any])
 
     normalized = normalize_target(signal_type, target)
     if ms.is_declined(normalized):
+        # The rss → page_watch conversion can change the target; re-check.
         return _err(tool, f"target {target!r} was declined by the principal — do not re-propose it")
 
     certainty = str(tool_input.get("certainty", "unsure")).strip().lower()
@@ -545,7 +574,7 @@ async def handle_propose_watch(tool_input: dict[str, Any], collector: list[Any])
         target=target,
         normalized_target=normalized,
         rationale=str(tool_input.get("rationale", ""))[:240],
-        grounding_entity=str(tool_input.get("grounding_entity", ""))[:120],
+        grounding_entity=entity,
         finding_index=finding_index,
         certainty=certainty,
         config=config,
@@ -617,11 +646,14 @@ async def handle_remove_watchlist_entry(tool_input: dict[str, Any]) -> str:
     # "Stop watching" a research-added source is feedback: remember the
     # decline so the research pass never re-proposes it under a new slug.
     if removed and item.origin in RESEARCH_ORIGINS:
+        reason = str(tool_input.get("reason") or DECLINE_REASON_NOT_RELEVANT)
+        if reason not in EXPLICIT_DECLINE_REASONS:
+            reason = DECLINE_REASON_NOT_RELEVANT
         try:
             ms.insert_decline(
                 normalized_target=normalize_target(item.signal_type, item.target),
                 kind=DECLINE_KIND_EXPLICIT,
-                reason=str(tool_input.get("reason") or DECLINE_REASON_NOT_RELEVANT),
+                reason=reason,
                 signal_type=item.signal_type,
                 slug=item.slug,
             )
@@ -659,6 +691,14 @@ async def handle_tune_watchlist_entry(tool_input: dict[str, Any]) -> str:
     fields: dict[str, Any] = {}
     changes: list[str] = []
 
+    if item.origin == ORIGIN_RESEARCH_PROPOSED and ("mode" in tool_input or "enabled" in tool_input):
+        # A pending research suggestion leaves the pending state only through
+        # the principal's approve / decline — never by a tune from a model.
+        return _err(
+            tool,
+            f"{slug!r} is a pending research suggestion; the principal approves or "
+            "declines it on the watch list",
+        )
     if "enabled" in tool_input:
         enabled = bool(tool_input["enabled"])
         fields["enabled"] = 1 if enabled else 0

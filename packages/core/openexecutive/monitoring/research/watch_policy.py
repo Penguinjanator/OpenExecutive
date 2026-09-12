@@ -38,6 +38,7 @@ from openexecutive.monitoring import store as ms
 from openexecutive.monitoring.models import (
     DECLINE_KIND_EXPIRED,
     DECLINE_REASON_EXPIRED,
+    DECLINE_REASON_NOT_RELEVANT,
     MODE_ACTIVE,
     MODE_DRY_RUN,
     ORIGIN_RESEARCH,
@@ -51,6 +52,7 @@ from openexecutive.monitoring.models import (
     WatchlistItem,
 )
 from openexecutive.monitoring.research.models import ResearchFinding
+from openexecutive.monitoring.sources._http import validate_target_url
 from openexecutive.monitoring.validation import normalize_target, registrable_domain
 
 logger = logging.getLogger(__name__)
@@ -99,6 +101,13 @@ KIND_WATCH = "watch"  # already watched (label/target) — corroborates, never g
 GROUNDING_KINDS: frozenset[str] = frozenset({
     KIND_COMPANY, KIND_COMPETITOR, KIND_VENDOR, KIND_TICKER, KIND_INITIATIVE, KIND_PRIORITY,
 })
+# Kinds that name an external ENTITY the company deals with. Only these can
+# ground a direct add: an initiative title or a priority sentence is company
+# data too, but it is a bag of common words ("growth", "platform") that a
+# planted finding can echo, so a watch grounded only in one is a suggestion.
+STRONG_GROUNDING_KINDS: frozenset[str] = frozenset({
+    KIND_COMPANY, KIND_COMPETITOR, KIND_VENDOR, KIND_TICKER,
+})
 
 # Material-event words every research feed trigger carries, so a competitor
 # blog surfaces "we raised / we launched / pricing" and not every post.
@@ -109,8 +118,13 @@ _EVENT_KEYWORDS: tuple[str, ...] = (
 _STOPWORDS: frozenset[str] = frozenset({
     "the", "and", "for", "with", "our", "into", "from", "that", "this", "year",
     "grow", "growth", "build", "expand", "increase", "improve", "drive", "launch",
-    "new", "more", "across", "team", "company", "inc", "corp", "ltd", "llc",
+    "new", "more", "across", "team", "company", "inc", "corp", "ltd", "llc", "co",
+    "group", "labs", "platform", "product", "market", "customer", "customers",
+    "revenue", "sales", "enterprise", "global", "digital", "cloud", "data", "api",
 })
+# Shortest token that may match on its own inside a multi-word term. Tickers
+# and short names still match exactly (whole-term equality is checked first).
+_MIN_PARTIAL_TOKEN = 4
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 # Auto-add defaults per source kind: (cadence, severity_floor).
@@ -276,12 +290,17 @@ def match_entity(entity: str, vocabulary: dict[str, str]) -> tuple[str, str] | N
     exact = vocabulary.get(n)
     if exact is not None and exact != KIND_WATCH:
         return n, exact
-    tokens = set(n.split())
+    # Partial matching only on distinctive tokens: no stopwords, nothing
+    # shorter than _MIN_PARTIAL_TOKEN, so "Growth Inc" cannot match the
+    # priority "drive growth in EMEA" and "corp" matches nothing.
+    tokens = {t for t in n.split() if t not in _STOPWORDS and len(t) >= _MIN_PARTIAL_TOKEN}
     # An exact hit on a watch label is only the fallback: a company-data term
     # that contains (or is contained by) the entity still wins.
     best: tuple[str, str] | None = (n, exact) if exact is not None else None
+    if not tokens:
+        return best
     for term, kind in vocabulary.items():
-        term_tokens = set(term.split())
+        term_tokens = {t for t in term.split() if t not in _STOPWORDS and len(t) >= _MIN_PARTIAL_TOKEN}
         if not term_tokens or not (term_tokens <= tokens or tokens <= term_tokens):
             continue
         # Prefer a company-data kind over a watch label, then the longer term.
@@ -290,6 +309,27 @@ def match_entity(entity: str, vocabulary: dict[str, str]) -> tuple[str, str] | N
         ):
             best = (term, kind)
     return best
+
+
+def entity_declined(entity: str, declines: list[Any]) -> bool:
+    """True when the principal declined this entity as *not relevant* (the
+    reason that blacklists the company/topic, not just one source)."""
+    n = _norm(entity)
+    if len(n) < 2:
+        return False
+    tokens = {t for t in n.split() if t not in _STOPWORDS and len(t) >= _MIN_PARTIAL_TOKEN}
+    for d in declines:
+        if getattr(d, "reason", "") != DECLINE_REASON_NOT_RELEVANT:
+            continue
+        dn = _norm(str(getattr(d, "entity", "") or ""))
+        if len(dn) < 2:
+            continue
+        if dn == n:
+            return True
+        d_tokens = {t for t in dn.split() if t not in _STOPWORDS and len(t) >= _MIN_PARTIAL_TOKEN}
+        if tokens and d_tokens and (d_tokens <= tokens or tokens <= d_tokens):
+            return True
+    return False
 
 
 # --------------------------------------------------------------------- #
@@ -310,7 +350,9 @@ def _is_own_source(proposal: WatchProposal, entity_term: str, vocabulary: dict[s
     if host in PRIMARY_SOURCE_HOSTS or any(host.endswith("." + h) for h in PRIMARY_SOURCE_HOSTS):
         return True
     host_tokens = set(_TOKEN_RE.findall(host.replace(".", " ")))
-    entity_tokens = {t for t in entity_term.split() if len(t) >= 3}
+    entity_tokens = {
+        t for t in entity_term.split() if len(t) >= _MIN_PARTIAL_TOKEN and t not in _STOPWORDS
+    }
     return bool(entity_tokens & host_tokens)
 
 
@@ -334,8 +376,8 @@ def _history_adjustment(
 def _same_source_already_watched(proposal: WatchProposal, existing: list[WatchlistItem]) -> bool:
     host = registrable_domain(proposal.target)
     for item in existing:
-        if not item.enabled:
-            continue
+        # Disabled rows count: a source the sweep retired as noisy or dead
+        # must not come back under a new slug with reset counters.
         if normalize_target(item.signal_type, item.target) == proposal.normalized_target:
             return True
         if host and item.signal_type == proposal.signal_type and registrable_domain(item.target) == host:
@@ -356,8 +398,10 @@ def classify(
     +1 cross-specialist consensus on the finding
     ±1 policy history for (signal_type, grounding kind) at >=5 samples
 
-    Direct at >= DIRECT_THRESHOLD with the mandatory entity match; the model's
-    own ``certainty`` can only downgrade. ``query`` is never direct.
+    Direct at >= DIRECT_THRESHOLD with the mandatory entity match, and only
+    when the entity is a named competitor / vendor / ticker / the company
+    (STRONG_GROUNDING_KINDS); the model's own ``certainty`` can only
+    downgrade. ``query`` is never direct.
     """
     reasons: list[str] = []
     score = 0
@@ -398,6 +442,9 @@ def classify(
     tier = TIER_SUGGEST
     if grounded and score >= DIRECT_THRESHOLD:
         tier = TIER_DIRECT
+    if tier == TIER_DIRECT and kind not in STRONG_GROUNDING_KINDS:
+        tier = TIER_SUGGEST
+        reasons.append(f"grounded only in a {kind} — needs a named competitor, vendor or ticker")
     if tier == TIER_DIRECT and proposal.signal_type == SOURCE_KIND_QUERY:
         tier = TIER_SUGGEST
         reasons.append("standing web queries are always suggestions")
@@ -446,6 +493,19 @@ def quiet_defaults(
 # --------------------------------------------------------------------- #
 
 
+def _safe_source_url(finding: ResearchFinding | None) -> str:
+    """First cited URL that is a public http(s) URL — it is rendered as a
+    link beside the Approve button, so anything else is dropped."""
+    for url in (finding.relevant_urls if finding else []):
+        candidate = str(url or "").strip()
+        if not candidate.lower().startswith(("http://", "https://")):
+            continue
+        ok, _reason = validate_target_url(candidate)
+        if ok:
+            return candidate[:500]
+    return ""
+
+
 def _policy_stamp(decision: Decision, proposal: WatchProposal, finding: ResearchFinding | None) -> dict[str, Any]:
     return {
         "entity": decision.entity,
@@ -453,7 +513,7 @@ def _policy_stamp(decision: Decision, proposal: WatchProposal, finding: Research
         "specialist": (finding.source_specialist if finding else ""),
         "score": decision.score,
         "reasons": decision.reasons[:6],
-        "source_url": (finding.relevant_urls[0] if finding and finding.relevant_urls else ""),
+        "source_url": _safe_source_url(finding),
     }
 
 
@@ -529,9 +589,9 @@ def apply_proposals(
                 origin=ORIGIN_RESEARCH if is_direct else ORIGIN_RESEARCH_PROPOSED,
                 db_path=db_path,
             )
-        except Exception as exc:
+        except Exception:
             logger.exception("watch_policy: insert failed for %s", proposal.slug)
-            summaries.append(_summary(proposal, "rejected", f"insert failed: {exc}"[:120]))
+            summaries.append(_summary(proposal, "rejected", "insert failed (see server log)"))
             continue
 
         inserted = ms.get_watchlist_item(new_id, db_path=db_path)
@@ -685,6 +745,10 @@ def _expire_suggestions(now: datetime, settings: PolicySettings, db_path: Path |
         created = _parse(item.created_at)
         if created is None or now - created < ttl or item.id is None:
             continue
+        # Compare-and-delete: a principal approving this very row a moment
+        # ago must win over the sweep.
+        if not ms.delete_pending_suggestion(item.id, db_path=db_path):
+            continue
         ms.insert_decline(
             normalized_target=normalize_target(item.signal_type, item.target),
             kind=DECLINE_KIND_EXPIRED, reason=DECLINE_REASON_EXPIRED,
@@ -692,7 +756,6 @@ def _expire_suggestions(now: datetime, settings: PolicySettings, db_path: Path |
             signal_type=item.signal_type, slug=item.slug, db_path=db_path,
         )
         record_outcome_for(item, OUTCOME_EXPIRED, db_path=db_path)
-        ms.delete_watchlist_item(item.id, db_path=db_path)
         audit_log(
             EVENT_SUGGESTION_EXPIRED,
             f"Watch suggestion {item.slug} expired unreviewed after {settings.suggestion_ttl_days}d",
@@ -713,6 +776,15 @@ def _auto_disable(now: datetime, db_path: Path | None) -> int:
             continue
         ms.set_enabled(item.id, False, db_path=db_path)
         record_outcome_for(item, OUTCOME_AUTO_DISABLED, db_path=db_path)
+        # Remember the target (retryable after 90 days, like an unreviewed
+        # expiry) so the next research run cannot re-add the same source
+        # under a new slug with fresh counters.
+        ms.insert_decline(
+            normalized_target=normalize_target(item.signal_type, item.target),
+            kind=DECLINE_KIND_EXPIRED, reason=reason[:120],
+            entity=str(policy_stamp_of(item).get("entity", "")),
+            signal_type=item.signal_type, slug=item.slug, db_path=db_path,
+        )
         audit_log(
             EVENT_AUTO_DISABLED,
             f"Stopped watching {item.slug} — {reason}",
@@ -770,12 +842,14 @@ __all__ = [
     "TIER_DIRECT",
     "TIER_REJECT",
     "TIER_SUGGEST",
+    "STRONG_GROUNDING_KINDS",
     "Decision",
     "PolicyContext",
     "PolicySettings",
     "WatchProposal",
     "apply_proposals",
     "classify",
+    "entity_declined",
     "grounding_vocabulary",
     "match_entity",
     "policy_stamp_of",

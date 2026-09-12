@@ -586,8 +586,15 @@ export default function WatchlistPage() {
   async function stopWatching(slug: string, reason: WatchDeclineReason) {
     markBusy(slug, true);
     try {
-      await deleteWatchlistItem(slug, reason);
-      setItems((prev) => prev.filter((it) => it.slug !== slug));
+      if (reason === "too_noisy") {
+        // Same remedy the decline route applies: keep the source, only
+        // high-severity signals surface.
+        const updated = await patchWatchlistItem(slug, { severity_floor: "high" });
+        setItems((prev) => prev.map((it) => (it.slug === slug ? updated : it)));
+      } else {
+        await deleteWatchlistItem(slug, reason);
+        setItems((prev) => prev.filter((it) => it.slug !== slug));
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Remove failed");
     } finally {

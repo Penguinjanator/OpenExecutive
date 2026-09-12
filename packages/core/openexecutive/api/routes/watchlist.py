@@ -24,12 +24,11 @@ from openexecutive.monitoring.models import (
     DECLINE_KIND_EXPLICIT,
     DECLINE_REASON_NOT_RELEVANT,
     DECLINE_REASON_TOO_NOISY,
+    EXPLICIT_DECLINE_REASONS,
     MODE_ACTIVE,
     MODE_DRY_RUN,
-    ORIGIN_RESEARCH,
     ORIGIN_RESEARCH_PROPOSED,
     RESEARCH_ORIGINS,
-    VALID_DECLINE_REASONS,
     WatchlistItem,
     is_valid_cadence,
     is_valid_mode,
@@ -401,7 +400,7 @@ def delete_watchlist_entry(slug: str, reason: str | None = None) -> Response:
     if item is None:
         raise HTTPException(status_code=404, detail=f"Watchlist entry {slug!r} not found")
     assert item.id is not None
-    if reason is not None and reason not in VALID_DECLINE_REASONS:
+    if reason is not None and reason not in EXPLICIT_DECLINE_REASONS:
         raise HTTPException(status_code=400, detail=f"unknown reason {reason!r}")
     try:
         removed = ms.delete_watchlist_item(item.id)
@@ -477,24 +476,25 @@ def decline_watchlist_suggestion(slug: str, body: DeclineBody | None = None) -> 
     from openexecutive.monitoring.research import watch_policy
 
     reason = (body.reason if body else DECLINE_REASON_NOT_RELEVANT)
-    if reason not in VALID_DECLINE_REASONS:
+    if reason not in EXPLICIT_DECLINE_REASONS:
         raise HTTPException(status_code=400, detail=f"unknown reason {reason!r}")
     item = _pending_suggestion_or_409(slug)
     assert item.id is not None
 
+    # Both remedies are compare-and-act on "still pending", so a concurrent
+    # approve (or the sweep) cannot be undone by this decline.
     if reason == DECLINE_REASON_TOO_NOISY:
-        ms.update_watchlist_fields(item.id, {
-            "mode": MODE_ACTIVE, "origin": ORIGIN_RESEARCH,
-            "severity_floor": "high", "enabled": 1,
-        })
+        if not ms.quiet_pending_suggestion(item.id):
+            raise HTTPException(status_code=409, detail=f"{slug!r} is not a pending research suggestion")
         watch_policy.record_outcome_for(item, watch_policy.OUTCOME_APPROVED)
         result = "kept_quiet"
     else:
+        if not ms.delete_pending_suggestion(item.id):
+            raise HTTPException(status_code=409, detail=f"{slug!r} is not a pending research suggestion")
         try:
             _record_decline(item, reason)
         except Exception:
             logger.exception("watchlist.decline: decline record failed slug=%s", slug)
-        ms.delete_watchlist_item(item.id)
         result = "removed"
     audit_log(
         watch_policy.EVENT_SUGGESTION_DECLINED,

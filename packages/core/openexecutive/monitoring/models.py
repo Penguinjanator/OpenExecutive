@@ -82,6 +82,11 @@ VALID_DECLINE_REASONS = frozenset({
     DECLINE_REASON_NOT_RELEVANT, DECLINE_REASON_TOO_NOISY,
     DECLINE_REASON_WRONG_SOURCE, DECLINE_REASON_EXPIRED,
 })
+# The reasons a principal (or a tool acting for one) may give; `expired` is
+# only ever written by the sweep.
+EXPLICIT_DECLINE_REASONS = frozenset({
+    DECLINE_REASON_NOT_RELEVANT, DECLINE_REASON_TOO_NOISY, DECLINE_REASON_WRONG_SOURCE,
+})
 
 # Watchlist row "cadence" hints — used by the briefing/digest layer in
 # PR-C to decide whether a signal surfaces real-time vs in a digest.

@@ -27,6 +27,20 @@ from openexecutive.monitoring.research.models import ResearchFinding
 from openexecutive.monitoring.validation import normalize_target, registrable_domain
 
 
+@pytest.fixture(autouse=True)
+def _no_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """URL validation resolves DNS; keep the policy tests offline."""
+    from openexecutive.orchestrator import watchlist_tools as wt
+
+    monkeypatch.setattr(wp, "validate_target_url", lambda url: (True, ""))
+    monkeypatch.setattr(wt, "validate_target_url", lambda url: (True, ""))
+
+    async def _passthrough(signal_type: str, target: str, config: dict) -> tuple[str, str, dict]:
+        return signal_type, target, config
+
+    monkeypatch.setattr(wt, "validate_and_normalize_target", _passthrough)
+
+
 @pytest.fixture
 def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     db_path = tmp_path / "policy.db"
@@ -118,13 +132,17 @@ def test_match_entity_is_token_based_and_prefers_company_data() -> None:
 
 
 def test_priority_terms_drop_stopwords() -> None:
-    assert wp.priority_terms(_profile()) == ["enterprise", "accounts"]
+    # "expand", "into", "enterprise" are stopwords; only distinctive words remain.
+    assert wp.priority_terms(_profile()) == ["accounts"]
 
 
 def test_normalize_target_and_domain() -> None:
     assert normalize_target("stock", " acme ") == "ACME"
-    assert normalize_target("rss", "HTTPS://www.Acme.com/feed/#top") == "https://www.acme.com/feed"
+    # scheme, www., query, fragment, path case and trailing slash never
+    # distinguish two spellings of one source.
+    assert normalize_target("rss", "HTTP://www.Acme.com/Feed/?x=1#top") == "https://acme.com/feed"
     assert normalize_target("rss", "https://acme.com/") == "https://acme.com"
+    assert normalize_target("query", "  Acme   Corp pricing ") == "acme corp pricing"
     assert registrable_domain("https://www.acme.com/blog") == "acme.com"
     assert registrable_domain("ACME") == ""
 
@@ -288,13 +306,16 @@ def test_explicit_decline_is_permanent_and_expiry_retries_after_90_days(db: Path
     later = datetime.now(UTC) + timedelta(days=91)
     assert ms.is_declined("https://initech.com/feed.xml", now=later, db_path=db)
     assert not ms.is_declined("https://globex.com/feed.xml", now=later, db_path=db)
-    # An expiry never downgrades an explicit decline.
+    # An expiry never downgrades an explicit decline; an explicit decline
+    # always overwrites an expiry.
     ms.insert_decline(normalized_target="https://initech.com/feed.xml",
                       kind=DECLINE_KIND_EXPIRED, reason="expired", db_path=db)
-    assert ms.list_declines(db_path=db)[-1].kind == DECLINE_KIND_EXPLICIT or any(
-        d.normalized_target == "https://initech.com/feed.xml" and d.kind == DECLINE_KIND_EXPLICIT
-        for d in ms.list_declines(db_path=db)
-    )
+    ms.insert_decline(normalized_target="https://globex.com/feed.xml",
+                      kind=DECLINE_KIND_EXPLICIT, reason="wrong_source", db_path=db)
+    kinds = {d.normalized_target: (d.kind, d.reason) for d in ms.list_declines(db_path=db)}
+    assert kinds["https://initech.com/feed.xml"] == (DECLINE_KIND_EXPLICIT, "not_relevant")
+    assert kinds["https://globex.com/feed.xml"] == (DECLINE_KIND_EXPLICIT, "wrong_source")
+    assert ms.is_declined("https://globex.com/feed.xml", now=later, db_path=db)
 
 
 @pytest.mark.asyncio
@@ -303,25 +324,37 @@ async def test_propose_handler_refuses_declined_target_under_new_slug(
 ) -> None:
     from openexecutive.orchestrator import watchlist_tools as wt
 
-    async def _passthrough(signal_type: str, target: str, config: dict) -> tuple[str, str, dict]:
-        return signal_type, target, config
-
-    monkeypatch.setattr(wt, "validate_and_normalize_target", _passthrough)
     ms.insert_decline(normalized_target="https://initech.com/feed.xml",
-                      kind=DECLINE_KIND_EXPLICIT, reason="not_relevant", db_path=db)
+                      kind=DECLINE_KIND_EXPLICIT, reason="wrong_source", db_path=db)
     collector: list[Any] = []
     out = await wt.handle_propose_watch({
         "slug": "rss-initech-again", "signal_type": "rss",
-        "target": "HTTPS://initech.com/feed.xml/", "grounding_entity": "Initech",
+        "target": "HTTP://www.initech.com/Feed.xml/?utm=1", "grounding_entity": "Initech",
         "rationale": "x", "certainty": "confident",
     }, collector)
     assert "declined" in out and collector == []
+    # wrong_source blacklists only that target; another Initech source may be proposed.
+    other = await wt.handle_propose_watch({
+        "slug": "rss-initech-status", "signal_type": "vendor_status",
+        "target": "https://status.initech.com/history.atom", "grounding_entity": "Initech",
+        "rationale": "x", "certainty": "unsure",
+    }, collector)
+    assert '"queued"' in other and len(collector) == 1
+    # not_relevant blacklists the entity: any Initech source is refused.
+    ms.insert_decline(normalized_target="https://initech.com/other", entity="Initech Inc",
+                      kind=DECLINE_KIND_EXPLICIT, reason="not_relevant", db_path=db)
+    blocked = await wt.handle_propose_watch({
+        "slug": "stock-initech", "signal_type": "stock", "target": "INTC",
+        "grounding_entity": "initech", "rationale": "x", "certainty": "confident",
+    }, collector)
+    assert "declined watching" in blocked and len(collector) == 1
     ok = await wt.handle_propose_watch({
         "slug": "stock-acme", "signal_type": "stock", "target": "ACME",
         "grounding_entity": "Acme Corp", "rationale": "y", "certainty": "confident",
         "finding_index": 1,
     }, collector)
-    assert '"queued": "stock-acme"' in ok and collector[0].finding_index == 0
+    assert '"queued": "stock-acme"' in ok
+    assert len(collector) == 2 and collector[-1].finding_index == 0
 
 
 # --------------------------------------------------------------------- #
@@ -412,3 +445,51 @@ def test_sweep_nudges_once_suggestions_pile_up(db: Path) -> None:
     assert wp.sweep(datetime.now(UTC), db_path=db)["nudged"] == 0  # coalesced
     alerts = [a for a in list_alerts(limit=10, db_path=db) if a.source == wp.NUDGE_ALERT_SOURCE]
     assert len(alerts) == 1 and "3 watch suggestions" in alerts[0].headline
+
+
+def test_initiative_or_priority_grounding_is_never_direct() -> None:
+    p = _proposal(
+        slug="rss-helios", target="https://helios-news.example/feed.xml",
+        grounding_entity="Helios API",
+    )
+    d = wp.classify(p, _finding(verification="confirmed", source_specialist="cso,cfo"), _ctx())
+    assert d.grounding_kind == wp.KIND_INITIATIVE and d.score >= wp.DIRECT_THRESHOLD
+    assert d.tier == wp.TIER_SUGGEST and "needs a named competitor" in d.reasons[-1]
+
+
+def test_generic_tokens_do_not_ground() -> None:
+    # "enterprise" appears in a priority but is a stopword; "Corp" is too.
+    assert wp.match_entity("Enterprise Corp", _ctx().vocabulary) is None
+    assert wp.match_entity("Growth", {"drive growth in emea": wp.KIND_PRIORITY}) is None
+
+
+def test_own_source_ignores_generic_host_tokens() -> None:
+    p = _proposal(target="https://labs.example.com/feed.xml", grounding_entity="Sente Labs")
+    d = wp.classify(p, _finding(), _ctx())
+    assert "own source" not in " ".join(d.reasons)
+
+
+def test_retired_source_is_not_re_added(db: Path) -> None:
+    ms.insert_watchlist_item(slug="rss-acme-old", signal_type="rss", target="https://acme.com/blog/feed.xml",
+                             origin=ORIGIN_RESEARCH, enabled=False, db_path=db)
+    d = wp.classify(_proposal(), _finding(), _ctx(ms.list_watchlist(db_path=db)))
+    assert d.tier == wp.TIER_REJECT
+
+
+def test_auto_disable_records_a_retryable_decline(db: Path) -> None:
+    import sqlite3
+
+    ms.insert_watchlist_item(slug="rss-noisy", signal_type="rss", target="https://noisy.com/feed",
+                             origin=ORIGIN_RESEARCH, db_path=db)
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE watchlist SET fired_count = 6, dismiss_count = 3, trust_score = 0.4")
+    assert wp.sweep(datetime.now(UTC), db_path=db)["disabled"] == 1
+    assert ms.is_declined("https://noisy.com/feed", db_path=db)
+    assert not ms.is_declined("https://noisy.com/feed", now=datetime.now(UTC) + timedelta(days=91), db_path=db)
+
+
+def test_source_url_stamp_only_keeps_public_http_urls() -> None:
+    f = _finding(relevant_urls=["javascript:alert(1)", "ftp://x/y", "https://www.acme.com/blog/pricing"])
+    out = wp.apply_proposals([_proposal()], [f], _ctx())  # no db: insert fails → rejected
+    assert out[0]["outcome"] == "rejected" and "see server log" in out[0]["result_preview"]
+    assert wp._safe_source_url(f) == "https://www.acme.com/blog/pricing"

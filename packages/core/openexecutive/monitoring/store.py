@@ -605,6 +605,37 @@ def approve_suggestion(item_id: int, db_path: Path | None = None) -> bool:
         return cursor.rowcount > 0
 
 
+def delete_pending_suggestion(item_id: int, db_path: Path | None = None) -> bool:
+    """Delete a row only while it is still a pending research suggestion
+    (compare-and-delete, with its signal history). False when it was
+    approved, declined or removed in the meantime."""
+    with _get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM watchlist WHERE id = ? AND origin = ? AND mode = ?",
+            (item_id, ORIGIN_RESEARCH_PROPOSED, MODE_DRY_RUN),
+        ).fetchone()
+        if row is None:
+            return False
+        conn.execute("DELETE FROM external_signals WHERE watchlist_id = ?", (item_id,))
+        cursor = conn.execute(
+            "DELETE FROM watchlist WHERE id = ? AND origin = ? AND mode = ?",
+            (item_id, ORIGIN_RESEARCH_PROPOSED, MODE_DRY_RUN),
+        )
+        return cursor.rowcount > 0
+
+
+def quiet_pending_suggestion(item_id: int, db_path: Path | None = None) -> bool:
+    """The too_noisy remedy: a pending suggestion goes live as a research
+    watch with a high severity floor. Conditional on it still being pending."""
+    with _get_conn(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE watchlist SET mode = ?, origin = ?, enabled = 1, severity_floor = 'high' "
+            "WHERE id = ? AND origin = ? AND mode = ?",
+            (MODE_ACTIVE, ORIGIN_RESEARCH, item_id, ORIGIN_RESEARCH_PROPOSED, MODE_DRY_RUN),
+        )
+        return cursor.rowcount > 0
+
+
 def _row_to_decline(row: sqlite3.Row) -> WatchlistDecline:
     return WatchlistDecline(**dict(row))
 
@@ -707,39 +738,44 @@ def record_policy_outcome(
         )
 
 
+def _outcome_tally(
+    group_cols: tuple[str, ...], *, where: str = "", db_path: Path | None = None,
+) -> list[tuple[tuple[str, ...], str, int]]:
+    """``[(group key, outcome, n)]`` from watchlist_policy_outcomes. Column
+    names are internal constants, never user input."""
+    resolved = _resolve_db_path(db_path)
+    if not resolved.exists():
+        return []
+    cols = ", ".join(group_cols)
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT {cols}, outcome, COUNT(*) AS n FROM watchlist_policy_outcomes "
+            f"{where} GROUP BY {cols}, outcome"
+        ).fetchall()
+    return [
+        (tuple(str(row[c]) for c in group_cols), str(row["outcome"]), int(row["n"]))
+        for row in rows
+    ]
+
+
 def policy_outcome_counts(
     db_path: Path | None = None,
 ) -> dict[tuple[str, str], dict[str, int]]:
     """``{(signal_type, grounding_kind): {outcome: n}}`` — the policy's
     track record by the shape of the guess. Empty on a fresh install."""
-    resolved = _resolve_db_path(db_path)
-    if not resolved.exists():
-        return {}
     out: dict[tuple[str, str], dict[str, int]] = {}
-    with _get_conn(db_path) as conn:
-        rows = conn.execute(
-            "SELECT signal_type, grounding_kind, outcome, COUNT(*) AS n "
-            "FROM watchlist_policy_outcomes GROUP BY signal_type, grounding_kind, outcome"
-        ).fetchall()
-    for row in rows:
-        key = (str(row["signal_type"]), str(row["grounding_kind"]))
-        out.setdefault(key, {})[str(row["outcome"])] = int(row["n"])
+    for key, outcome, n in _outcome_tally(("signal_type", "grounding_kind"), db_path=db_path):
+        out.setdefault((key[0], key[1]), {})[outcome] = n
     return out
 
 
 def specialist_outcome_counts(db_path: Path | None = None) -> dict[str, dict[str, int]]:
     """``{specialist: {outcome: n}}`` for the research turn's calibration line."""
-    resolved = _resolve_db_path(db_path)
-    if not resolved.exists():
-        return {}
     out: dict[str, dict[str, int]] = {}
-    with _get_conn(db_path) as conn:
-        rows = conn.execute(
-            "SELECT specialist, outcome, COUNT(*) AS n FROM watchlist_policy_outcomes "
-            "WHERE specialist != '' GROUP BY specialist, outcome"
-        ).fetchall()
-    for row in rows:
-        out.setdefault(str(row["specialist"]), {})[str(row["outcome"])] = int(row["n"])
+    for key, outcome, n in _outcome_tally(
+        ("specialist",), where="WHERE specialist != ''", db_path=db_path,
+    ):
+        out.setdefault(key[0], {})[outcome] = n
     return out
 
 

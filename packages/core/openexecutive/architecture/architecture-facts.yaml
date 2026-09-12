@@ -1375,8 +1375,10 @@ external_monitoring:
       eur-lex), +1 finding confidence high, +1 verification confirmed, +1
       cross-specialist consensus, ±1 policy history for (signal_type,
       grounding_kind) at >= 5 samples (>= 0.7 / <= 0.3 approval rate).
-    - direct add at score >= 4 with the mandatory match; model `certainty`
-      can only downgrade; `query` never direct; above WATCHLIST_MAX_ENABLED
+    - direct add at score >= 4 with the mandatory match AND a strong kind
+      (company / competitor / vendor / ticker — initiative- or
+      priority-grounded proposals are suggestions at most); model
+      `certainty` can only downgrade; `query` never direct; above WATCHLIST_MAX_ENABLED
       (40) enabled rows every add is a suggestion; WATCHLIST_RESEARCH_MAX_DIRECT_ADDS
       (2) and WATCHLIST_RESEARCH_MAX_PROPOSALS (2) per run.
     - quiet defaults on every research row (model cannot loosen): cadence
@@ -1388,12 +1390,23 @@ external_monitoring:
       grounding_kind, specialist, score, reasons, source_url) in
       config_json._policy. Reject: invalid target, same site + signal_type
       already watched, declined target, spent budget.
-    - declines (`watchlist_declines`, keyed by normalized target): explicit
-      (Decline button, "Stop watching…", remove_watchlist_entry / DELETE on a
-      research-origin row) is permanent; expired_unreviewed retries once
-      after 90 days. Enforced in the propose_watch handler, rendered to the
-      model as DECLINED. Decline reasons: not_relevant (blacklist entity),
-      wrong_source (blacklist target), too_noisy (keep live at floor=high).
+    - declines (`watchlist_declines`, keyed by normalized target — https
+      forced, www. dropped, host/path lower-cased, query/fragment/trailing
+      slash removed): explicit (Decline button, "Stop watching…",
+      remove_watchlist_entry / DELETE on a research-origin row) is permanent;
+      expired_unreviewed (sweep expiry, and auto-disable) retries once after
+      90 days. Enforced in the propose_watch handler BEFORE any fetch — by
+      target, and by entity for not_relevant declines (token match) —
+      and rendered to the model as DECLINED. Decline reasons: not_relevant
+      (blacklist entity), wrong_source (blacklist target), too_noisy (keep
+      live at floor=high). Tool-supplied reasons outside the explicit set
+      fall back to not_relevant.
+    - isolation: the routing/synthesis pass has NO watchlist write tools
+      (add/tune/remove are in _SYNTHESIS_EXCLUDED_TOOLS), so every watch a
+      research run creates goes through the policy; tune_watchlist_entry
+      refuses mode/enabled on a pending suggestion (only approve/decline
+      move it); URL-typed targets pass validate_target_url at insert time;
+      approve / decline / expiry are compare-and-act on "still pending".
     - outcomes (`watchlist_policy_outcomes`: approved / declined / expired /
       auto_disabled by signal_type, grounding_kind, specialist) feed the
       history term and are rendered to the model as HOW PAST PROPOSALS TURNED OUT.

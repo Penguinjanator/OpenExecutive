@@ -184,7 +184,7 @@ def _build_synthesis_system(configured: set[str], has_roster: bool = True) -> st
         "as quiet.\n\n"
         f"## ROUTING BUDGET: {_MAX_ROUTING_TOOLS_PER_RUN}\n\n"
         f"You may fire AT MOST {_MAX_ROUTING_TOOLS_PER_RUN} outbound tool "
-        "calls in this run combined (DMs, alerts, watchlist adds, "
+        "calls in this run combined (DMs, alerts, "
         "follow-ups, workflow suggestions). The runtime enforces this "
         "ceiling — calls beyond the budget will be rejected. Choose the "
         "few that genuinely deserve the cost. Read-only lookups "
@@ -203,14 +203,12 @@ def _build_synthesis_system(configured: set[str], has_roster: bool = True) -> st
         "  (c) **Surface as briefing card** via create_alert — RARE. Only "
         "when the principal personally must decide / react and the matter "
         "is materially company-wide. Default away from this.\n"
-        "  (d) **Add to the watchlist** via add_watchlist_entry — ONLY "
-        "for ongoing-monitor signals (a new competitor ticker, a vendor "
-        "status page not yet watched). Most findings are NOT watchlist "
-        "material; a dedicated pass after this one proposes monitors.\n"
-        "  (e) **Schedule a follow-up** via schedule_followup for "
+        "  (d) **Schedule a follow-up** via schedule_followup for "
         "time-shifted chases.\n"
-        "  (f) **Suggest a deeper workflow** via suggest_workflow only "
-        "for major events (M&A, fundraising, crisis comms).\n\n"
+        "  (e) **Suggest a deeper workflow** via suggest_workflow only "
+        "for major events (M&A, fundraising, crisis comms).\n"
+        "  Watchlist changes are NOT yours to make here — a dedicated pass "
+        "after this one proposes monitors under policy.\n\n"
         "## INVARIANTS\n\n"
         "  - Privacy: board / comp / legal stay per-Person. NEVER "
         "broadcast.\n"
@@ -1058,6 +1056,15 @@ async def _watchlist_analysis_loop(
 _SYNTHESIS_EXCLUDED_TOOLS = frozenset({
     "run_executive_research",
     "send_company_broadcast",
+    # Watchlist writes are withheld from the routing pass: every watch the
+    # research run creates must go through the dedicated watchlist pass and
+    # its policy (grounding, budgets, declines, suggestions). With these
+    # tools present, a finding could add an unfiltered live watch, flip a
+    # pending suggestion to active (self-approval), or write a permanent
+    # decline in the principal's name.
+    "add_watchlist_entry",
+    "tune_watchlist_entry",
+    "remove_watchlist_entry",
     # Raw per-channel DM tools are withheld from synthesis: the model kept
     # passing the wrong identifier into them (a person_id, another channel's
     # id, or an invented Slack-style handle), so DMs silently failed the roster

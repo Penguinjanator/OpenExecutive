@@ -76,6 +76,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ranking and is shown to the review as evidence.
 
 ### Changed
+- The research routing pass no longer carries the watchlist write tools
+  (`add_watchlist_entry`, `tune_watchlist_entry`, `remove_watchlist_entry`):
+  every watch a research run creates goes through the watchlist policy.
+  `tune_watchlist_entry` refuses `mode` / `enabled` changes on a pending
+  suggestion, URL targets are SSRF-checked at insert time for every kind,
+  and deleting a watch now removes its signal history in the same
+  transaction (the foreign key previously made any polled watch
+  undeletable).
 - Watchlist rows carry an `origin` (`manual` | `executive` | `research` |
   `research_proposed`); the research skip-if-unchanged fingerprint hashes
   only enabled, active rows so approving or declining a suggestion never

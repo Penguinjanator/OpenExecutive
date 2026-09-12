@@ -44,15 +44,20 @@ def normalize_target(signal_type: str, target: str) -> str:
     if signal_type in ("stock", "edgar"):
         return raw.upper()
     if "://" not in raw:
-        return raw.lower()
+        # Free-text targets (standing queries): collapse case + whitespace.
+        return " ".join(raw.lower().split())
     try:
         parts = urlsplit(raw)
     except ValueError:
         return raw.lower()
-    path = parts.path.rstrip("/") if parts.path not in ("", "/") else ""
-    return urlunsplit((
-        parts.scheme.lower(), parts.netloc.lower(), path, parts.query, "",
-    ))
+    # Scheme, www., query string, fragment, path case and a trailing slash
+    # are all ways to spell the same source; none of them may defeat a
+    # decline or the duplicate-source guard.
+    host = (parts.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = parts.path.lower().rstrip("/") if parts.path not in ("", "/") else ""
+    return urlunsplit(("https", host, path, "", ""))
 
 
 def registrable_domain(url: str) -> str:
