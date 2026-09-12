@@ -130,23 +130,40 @@ _CLAUDE_FEATURE_SPEC = FeatureSpec(
 )
 
 
-# Per-non-Claude model spec. ``supports_tool_use`` is universal across
-# the curated set; the other three are off — Anthropic-specific server
-# tools and prompt-caching annotations have no OpenAI-format equivalent.
+# Per-non-Claude OpenRouter model spec. ``supports_tool_use`` is universal
+# across the curated set; cache_control and thinking are off (no
+# OpenAI-format equivalent). ``supports_web_search`` is ON: the Anthropic
+# web_search tool never reaches the upstream model — the translator drops
+# it from ``tools`` and attaches OpenRouter's ``web`` plugin instead, and
+# that plugin works for any model OpenRouter serves, not only Claude. What
+# the plugin gives differs from Anthropic's tool (one prompt-derived search
+# per request, results injected; ``max_uses`` becomes a result count; no
+# domain lists; no search count in usage), but a specialist told to emit
+# nothing it cannot confirm by search gets a search.
 _DEFAULT_NON_CLAUDE_SPEC = FeatureSpec(
     supports_cache_control=False,
     supports_thinking=False,
-    supports_web_search=False,
+    supports_web_search=True,
     supports_tool_use=True,
 )
 
 # Non-Claude model whose live catalog entry advertises ``reasoning``
 # support: keep the Anthropic ``thinking`` / ``output_config`` fields so the
 # translator can turn them into OpenRouter's ``reasoning`` parameter. Cache
-# and web-search stay off — those really are Anthropic-only.
+# stays off — that really is Anthropic-only.
 _NON_CLAUDE_REASONING_SPEC = FeatureSpec(
     supports_cache_control=False,
     supports_thinking=True,
+    supports_web_search=True,
+    supports_tool_use=True,
+)
+
+# Self-hosted OpenAI-compatible backend: tools only. There is no search
+# plugin on that path, so the web_search tool is stripped (it would be
+# rejected or silently ignored by the server).
+_LOCAL_FEATURE_SPEC = FeatureSpec(
+    supports_cache_control=False,
+    supports_thinking=False,
     supports_web_search=False,
     supports_tool_use=True,
 )
@@ -230,8 +247,10 @@ def _openrouter_model_resolver(model: str) -> tuple[str, FeatureSpec] | None:
       unchanged, Claude spec — OpenRouter forwards cache_control / thinking
       to Anthropic for these, so stripping them would only cost money.
     * Non-Claude slug the catalog marks reasoning-capable → unchanged,
-      thinking kept (translated to OpenRouter ``reasoning``), rest stripped.
-    * Anything else → None; the provider applies the non-Claude default.
+      thinking kept (translated to OpenRouter ``reasoning``), web search
+      kept (translated to the ``web`` plugin), cache stripped.
+    * Anything else → unchanged, the non-Claude default (tools + web
+      search; cache and thinking stripped).
     """
     slug = openrouter_slug_for_claude(model)
     if slug is not None:
@@ -243,7 +262,7 @@ def _openrouter_model_resolver(model: str) -> tuple[str, FeatureSpec] | None:
     # outside the catalog) keeps the conservative thinking-off default.
     if openrouter_catalog.supports_reasoning(model):
         return model, _NON_CLAUDE_REASONING_SPEC
-    return None
+    return model, _DEFAULT_NON_CLAUDE_SPEC
 
 
 # Module-level singletons — providers pool their own HTTP connections and
@@ -287,11 +306,11 @@ def _local() -> OpenAICompatibleProvider:
                 status_code=400,
                 detail="Local model routing requires LOCAL_BASE_URL",
             )
-        # Local models get the non-Claude feature spec: no cache_control,
-        # thinking, or server-side web_search — those are Anthropic-only and
-        # would 400 (or be silently ignored) on an OpenAI-compatible server.
+        # Local models get the tools-only spec: no cache_control, thinking,
+        # or web_search — a self-hosted OpenAI-compatible server has no
+        # search plugin and would 400 (or silently ignore) the rest.
         spec_lookup: dict[str, FeatureSpec] = {
-            m: _DEFAULT_NON_CLAUDE_SPEC for m in _local_models(settings)
+            m: _LOCAL_FEATURE_SPEC for m in _local_models(settings)
         }
         _local_provider = OpenAICompatibleProvider(
             base_url=base_url,

@@ -442,11 +442,12 @@ def test_openrouter_provider_resolves_specs_by_rule(
     assert slug == "anthropic/claude-opus-4.8"
     assert spec.supports_cache_control and spec.supports_thinking
 
-    # Anything else: passthrough slug, non-Claude default (Anthropic-only
-    # fields stripped).
+    # Anything else: passthrough slug, non-Claude default (cache and
+    # thinking stripped; web search kept, since the translator turns it
+    # into OpenRouter's web plugin for any model).
     slug, spec = provider._resolve("openai/gpt-6")
     assert slug == "openai/gpt-6"
     assert not spec.supports_cache_control
     assert not spec.supports_thinking
-    assert not spec.supports_web_search
+    assert spec.supports_web_search
     assert spec.supports_tool_use

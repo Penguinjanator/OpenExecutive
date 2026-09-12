@@ -118,6 +118,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   routing pass can no longer start a workflow (`run_workflow` is withheld,
   `suggest_workflow` remains); the periodic run's default interval moves
   from 120 to 360 minutes.
+- **Web search reaches every OpenRouter model.** The provider feature gate
+  stripped the web-search tool for non-Claude models, so a research
+  specialist or the Executive pinned to Gemini, GPT, Llama, DeepSeek or
+  Grok ran without search (and the research prompt then told it to emit
+  nothing). The tool is now kept for any OpenRouter model and translated
+  into OpenRouter's web plugin, as it already was for Claude via
+  OpenRouter; only a self-hosted OpenAI-compatible backend still strips
+  it. The plugin runs one search per request and reports no search count.
 - **Every model call is recorded.** Research specialists, the research
   routing and watchlist passes, triage and the chat memory extractor now
   write the same `cache_event` audit row the Executive's chat turns always

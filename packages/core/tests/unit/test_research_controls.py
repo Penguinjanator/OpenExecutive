@@ -84,3 +84,44 @@ def test_env_example_documents_the_controls() -> None:
         text = fh.read()
     for key in ("RESEARCH_WEB_SEARCH_MAX_USES", "RESEARCH_SPECIALISTS", "WATCHLIST_RESEARCH_INTERVAL_MINUTES"):
         assert key in text
+
+
+def test_non_claude_openrouter_models_keep_web_search_but_local_models_do_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The feature gate used to strip the web_search tool for every
+    non-Claude model, so a research specialist pinned to e.g. Gemini ran
+    without search. OpenRouter's web plugin works for any model it serves,
+    so the gate now keeps the tool there; a self-hosted backend has no
+    plugin, so it is still stripped."""
+    from openexecutive.providers import registry
+    from openexecutive.providers.feature_gate import apply_feature_gates
+    from openexecutive.providers.translator import to_openai_request
+
+    monkeypatch.setattr(registry.openrouter_catalog, "supports_reasoning", lambda _m: False)
+    resolved = registry._openrouter_model_resolver("google/gemini-2.5-flash")
+    assert resolved is not None
+    slug, spec = resolved
+    assert slug == "google/gemini-2.5-flash" and spec.supports_web_search
+
+    monkeypatch.setattr(registry.openrouter_catalog, "supports_reasoning", lambda _m: True)
+    _slug, reasoning_spec = registry._openrouter_model_resolver("deepseek/deepseek-v4-pro")
+    assert reasoning_spec.supports_web_search and reasoning_spec.supports_thinking
+
+    assert not registry._LOCAL_FEATURE_SPEC.supports_web_search
+
+    # End to end through the gate + translator: the plugin is attached.
+    kwargs = {
+        "model": "google/gemini-2.5-flash", "max_tokens": 10, "messages": [],
+        "tools": [
+            {"name": "emit", "input_schema": {"type": "object"}},
+            {"type": "web_search_20250305", "name": "web_search", "max_uses": 3},
+        ],
+    }
+    gated = apply_feature_gates(spec, dict(kwargs))
+    body = to_openai_request("google/gemini-2.5-flash", gated)
+    assert body.get("plugins") == [{"id": "web", "max_results": 3}]
+    assert [t["function"]["name"] for t in body["tools"]] == ["emit"]
+
+    stripped = apply_feature_gates(registry._LOCAL_FEATURE_SPEC, dict(kwargs))
+    assert "plugins" not in to_openai_request("local-model", stripped)

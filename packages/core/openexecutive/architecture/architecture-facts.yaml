@@ -54,8 +54,9 @@ system:
       in LOCAL_MODELS route to a self-hosted OpenAI-compatible server
       (Ollama / LM Studio / vLLM / llama.cpp) through the same provider seam,
       reusing the OpenRouter request/response/stream translator. Those slugs
-      are added to the Council UI dropdown and get the non-Claude feature
-      spec (no cache_control / thinking / web_search). This makes
+      are added to the Council UI dropdown and get the tools-only local
+      feature spec (no cache_control / thinking / web_search — a
+      self-hosted server has no search plugin). This makes
       ANTHROPIC_API_KEY optional: a deployment with only local (or
       OpenRouter) models configured boots with no Anthropic key — the
       Settings validator just requires that at least one provider is
@@ -81,7 +82,7 @@ system:
     - Company-specific data lives under packages/core/company/ and is gitignored. Never commit it.
     - Audit writes never break a chat turn or tool call — exceptions are swallowed with a warning.
     - Provider selection is per-call by model (openexecutive.providers.get_provider(model)). A single chat turn can mix Anthropic-routed Claude calls, OpenRouter-routed non-Claude calls, and locally-routed self-hosted models — no global "current provider" state.
-    - When a non-Claude or local model is selected, Anthropic-only fields (cache_control on system/tool/user blocks, adaptive thinking + output_config, server-side web_search) are stripped by the feature gate before the request leaves the process. Callers do NOT need to know which model they're routing to.
+    - When a non-Claude or local model is selected, Anthropic-only fields (cache_control on system/tool/user blocks, adaptive thinking + output_config) are stripped by the feature gate before the request leaves the process. The web_search server tool is kept for every OpenRouter model (the translator swaps it for OpenRouter's `web` plugin, which serves any model) and stripped only for a self-hosted OpenAI-compatible backend, which has no search plugin. Callers do NOT need to know which model they're routing to.
     - ANTHROPIC_API_KEY is optional: a Settings validator requires at least one provider (Anthropic key, OpenRouter, or local models) to be configured, so an Anthropic-free deployment is supported but a zero-provider one fails fast at startup.
     - External-monitor adapters are read-only — they never write to upstream systems. The whole `monitoring/` subsystem is observation-only; surfacing happens through the alert pipeline, never via a direct upstream side-effect.
     - External signals never auto-execute on the principal's behalf. Every signal that surfaces is proposed via the alert pipeline (and thus subject to triage / mute / severity gates); the scheduler never dispatches an outbound message directly off a signal.
@@ -127,10 +128,17 @@ caching:
     models the feature gate strips cache_control before translation —
     those backends have no equivalent feature and would reject the
     field. The two-block layout above is unchanged either way.
-    Web search for Claude-via-OpenRouter is preserved by translating the
-    Anthropic web_search server tool into OpenRouter's ``web`` plugin (see
-    providers.translator_shapes), so server-side search still runs when
-    Claude is proxied through OpenRouter.
+    Web search via OpenRouter — for Claude and non-Claude models alike —
+    is preserved by translating the Anthropic web_search server tool into
+    OpenRouter's ``web`` plugin (see providers.translator_shapes), so a
+    research specialist or the Executive pinned to e.g. Gemini still
+    searches. The plugin is not the Anthropic tool: it runs one
+    prompt-derived search per request and injects the results (the model
+    cannot search again), ``max_uses`` becomes a result count capped at
+    10, allowed/blocked domain lists are not applied, and OpenRouter
+    reports no search count, so `web_search_requests` on those usage rows
+    reads 0 even though search ran. Only the self-hosted
+    OpenAI-compatible backend strips the tool (no plugin there).
 
 providers:
   module: openexecutive.providers
@@ -149,8 +157,11 @@ providers:
     openexecutive.providers.feature_gate.apply_feature_gates(spec, kwargs)
     runs inside the OpenRouter provider before translation. Spec-driven
     stripping covers cache_control on system/tool/user blocks, adaptive
-    thinking + output_config, and Anthropic server-side web_search
-    tools. A misrouted call cannot ship an unsupported field.
+    thinking + output_config, and — for the local backend only — the
+    Anthropic server-side web_search tool; every OpenRouter model keeps
+    web_search (supports_web_search=True on both non-Claude specs) so the
+    translator can turn it into the ``web`` plugin. A misrouted call
+    cannot ship an unsupported field.
     supports_thinking is TRUE for the Claude family and for any non-Claude
     catalog slug whose OpenRouter entry lists "reasoning" in
     supported_parameters (registry._openrouter_model_resolver consults
@@ -202,7 +213,8 @@ providers:
     server-side web_search tool (no input_schema) cannot be executed by
     OpenRouter, so its intent is translated into OpenRouter's
     ``plugins:[{"id":"web","max_results":N}]`` web-search plugin (N derived
-    from the tool's max_uses, capped) — without this a Claude call routed
+    from the tool's max_uses, capped) for ANY model routed via OpenRouter,
+    Claude or not — without this a call routed
     via OpenRouter would silently lose web search (the executive_research
     council emitted zero findings). The plugin makes the model cite sources
     with inline ``<cite index="...">…</cite>`` markup; the response path
