@@ -163,10 +163,19 @@ def test_grounded_own_source_high_confidence_is_direct() -> None:
     assert d.grounding_kind == wp.KIND_COMPETITOR
 
 
-def test_ticker_in_profile_is_own_source_for_stock() -> None:
-    p = _proposal(slug="stock-acme", signal_type="stock", target="ACME", grounding_entity="Acme Corp")
-    d = wp.classify(p, _finding(), _ctx())
-    assert d.tier == wp.TIER_DIRECT
+def test_ticker_is_own_source_only_when_it_is_the_entity() -> None:
+    p = _proposal(slug="stock-acme", signal_type="stock", target="ACME", grounding_entity="ACME")
+    d = wp.classify(p, _finding(title="ACME slides", summary="ACME fell 8% on 2026-09-01."), _ctx())
+    assert d.tier == wp.TIER_DIRECT and d.grounding_kind == wp.KIND_TICKER
+    # A profile ticker that belongs to someone else lends nothing to "Acme Corp".
+    other = _proposal(slug="stock-msft", signal_type="stock", target="MSFT", grounding_entity="Acme Corp")
+    profile = CompanyProfile.model_validate({
+        "name": "Sente Labs", "competitive_landscape": {"primary_competitors": ["Acme Corp"]},
+        "tickers": ["MSFT"],
+    })
+    ctx = wp.PolicyContext(vocabulary=wp.grounding_vocabulary(profile, [], []), priority_terms=[], existing=[])
+    d2 = wp.classify(other, _finding(), ctx)
+    assert d2.tier == wp.TIER_SUGGEST and "own source" not in " ".join(d2.reasons)
 
 
 def _stripe_finding(**kw: Any) -> ResearchFinding:
@@ -316,10 +325,10 @@ def test_apply_adds_direct_and_files_suggestion(db: Path) -> None:
 
 
 def test_apply_honours_budgets_and_duplicate_targets(db: Path) -> None:
-    findings = [_finding(), _stripe_finding(), _initech_finding(confidence="high")]
+    findings = [_finding(title="ACME cuts prices"), _stripe_finding(), _initech_finding(confidence="high")]
     proposals = [
-        _proposal(slug="stock-acme", signal_type="stock", target="ACME"),
-        _proposal(slug="stock-acme-2", signal_type="stock", target="acme"),  # same target
+        _proposal(slug="stock-acme", signal_type="stock", target="ACME", grounding_entity="ACME"),
+        _proposal(slug="stock-acme-2", signal_type="stock", target="acme", grounding_entity="ACME"),  # same target
         _proposal(slug="vendor-stripe", signal_type="vendor_status",
                   target="https://status.stripe.com/feed.atom", grounding_entity="Stripe", finding_index=1),
         _proposal(slug="rss-acme-blog"),  # third direct → budget → suggestion
@@ -528,9 +537,9 @@ def test_finding_points_need_a_finding_about_this_source() -> None:
     d = wp.classify(p, _finding(verification="confirmed", source_specialist="cso,cfo"), _ctx())
     assert d.score == 2 and d.tier == wp.TIER_SUGGEST
     assert "does not mention this source" in " ".join(d.reasons)
-    # A finding that names the entity does support a ticker watch on it.
-    p2 = _proposal(slug="stock-acme", signal_type="stock", target="ACME", grounding_entity="Acme Corp")
-    assert wp.classify(p2, _finding(), _ctx()).tier == wp.TIER_DIRECT
+    # A finding that names the ticker does support a ticker watch on it.
+    p2 = _proposal(slug="stock-acme", signal_type="stock", target="ACME", grounding_entity="ACME")
+    assert wp.classify(p2, _finding(title="ACME slides 8%"), _ctx()).tier == wp.TIER_DIRECT
 
 
 def test_direct_add_requires_the_entitys_own_source() -> None:
@@ -557,6 +566,37 @@ def test_generic_tokens_do_not_ground() -> None:
     # "enterprise" appears in a priority but is a stopword; "Corp" is too.
     assert wp.match_entity("Enterprise Corp", _ctx().vocabulary) is None
     assert wp.match_entity("Growth", {"drive growth in emea": wp.KIND_PRIORITY}) is None
+    # Short names that are whole vocabulary terms still match in longer forms.
+    assert wp.match_entity("IBM Corp", {"ibm": wp.KIND_COMPETITOR}) == ("ibm", wp.KIND_COMPETITOR)
+    assert wp.match_entity("AWS Lambda", {"aws": wp.KIND_VENDOR}) == ("aws", wp.KIND_VENDOR)
+
+
+def test_vocabulary_from_url_targets_uses_the_site_label(db: Path) -> None:
+    ms.insert_watchlist_item(slug="vendor-stripe", signal_type="vendor_status",
+                             target="https://status.stripe.com/history.atom", db_path=db)
+    vocab = wp.grounding_vocabulary(CompanyProfile(name="X"), [], ms.list_watchlist(db_path=db))
+    assert vocab.get("stripe") == wp.KIND_WATCH
+    assert not any(t.startswith("https") for t in vocab)
+    assert wp.match_entity("Status Labs", vocab) is None
+
+
+def test_quiet_defaults_never_put_keywords_on_a_page_watch() -> None:
+    _, _, trigger = wp.quiet_defaults(
+        _proposal(signal_type="page_watch", target="https://acme.com/pricing"), ["accounts"],
+    )
+    assert "keywords" not in trigger
+
+
+def test_not_relevant_decline_remembers_the_models_entity_when_ungrounded(db: Path) -> None:
+    findings = [_initech_finding(confidence="high")]
+    out = wp.apply_proposals(
+        [_proposal(slug="rss-initech", target="https://initech.com/feed.xml",
+                   grounding_entity="Initech Industries", certainty="unsure")],
+        findings, _ctx(), db_path=db,
+    )
+    assert out[0]["outcome"] == "suggested"
+    row = ms.get_watchlist_item_by_slug("rss-initech", db_path=db)
+    assert row is not None and row.config_json["_policy"]["entity"] == "initech industries"
 
 
 def test_own_source_ignores_generic_host_tokens() -> None:

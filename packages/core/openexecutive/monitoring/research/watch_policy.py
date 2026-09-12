@@ -130,6 +130,7 @@ _STOPWORDS: frozenset[str] = frozenset({
     "new", "more", "across", "team", "company", "inc", "corp", "ltd", "llc", "co",
     "group", "labs", "platform", "product", "market", "customer", "customers",
     "revenue", "sales", "enterprise", "global", "digital", "cloud", "data", "api",
+    "http", "https", "www", "com", "net", "org", "feed", "blog", "status", "news",
 })
 # Shortest token that may match on its own inside a multi-word term. Tickers
 # and short names still match exactly (whole-term equality is checked first).
@@ -262,7 +263,10 @@ def grounding_vocabulary(
             label = item.config_json.get(label_key) if isinstance(item.config_json, dict) else None
             if label:
                 add(str(label), KIND_WATCH)
-        add(item.target, KIND_WATCH)
+        # A URL target contributes its site label only ("acme" for
+        # https://status.acme.com/feed), never its scheme/host/path tokens.
+        host = registrable_domain(item.target)
+        add(_site_label(host) if host else item.target, KIND_WATCH)
         add(item.slug.replace("-", " "), KIND_WATCH)
     for i in initiatives:
         add(str(getattr(i, "title", "") or ""), KIND_INITIATIVE)
@@ -289,6 +293,17 @@ def priority_terms(profile: Any) -> list[str]:
     return out[:6]
 
 
+def _distinctive_tokens(text: str, vocabulary: dict[str, str] | None = None) -> set[str]:
+    """Tokens that may carry a partial match: not stopwords, and either long
+    enough or a whole vocabulary term in their own right (short names such
+    as IBM, AWS, SAP)."""
+    vocab = vocabulary or {}
+    return {
+        t for t in text.split()
+        if t not in _STOPWORDS and (len(t) >= _MIN_PARTIAL_TOKEN or t in vocab)
+    }
+
+
 def match_entity(entity: str, vocabulary: dict[str, str]) -> tuple[str, str] | None:
     """``(term, kind)`` for the vocabulary term the entity names, else None.
 
@@ -301,16 +316,18 @@ def match_entity(entity: str, vocabulary: dict[str, str]) -> tuple[str, str] | N
     if exact is not None and exact != KIND_WATCH:
         return n, exact
     # Partial matching only on distinctive tokens: no stopwords, nothing
-    # shorter than _MIN_PARTIAL_TOKEN, so "Growth Inc" cannot match the
-    # priority "drive growth in EMEA" and "corp" matches nothing.
-    tokens = {t for t in n.split() if t not in _STOPWORDS and len(t) >= _MIN_PARTIAL_TOKEN}
+    # shorter than _MIN_PARTIAL_TOKEN unless the token is itself a whole
+    # vocabulary term ("IBM Corp" still matches competitor "IBM"), so
+    # "Growth Inc" cannot match the priority "drive growth in EMEA" and
+    # "corp" matches nothing.
+    tokens = _distinctive_tokens(n, vocabulary)
     # An exact hit on a watch label is only the fallback: a company-data term
     # that contains (or is contained by) the entity still wins.
     best: tuple[str, str] | None = (n, exact) if exact is not None else None
     if not tokens:
         return best
     for term, kind in vocabulary.items():
-        term_tokens = {t for t in term.split() if t not in _STOPWORDS and len(t) >= _MIN_PARTIAL_TOKEN}
+        term_tokens = _distinctive_tokens(term, vocabulary)
         if not term_tokens or not (term_tokens <= tokens or tokens <= term_tokens):
             continue
         # Prefer a company-data kind over a watch label, then the longer term.
@@ -351,11 +368,10 @@ def _is_own_source(proposal: WatchProposal, entity_term: str, vocabulary: dict[s
     """The target is the entity's own primary source: its ticker for
     stock/edgar, its own domain for a URL, or an allowlisted primary host."""
     if proposal.signal_type in (SOURCE_KIND_STOCK, SOURCE_KIND_EDGAR):
-        # The ticker is the entity itself, or one the profile explicitly
-        # tracks (`tickers`). A ticker that merely appears as some other
-        # watch's target says nothing about THIS entity.
-        target_norm = _norm(proposal.target)
-        return target_norm == entity_term or vocabulary.get(target_norm) == KIND_TICKER
+        # Only when the grounding entity IS this ticker. A ticker the profile
+        # tracks for someone else (MSFT) says nothing about "Acme Corp"; the
+        # model grounds a ticker watch with the ticker itself.
+        return _norm(proposal.target) == entity_term
     host = registrable_domain(proposal.target)
     if not host:
         return False
@@ -556,11 +572,13 @@ def quiet_defaults(
     if proposal.signal_type == SOURCE_KIND_STOCK:
         if not isinstance(trigger.get("abs_change_pct_gte"), (int, float)):
             trigger["abs_change_pct_gte"] = _STOCK_DEFAULT_PCT
-    elif proposal.signal_type in (SOURCE_KIND_RSS, SOURCE_KIND_PAGE_WATCH, SOURCE_KIND_QUERY):
-        # Material-event words + priority terms only. The entity's own name
-        # must NOT be a keyword: feed summaries are rendered as
-        # "[<feed label>] <title>", so a keyword equal to the label would
-        # match every entry and turn the trigger into a no-op.
+    elif proposal.signal_type in (SOURCE_KIND_RSS, SOURCE_KIND_QUERY):
+        # Material-event words + priority terms only, and only for sources
+        # with prose to match (feed titles, search snippets). A page_watch
+        # summary is "[label] page changed — <diff>" — a keyword filter
+        # there would mean the watch could never fire. The entity's own
+        # name must NOT be a keyword either: feed summaries carry the feed
+        # label, so it would match every entry.
         existing_kw = trigger.get("keywords")
         keywords: list[str] = [str(k) for k in existing_kw] if isinstance(existing_kw, list) else []
         for kw in list(_EVENT_KEYWORDS) + priority_words:
@@ -590,7 +608,10 @@ def _safe_source_url(finding: ResearchFinding | None) -> str:
 
 def _policy_stamp(decision: Decision, proposal: WatchProposal, finding: ResearchFinding | None) -> dict[str, Any]:
     return {
-        "entity": decision.entity,
+        # The matched company-data term, else the model's own entity string,
+        # so a not_relevant decline on an ungrounded suggestion still
+        # blacklists the entity the model named.
+        "entity": decision.entity or _norm(proposal.grounding_entity),
         "grounding_kind": decision.grounding_kind,
         "specialist": (finding.source_specialist if finding else ""),
         "score": decision.score,

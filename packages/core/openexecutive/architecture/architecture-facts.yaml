@@ -1373,8 +1373,8 @@ external_monitoring:
       company > competitor > vendor > ticker > initiative > priority > watch.
       Partial (token) matching ignores stopwords and tokens < 4 chars.
     - score ledger: +2 entity in company data (mandatory), +1 entity already
-      watched under another source, +1 target is the entity's own source (the
-      entity's ticker or a profile-tracked ticker / a URL whose SITE LABEL —
+      watched under another source, +1 target is the entity's own source (for
+      stock/edgar the grounding entity IS the ticker / a URL whose SITE LABEL —
       "acme" in status.acme.com, acme.co.uk; never a subdomain or TLD — is the
       entity's / a primary-source host: sec.gov, federalregister.gov,
       eur-lex), +1 finding confidence high, +1 verification confirmed, +1
@@ -1396,9 +1396,14 @@ external_monitoring:
       budget is filed as a suggestion and charged to that budget).
     - quiet defaults on every research row (model cannot loosen): cadence
       daily (vendor_status hourly; page_watch/query weekly), severity_floor
-      medium, feed keyword trigger = material-event words + priority terms
-      (NEVER the entity name: feed summaries carry the feed label, so it would
-      match every entry), stock abs_change_pct_gte=5.
+      medium, keyword trigger (rss/query only — a page_watch summary is
+      "page changed" and would never match) = material-event words +
+      priority terms (NEVER the entity name: feed summaries carry the feed
+      label, so it would match every entry), stock abs_change_pct_gte=5.
+      Vocabulary: URL targets contribute their site label only; short
+      whole-term names (IBM, AWS) still match in longer forms; the policy
+      stamp keeps the model's entity string when nothing matched, so a
+      not_relevant decline on an ungrounded suggestion still blacklists it.
     - direct → mode=active, origin=research; suggestion → mode=dry_run,
       origin=research_proposed; rationale in `notes`; policy stamp (entity,
       grounding_kind, specialist, score, reasons, source_url) in

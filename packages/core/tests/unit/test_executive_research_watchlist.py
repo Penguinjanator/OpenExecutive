@@ -49,7 +49,7 @@ def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return db_path
 
 
-def _finding(title: str = "Tesla cut prices", url: str = "https://example.com/feed.xml") -> ResearchFinding:
+def _finding(title: str = "TSLA: Tesla cut prices", url: str = "https://example.com/feed.xml") -> ResearchFinding:
     return ResearchFinding(
         title=title,
         summary="Detail with a source.",
@@ -71,7 +71,7 @@ def _profile():
     })
 
 
-def _propose(slug: str, signal_type: str, target: str, entity: str = "Tesla",
+def _propose(slug: str, signal_type: str, target: str, entity: str = "TSLA",
              certainty: str = "confident", **extra: Any) -> tuple[str, dict[str, Any]]:
     return ("propose_watch", {
         "slug": slug, "signal_type": signal_type, "target": target,
