@@ -355,17 +355,17 @@ def test_apply_honours_budgets_and_duplicate_targets(db: Path) -> None:
                   target="https://status.stripe.com/feed.atom", grounding_entity="Stripe", finding_index=1),
         _proposal(slug="rss-acme-blog"),  # third direct → budget → suggestion
         _proposal(slug="rss-initech", target="https://initech.com/feed.xml", grounding_entity="Initech",
-                  finding_index=2),
+                  finding_index=2),  # not in company data: the weakest → loses the budget
         _proposal(slug="rss-globex", target="https://globex.com/feed.xml", grounding_entity="Globex",
-                  certainty="unsure"),  # suggestion budget spent → rejected
+                  certainty="unsure"),  # a competitor, own source: outranks Initech despite filing last
     ]
     ctx = _ctx(settings=wp.PolicySettings(max_direct_adds=2, max_suggestions=2))
     out = wp.apply_proposals(proposals, findings, ctx, db_path=db)
     assert [o["outcome"] for o in out] == [
-        "added", "rejected", "added", "suggested", "suggested", "rejected",
+        "added", "rejected", "added", "suggested", "rejected", "suggested",
     ]
     assert "duplicate" in out[1]["result_preview"]
-    assert "budget" in out[5]["result_preview"]
+    assert "budget" in out[4]["result_preview"]
     # The caller's context is not mutated by the run.
     assert ctx.existing == []
 
@@ -1127,3 +1127,36 @@ def test_auto_link_prefers_the_finding_that_cites_the_source() -> None:
     stranger = _proposal(slug="stock-intc", signal_type="stock", target="INTC", grounding_entity="Initech Holdings",
                          finding_index=None)
     assert wp.auto_link_finding(stranger, findings, ctx) is None
+
+
+def test_budgets_go_to_the_strongest_proposals_not_the_earliest(db: Path) -> None:
+    """The dev run that motivated this: two score-3 suggestions filed first
+    took the whole suggestion budget, and a score-4 Finance watched-entity
+    proposal filed third was rejected as over budget. Proposals are now
+    applied strongest first; summaries keep file order."""
+    ctx = _dept_ctx(settings=wp.PolicySettings(max_direct_adds=2, max_suggestions=2))
+    # Two query watches (always suggestions) grounded in a competitor and a
+    # vendor: score 3 each. Brex on its own status page, a Finance watched
+    # entity, high-confidence finding: score 4, marked unsure.
+    weak_a = _proposal(slug="q-globex", signal_type="query", target="Globex pricing moves",
+                       grounding_entity="Globex", finding_index=0)
+    weak_b = _proposal(slug="q-stripe", signal_type="query", target="Stripe outage history",
+                       grounding_entity="Stripe", finding_index=1)
+    strong = _brex_proposal(finding_index=2, certainty="unsure")
+    findings = [
+        _finding(title="Globex cuts prices", summary="Globex cut list prices 10%.", confidence="high",
+                 relevant_urls=["https://globex.com/pricing"]),
+        _finding(title="Stripe outage", summary="Stripe had a two-hour outage.", confidence="high",
+                 relevant_urls=["https://status.stripe.com/incidents/9"]),
+        _brex_finding(),
+    ]
+    out = wp.apply_proposals([weak_a, weak_b, strong], findings, ctx, db_path=db)
+    by_slug = {o["slug"]: o for o in out}
+    assert [o["slug"] for o in out] == ["q-globex", "q-stripe", strong.slug]  # file order kept
+    assert by_slug[strong.slug]["outcome"] == "suggested"
+    rejected = [slug for slug, o in by_slug.items() if o["outcome"] == "rejected"]
+    assert len(rejected) == 1 and rejected[0] in ("q-globex", "q-stripe")
+    assert "suggestion budget spent this run" in by_slug[rejected[0]]["result_preview"]
+    # A later, stronger proposal on the same site as an inserted one still
+    # counts it as already watched (the score is recomputed at insert time).
+    assert ms.get_watchlist_item_by_slug(strong.slug, db_path=db) is not None

@@ -1092,6 +1092,50 @@ def policy_stamp_of(item: WatchlistItem) -> dict[str, Any]:
     return dict(stamp) if isinstance(stamp, dict) else {}
 
 
+def _link_evidence(
+    proposal: WatchProposal,
+    findings: list[ResearchFinding],
+    ctx: PolicyContext,
+) -> tuple[WatchProposal, ResearchFinding | None, bool, str]:
+    """Resolve the finding a proposal cites, repairing a missing or
+    unsupported ``finding_index`` with the finding that best concerns the
+    source. Returns ``(proposal, finding, supported, linked_note)``; the
+    proposal is a copy when its index was repaired (the caller's is left as
+    filed)."""
+    finding = (
+        findings[proposal.finding_index]
+        if proposal.finding_index is not None and 0 <= proposal.finding_index < len(findings)
+        else None
+    )
+    linked_note = ""
+    cited_term = match_vocab(proposal.grounding_entity, ctx.vocabulary)
+    given = proposal.finding_index
+    given_valid = given is not None and 0 <= given < len(findings)
+    if finding is None or not _finding_supports(
+        proposal, finding, cited_term[0] if cited_term else "", ctx.vocabulary,
+    ):
+        # The model routinely omits finding_index, or guesses one that
+        # does not concern this source; the finding that does is still
+        # the evidence, so link it (a copy: the caller's proposal is
+        # left as filed). A cited finding that does not concern the
+        # source is never kept as evidence.
+        cited_note = ""
+        if given is not None:
+            cited_note = f" (the cited #{given + 1} did not)" if given_valid else " (the cited index was invalid)"
+        auto_index = auto_link_finding(proposal, findings, ctx)
+        if auto_index is not None:
+            finding = findings[auto_index]
+            proposal = dataclasses.replace(proposal, finding_index=auto_index)
+            linked_note = f"linked to finding #{auto_index + 1}, which concerns this source" + cited_note
+    # A cited finding that does not concern the source still marks the
+    # proposal as research-derived (it may be a suggestion) but is never
+    # the evidence link shown beside Approve.
+    supported = finding is not None and _finding_supports(
+        proposal, finding, cited_term[0] if cited_term else "", ctx.vocabulary,
+    )
+    return proposal, finding, supported, linked_note
+
+
 def apply_proposals(
     proposals: list[WatchProposal],
     findings: list[ResearchFinding],
@@ -1100,9 +1144,18 @@ def apply_proposals(
     db_path: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Classify and persist. Returns tool-call-shaped summaries
-    (``tool='propose_watch'``, plus ``outcome`` = added | suggested | rejected)
-    so the run's artifact and audit accounting stay uniform."""
-    summaries: list[dict[str, Any]] = []
+    (``tool='propose_watch'``, plus ``outcome`` = added | suggested | rejected),
+    one per proposal in the order they were filed, so the run's artifact and
+    audit accounting stay uniform.
+
+    Proposals are applied strongest first: each is scored once against the
+    run's starting state, then persisted in descending score order (ties keep
+    file order), so when the model files more candidates than the per-run
+    budgets allow, the budgets go to the best-grounded ones rather than the
+    earliest. The score used for persisting is recomputed at that point, so a
+    row inserted for a stronger proposal still counts as "already watched"
+    for a weaker one on the same site."""
+    summaries: list[dict[str, Any] | None] = [None] * len(proposals)
     direct_left = max(0, ctx.settings.max_direct_adds)
     suggest_left = max(0, ctx.settings.max_suggestions)
     seen_targets: set[str] = set()
@@ -1112,44 +1165,21 @@ def apply_proposals(
     live_existing = list(ctx.existing)
     ctx = dataclasses.replace(ctx, existing=live_existing)
 
-    for proposal in proposals:
-        finding = (
-            findings[proposal.finding_index]
-            if proposal.finding_index is not None and 0 <= proposal.finding_index < len(findings)
-            else None
-        )
+    # Pass 1 (file order): drop duplicate targets, link each proposal to its
+    # evidence, and score it against the starting state to fix the order.
+    prepared: list[tuple[int, int, WatchProposal, ResearchFinding | None, bool, str]] = []
+    for index, proposal in enumerate(proposals):
         if proposal.normalized_target in seen_targets:
-            summaries.append(_summary(proposal, "rejected", "duplicate target in this run"))
+            summaries[index] = _summary(proposal, "rejected", "duplicate target in this run")
             continue
         seen_targets.add(proposal.normalized_target)
+        proposal, finding, supported, linked_note = _link_evidence(proposal, findings, ctx)
+        rank = classify(proposal, finding, ctx).score
+        prepared.append((-rank, index, proposal, finding, supported, linked_note))
+    prepared.sort(key=lambda item: (item[0], item[1]))
 
-        linked_note = ""
-        cited_term = match_vocab(proposal.grounding_entity, ctx.vocabulary)
-        given = proposal.finding_index
-        given_valid = given is not None and 0 <= given < len(findings)
-        if finding is None or not _finding_supports(
-            proposal, finding, cited_term[0] if cited_term else "", ctx.vocabulary,
-        ):
-            # The model routinely omits finding_index, or guesses one that
-            # does not concern this source; the finding that does is still
-            # the evidence, so link it (a copy: the caller's proposal is
-            # left as filed). A cited finding that does not concern the
-            # source is never kept as evidence.
-            cited_note = ""
-            if given is not None:
-                cited_note = f" (the cited #{given + 1} did not)" if given_valid else " (the cited index was invalid)"
-            auto_index = auto_link_finding(proposal, findings, ctx)
-            if auto_index is not None:
-                finding = findings[auto_index]
-                proposal = dataclasses.replace(proposal, finding_index=auto_index)
-                linked_note = f"linked to finding #{auto_index + 1}, which concerns this source" + cited_note
-        # A cited finding that does not concern the source still marks the
-        # proposal as research-derived (it may be a suggestion) but is never
-        # the evidence link shown beside Approve.
-        supported = finding is not None and _finding_supports(
-            proposal, finding, cited_term[0] if cited_term else "", ctx.vocabulary,
-        )
-
+    # Pass 2 (strongest first): budgets, inserts, audit rows.
+    for _rank, index, proposal, finding, supported, linked_note in prepared:
         decision = classify(proposal, finding, ctx)
         if linked_note:
             decision.reasons.insert(0, linked_note)
@@ -1168,9 +1198,8 @@ def apply_proposals(
                 details={"slug": proposal.slug, "target": proposal.target,
                          "signal_type": proposal.signal_type, **_policy_stamp(decision, proposal, finding, supported)},
             )
-            summaries.append(_summary(proposal, "rejected", decision.reasons[-1] if decision.reasons else ""))
+            summaries[index] = _summary(proposal, "rejected", decision.reasons[-1] if decision.reasons else "")
             continue
-
         cadence, floor, trigger = quiet_defaults(proposal, ctx.priority_terms)
         config = dict(proposal.config)
         config["_policy"] = _policy_stamp(decision, proposal, finding, supported)
@@ -1199,7 +1228,7 @@ def apply_proposals(
             )
         except Exception:
             logger.exception("watch_policy: insert failed for %s", proposal.slug)
-            summaries.append(_summary(proposal, "rejected", "insert failed (see server log)"))
+            summaries[index] = _summary(proposal, "rejected", "insert failed (see server log)")
             continue
 
         inserted = ms.get_watchlist_item(new_id, db_path=db_path)
@@ -1218,10 +1247,10 @@ def apply_proposals(
                 f"Started watching {proposal.slug} — {proposal.rationale[:120] or decision.entity}",
                 actor="executive", details=details,
             )
-            summaries.append(_summary(
+            summaries[index] = _summary(
                 proposal, "added",
                 f"added (score {decision.score}; {decision.reasons[0] if decision.reasons else ''})",
-            ))
+            )
         else:
             suggest_left -= 1
             audit_log(
@@ -1229,14 +1258,15 @@ def apply_proposals(
                 f"Suggested watching {proposal.slug} — {'; '.join(decision.reasons[-2:])}",
                 actor="executive", details=details,
             )
-            summaries.append(_summary(
+            summaries[index] = _summary(
                 proposal, "suggested",
                 f"suggested for approval (score {decision.score}; {decision.reasons[-1] if decision.reasons else ''})",
-            ))
+            )
             if dept_ref is not None and inserted is not None:
                 suggested_by_dept.setdefault(decision.department, []).append(inserted)
     _notify_department_heads(suggested_by_dept, ctx)
-    return summaries
+    # Every proposal was given a summary in one of the passes above.
+    return [s for s in summaries if s is not None]
 
 
 def _notify_department_heads(

@@ -1508,7 +1508,15 @@ external_monitoring:
       EVERY proposal is rejected (suggestions poll too, so the ceiling must
       stop them or it latches); WATCHLIST_RESEARCH_MAX_DIRECT_ADDS (2) and
       WATCHLIST_RESEARCH_MAX_PROPOSALS (2) per run (a direct add past its
-      budget is filed as a suggestion and charged to that budget).
+      budget is filed as a suggestion and charged to that budget). Budgets
+      are spent strongest first: apply_proposals scores every proposal
+      against the run's starting state, then persists them in descending
+      score order (ties keep file order), re-scoring at insert time so a
+      row inserted for a stronger proposal counts as "already watched" for
+      a weaker one on the same site. Before this a dev run rejected a
+      score-4 Finance watched-entity proposal (Brex) as over budget because
+      two score-3 proposals had been filed earlier in the same call. The
+      returned summaries keep file order.
     - quiet defaults on every research row (model cannot loosen): cadence
       daily (vendor_status hourly; page_watch/query weekly), severity_floor
       medium, keyword trigger (rss/query only — a page_watch summary is
