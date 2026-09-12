@@ -163,6 +163,31 @@ def test_update_department_partial(db: Path) -> None:
     assert state.budget_usd == 12_500.0
 
 
+def test_watched_entities_round_trip_and_migration(db: Path) -> None:
+    import sqlite3
+
+    store.seed_default_departments()
+    state = store.get_department("finance")
+    assert state is not None and state.config.watched_entities == []
+    assert store.update_department("finance", watched_entities=["Brex", "Stripe"]) is True
+    state = store.get_department("finance")
+    assert state is not None and state.config.watched_entities == ["Brex", "Stripe"]
+    # Other fields untouched; an update without the field leaves it alone.
+    store.update_department("finance", headcount=3)
+    state = store.get_department("finance")
+    assert state is not None and state.config.watched_entities == ["Brex", "Stripe"]
+    assert store.update_department("finance", watched_entities=[]) is True
+    state = store.get_department("finance")
+    assert state is not None and state.config.watched_entities == []
+    # Re-running the migration on a migrated DB is a no-op, and a corrupt
+    # column value reads back as an empty list rather than failing the read.
+    store.initialize_db()
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE departments SET watched_entities_json = 'nope' WHERE slug = 'finance'")
+    state = store.get_department("finance")
+    assert state is not None and state.config.watched_entities == []
+
+
 def test_get_department_returns_none_for_unknown(db: Path) -> None:
     store.seed_default_departments()
     assert store.get_department("does-not-exist") is None

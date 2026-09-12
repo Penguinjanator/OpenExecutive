@@ -23,17 +23,17 @@ Watchlist row shape:
        "allowed_domains": [...], "blocked_domains": [...]}``.
     ``allowed_domains`` / ``blocked_domains`` are passed to the model as
     *best-effort* prompt hints — they are NOT the same as the global
-    ``WEB_SEARCH_ALLOWED_DOMAINS`` setting, and the OpenRouter web plugin
-    does not honour Anthropic's domain-filter fields (see
-    ``providers/translator.py``), so do not rely on them as a hard guarantee.
+    ``WEB_SEARCH_ALLOWED_DOMAINS`` setting (which the provider layer applies
+    as a real filter on both the Anthropic and OpenRouter paths), so do not
+    rely on them as a hard guarantee.
   - ``trigger_json``: optional ``{"keywords": [...]}`` — same semantics as the
     rss adapter (a result surfaces only if a keyword appears in title/summary).
 
 Provider routing: the call goes through ``BaseAgent.analyze_with_tools`` with
 ``model_override=get_research_model()`` exactly like the research fan-out, so an
 OpenRouter Council override is honoured. The provider layer translates the
-native web_search tool into OpenRouter's ``plugins:[{id:web}]`` when routed
-there; no special-casing lives here.
+native web_search tool into OpenRouter's ``openrouter:web_search`` server
+tool when routed there; no special-casing lives here.
 
 Severity hint defaults to ``LOW`` — open-web results are noisy. Capture-time
 enrichment (``monitoring.enrichment``) scores relevance downstream and the
@@ -188,6 +188,7 @@ class QuerySource:
         try:
             message = await agent.analyze_with_tools(
                 user_content,
+                actor="query_watch",
                 tools=tools,
                 timeout_seconds=_QUERY_TIMEOUT_SECONDS,
                 model_override=get_research_model(),

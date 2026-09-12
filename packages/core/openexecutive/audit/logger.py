@@ -150,6 +150,7 @@ _USAGE_INT_FIELDS: tuple[str, ...] = (
     "cache_read_input_tokens",
     "cache_creation_input_tokens",
     "output_tokens",
+    "web_search_requests",
 )
 
 
@@ -175,6 +176,7 @@ _USAGE_SUM_COLS = """
     SUM(COALESCE(CAST(json_extract(details_json,'$.cache_read_input_tokens') AS INTEGER),0)) AS cache_read_input_tokens,
     SUM(COALESCE(CAST(json_extract(details_json,'$.cache_creation_input_tokens') AS INTEGER),0)) AS cache_creation_input_tokens,
     SUM(COALESCE(CAST(json_extract(details_json,'$.output_tokens') AS INTEGER),0)) AS output_tokens,
+    SUM(COALESCE(CAST(json_extract(details_json,'$.web_search_requests') AS INTEGER),0)) AS web_search_requests,
     SUM(COALESCE(CAST(json_extract(details_json,'$.cost_usd') AS REAL),0)) AS cost_usd
 """
 
@@ -431,7 +433,9 @@ class AuditLogger:
         """Aggregate token usage + cost from `cache_event` rows over an optional
         time window. Grouping is done in SQL (`json_extract`) so this scales past
         the 1000-row cap on `query()` — a busy DB can have far more cache_event
-        rows than that. Returns totals plus by-day and by-model breakdowns.
+        rows than that. Returns totals plus by-day, by-model and by-source
+        breakdowns (source = the row's `actor`: executive, specialist_research,
+        research_synthesis, triage, …; rows without one group as `unknown`).
 
         Each `cache_event` row carries the per-call token breakdown and (for
         OpenRouter calls) the actual `cost_usd`; missing/garbled fields coalesce
@@ -439,7 +443,9 @@ class AuditLogger:
         `until` bound the ISO `ts` column with the same string comparison used by
         `query()`/`count()`.
         """
-        empty: dict[str, Any] = {"totals": _zero_usage(), "by_day": [], "by_model": []}
+        empty: dict[str, Any] = {
+            "totals": _zero_usage(), "by_day": [], "by_model": [], "by_source": [],
+        }
         if not self._db_path.exists():
             return empty
 
@@ -469,11 +475,19 @@ class AuditLogger:
                 "GROUP BY model ORDER BY input_tokens DESC",
                 params,
             ).fetchall()
+            by_source_rows = conn.execute(
+                f"SELECT COALESCE(actor,'unknown') AS source, {_USAGE_SUM_COLS} "
+                f"FROM audit_log {where} GROUP BY source ORDER BY input_tokens DESC",
+                params,
+            ).fetchall()
 
         return {
             "totals": _row_to_usage(totals_row),
             "by_day": [{"day": r["day"], **_row_to_usage(r)} for r in by_day_rows],
             "by_model": [{"model": r["model"], **_row_to_usage(r)} for r in by_model_rows],
+            "by_source": [
+                {"source": r["source"], **_row_to_usage(r)} for r in by_source_rows
+            ],
         }
 
 

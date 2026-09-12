@@ -140,6 +140,7 @@ def initialize_db(db_path: Path | None = None) -> None:
         _migrate_specialist_key_nullable(conn)
         _migrate_add_channel_columns(conn)
         _migrate_add_last_reviewed_at_column(conn)
+        _migrate_add_watched_entities_column(conn)
 
 
 def _migrate_add_last_reviewed_at_column(conn: sqlite3.Connection) -> None:
@@ -184,6 +185,28 @@ def _migrate_add_channel_columns(conn: sqlite3.Connection) -> None:
         except sqlite3.OperationalError as exc:
             if "duplicate column" not in str(exc).lower():
                 raise
+
+
+def _migrate_add_watched_entities_column(conn: sqlite3.Connection) -> None:
+    """Add `watched_entities_json` to `departments` if missing.
+
+    A JSON list of external entity names the department wants the research
+    watch policy to treat as strong grounding (see
+    `monitoring/research/watch_policy.grounding_vocabulary`). Additive
+    ALTER pattern mirrors `_migrate_add_channel_columns`; the NOT NULL
+    DEFAULT '[]' keeps `_row_to_config` free of a null branch.
+    """
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(departments)")}
+    if "watched_entities_json" in existing:
+        return
+    try:
+        conn.execute(
+            "ALTER TABLE departments ADD COLUMN watched_entities_json "
+            "TEXT NOT NULL DEFAULT '[]'"
+        )
+    except sqlite3.OperationalError as exc:
+        if "duplicate column" not in str(exc).lower():
+            raise
 
 
 def _migrate_okrs_to_goals(conn: sqlite3.Connection) -> None:
@@ -323,6 +346,10 @@ def _row_to_config(row: sqlite3.Row) -> DepartmentConfig:
             return row[name]
         except (IndexError, KeyError):
             return None
+    try:
+        watched = json.loads(_opt_col("watched_entities_json") or "[]") or []
+    except (ValueError, TypeError):
+        watched = []
     return DepartmentConfig(
         slug=row["slug"],
         title=row["title"],
@@ -341,6 +368,10 @@ def _row_to_config(row: sqlite3.Row) -> DepartmentConfig:
         slack_channel_id=_opt_col("slack_channel_id"),
         discord_channel_id=_opt_col("discord_channel_id"),
         telegram_chat_id=_opt_col("telegram_chat_id"),
+        watched_entities=(
+            [str(e) for e in watched if isinstance(e, str) and e.strip()]
+            if isinstance(watched, list) else []
+        ),
     )
 
 
@@ -514,6 +545,7 @@ def update_department(
     slack_channel_id: str | None | object = _UNSET,
     discord_channel_id: str | None | object = _UNSET,
     telegram_chat_id: str | None | object = _UNSET,
+    watched_entities: list[str] | None = None,
     db_path: Path | None = None,
 ) -> bool:
     """Partial update. Returns True if a row was modified.
@@ -552,6 +584,8 @@ def update_department(
         fields.append(("discord_channel_id", discord_channel_id))
     if telegram_chat_id is not _UNSET:
         fields.append(("telegram_chat_id", telegram_chat_id))
+    if watched_entities is not None:
+        fields.append(("watched_entities_json", json.dumps(list(watched_entities))))
     if not fields:
         # Nothing to update; confirm the row exists so the route can 404.
         return get_department(slug, db_path) is not None

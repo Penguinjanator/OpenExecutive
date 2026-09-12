@@ -31,20 +31,22 @@ What we DO NOT translate:
   response are ignored by the response path — only ``content`` and
   ``tool_calls`` are read. See
   https://openrouter.ai/docs/guides/best-practices/reasoning-tokens.
-* Web-search server tools — feature_gate stripped these for non-Claude
-  models before we ran. For Claude family (where feature_gate keeps them)
-  the Anthropic ``web_search_*`` server tool can't be executed by
-  OpenRouter as-is, so ``to_openai_request`` translates its *intent* into
-  OpenRouter's ``plugins:[{"id":"web"}]`` web-search plugin (the tool
-  itself is still dropped from ``tools[]`` — it has no ``input_schema``).
-  See https://openrouter.ai/docs/guides/features/plugins/web-search.
-  OpenRouter's plugin injects search results inline and the model cites
-  them with ``<cite index="...">…</cite>`` markup; the response path
-  strips that markup so it doesn't leak into findings / chat text.
+* Web-search server tools — feature_gate strips these only for the local
+  OpenAI-compatible backend. For every OpenRouter model the Anthropic
+  ``web_search_*`` server tool (which OpenRouter can't execute as-is, and
+  which has no ``input_schema``) is replaced in ``tools[]`` by OpenRouter's
+  own ``openrouter:web_search`` server tool with the same ``max_uses`` and
+  domain lists, so the search cap and filters hold on this path and the
+  response's ``usage.web_search_requests`` is recorded. See
+  https://openrouter.ai/docs/guides/features/server-tools/web-search.
+  OpenRouter's search makes the model cite results with
+  ``(cite index="...">…</cite>`` markup; the response path strips that
+  markup so it doesn't leak into findings / chat text.
 """
 from __future__ import annotations
 
 import json
+import logging
 import re
 from types import SimpleNamespace
 from typing import Any
@@ -289,26 +291,40 @@ def _anthropic_tools_to_openai(tools: list[Any]) -> list[dict[str, Any]]:
 
 # Anthropic native web-search server-tool type prefix (e.g.
 # ``web_search_20250305``). OpenRouter cannot execute Anthropic's server tool,
-# but its own ``web`` plugin does the same job, so we translate the intent.
+# but its own server tool does the same job, so we translate the intent.
+logger = logging.getLogger(__name__)
+
 _WEB_SEARCH_TOOL_PREFIX = "web_search_"
-# OpenRouter's web plugin defaults to 5 results. We derive ``max_results`` from
-# the Anthropic tool's ``max_uses`` but cap it: ``max_uses`` is a search *count*
-# while ``max_results`` is a result *count* (Exa bills per result), so a large
-# ``max_uses`` must not translate into an unbounded result count.
-_WEB_PLUGIN_DEFAULT_MAX_RESULTS = 5
-_WEB_PLUGIN_MAX_RESULTS_CAP = 10
+# OpenRouter's own web-search server tool. Like Anthropic's, it runs inside
+# the provider request: the model decides when to search (0..N times), the
+# search count is capped server-side by ``max_uses``, domain lists apply, and
+# the response reports ``usage.web_search_requests``. The engine is left on
+# ``auto``: Claude, GPT, Gemini and Grok use their provider's native search,
+# everything else Exa. See
+# https://openrouter.ai/docs/guides/features/server-tools/web-search.
+_OPENROUTER_WEB_SEARCH_TYPE = "openrouter:web_search"
+# Tool-call ``type`` prefix of OpenRouter's server-side tools in a response.
+# Those calls were executed upstream; they are never surfaced as tool_use
+# blocks for the caller to run.
+_OPENROUTER_SERVER_TOOL_PREFIX = "openrouter:"
 
 
-def _web_search_plugin(tools: Any) -> dict[str, Any] | None:
-    """Return the OpenRouter ``web`` plugin spec when ``tools`` carries an
-    Anthropic native ``web_search_*`` server tool, else ``None``.
+def _is_server_tool_call(call: dict[str, Any]) -> bool:
+    call_type = call.get("type")
+    return isinstance(call_type, str) and call_type.startswith(_OPENROUTER_SERVER_TOOL_PREFIX)
+
+
+def _web_search_server_tool(tools: Any) -> dict[str, Any] | None:
+    """Return the OpenRouter ``openrouter:web_search`` server tool entry
+    when ``tools`` carries an Anthropic native ``web_search_*`` server tool,
+    else ``None``.
 
     OpenRouter's OpenAI-format endpoint can't run Anthropic's server-side
     ``web_search_20250305`` tool — ``_anthropic_tools_to_openai`` drops it
-    (no ``input_schema``), which would silently strip web search from a
-    Claude call routed via OpenRouter. We instead reproduce its intent with
-    OpenRouter's ``plugins:[{"id":"web"}]`` mechanism. ``max_results`` is
-    derived from the tool's ``max_uses`` (capped).
+    (no ``input_schema``), which would silently strip web search from a call
+    routed via OpenRouter. Its own server tool carries the same controls, so
+    ``max_uses`` and the domain lists translate one-to-one
+    (``blocked_domains`` → ``excluded_domains``).
     """
     if not isinstance(tools, list):
         return None
@@ -319,18 +335,21 @@ def _web_search_plugin(tools: Any) -> dict[str, Any] | None:
             and isinstance(t.get("type"), str)
             and t["type"].startswith(_WEB_SEARCH_TOOL_PREFIX)
         ):
+            params: dict[str, Any] = {}
             max_uses = t.get("max_uses")
-            # Note: bool is an int subtype, so exclude it explicitly. Anthropic's
-            # allowed_domains / blocked_domains have no OpenRouter web-plugin
-            # equivalent and are intentionally not translated (unused here).
-            max_results = (
-                min(max_uses, _WEB_PLUGIN_MAX_RESULTS_CAP)
-                if isinstance(max_uses, int)
-                and not isinstance(max_uses, bool)
-                and max_uses > 0
-                else _WEB_PLUGIN_DEFAULT_MAX_RESULTS
-            )
-            return {"id": "web", "max_results": max_results}
+            # bool is an int subtype, so exclude it explicitly.
+            if isinstance(max_uses, int) and not isinstance(max_uses, bool) and max_uses > 0:
+                params["max_uses"] = max_uses
+            allowed = t.get("allowed_domains")
+            if isinstance(allowed, list) and allowed:
+                params["allowed_domains"] = [str(d) for d in allowed]
+            blocked = t.get("blocked_domains")
+            if isinstance(blocked, list) and blocked:
+                params["excluded_domains"] = [str(d) for d in blocked]
+            tool: dict[str, Any] = {"type": _OPENROUTER_WEB_SEARCH_TYPE}
+            if params:
+                tool["parameters"] = params
+            return tool
     return None
 
 
@@ -401,14 +420,14 @@ def to_openai_request(model_slug: str, anthropic_kwargs: dict[str, Any]) -> dict
     tools = anthropic_kwargs.get("tools")
     if tools:
         translated = _anthropic_tools_to_openai(tools)
+        # Anthropic's web_search server tool is dropped from ``tools`` above
+        # (OpenRouter can't execute it); OpenRouter's own server tool takes
+        # its place with the same cap and domain lists.
+        web_search = _web_search_server_tool(tools)
+        if web_search is not None:
+            translated.append(web_search)
         if translated:
             body["tools"] = translated
-        # Anthropic's web_search server tool is dropped from ``tools`` above
-        # (OpenRouter can't execute it); reproduce its intent via OpenRouter's
-        # ``web`` plugin so search still runs for Claude-via-OpenRouter calls.
-        web_plugin = _web_search_plugin(tools)
-        if web_plugin is not None:
-            body["plugins"] = [web_plugin]
 
     tool_choice = anthropic_kwargs.get("tool_choice")
     if tool_choice is not None:
@@ -498,7 +517,7 @@ def _stop_reason_from_openai(reason: str | None) -> str:
     return reason or "end_turn"
 
 
-# OpenRouter's web plugin makes the model cite sources with inline
+# OpenRouter's web search makes the model cite sources with inline
 # ``<cite index="3-14,3-15">…</cite>`` markup (it appears both in free text and
 # inside tool-call argument strings). The wrapper tags are an upstream artifact
 # that would otherwise leak into research findings, artifacts, and chat replies,
@@ -521,6 +540,24 @@ def _remove_complete_cite_tags(text: str) -> str:
         if stripped == text:
             return stripped
         text = stripped
+
+
+def _parse_tool_arguments(raw_args: Any, tool_name: str) -> Any:
+    """Parse a tool call's JSON arguments. OpenRouter search's ``<cite>`` markup
+    can land inside argument strings with unescaped quotes; strip it from the
+    raw text before parsing so a citation cannot turn a full payload into an
+    empty one. A payload that still fails to parse is logged (it would
+    otherwise read as "the model returned nothing")."""
+    if not isinstance(raw_args, str):
+        return raw_args
+    try:
+        return json.loads(_CITE_TAG_RE.sub("", raw_args))
+    except json.JSONDecodeError as exc:
+        logger.warning(
+            "openrouter: tool call %r carried unparseable JSON arguments (%s) — "
+            "treating as empty", tool_name, exc,
+        )
+        return {}
 
 
 def _strip_cite_markup(text: str) -> str:
@@ -591,13 +628,17 @@ def from_openai_response(body: dict[str, Any]) -> SimpleNamespace:
     if isinstance(text, str) and text:
         content_blocks.append(_block("text", text=_strip_cite_markup(text)))
 
+    skipped_server_calls = 0
     for call in msg.get("tool_calls") or []:
+        if _is_server_tool_call(call):
+            # OpenRouter executed it already (web search); not for the
+            # caller to run.
+            skipped_server_calls += 1
+            logger.debug("openrouter: skipping server-side tool call %r", call.get("type"))
+            continue
         fn = call.get("function") or {}
         raw_args = fn.get("arguments") or "{}"
-        try:
-            parsed = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-        except json.JSONDecodeError:
-            parsed = {}
+        parsed = _parse_tool_arguments(raw_args, fn.get("name", ""))
         content_blocks.append(
             _block(
                 "tool_use",
@@ -606,6 +647,11 @@ def from_openai_response(body: dict[str, Any]) -> SimpleNamespace:
                 input=_strip_cite_in_value(parsed),
             )
         )
+    stop_reason = _stop_reason_from_openai(choice.get("finish_reason"))
+    if skipped_server_calls and not any(b.type == "tool_use" for b in content_blocks):
+        # Every tool call was server-side: nothing is left for the caller
+        # to run, so the turn is complete, not waiting on tool results.
+        stop_reason = "end_turn"
 
     # Reasoning LAST. Several callers read ``content[0].text`` (the SDK
     # itself only ever emits text first for those prompts), so the synthetic
@@ -623,7 +669,7 @@ def from_openai_response(body: dict[str, Any]) -> SimpleNamespace:
         role="assistant",
         model=body.get("model", ""),
         content=content_blocks,
-        stop_reason=_stop_reason_from_openai(choice.get("finish_reason")),
+        stop_reason=stop_reason,
         stop_sequence=None,
         usage=SimpleNamespace(
             input_tokens=usage.get("prompt_tokens", 0),
@@ -633,8 +679,30 @@ def from_openai_response(body: dict[str, Any]) -> SimpleNamespace:
             # Actual USD charged for this generation, present when the request
             # set `usage: {include: true}`. None for upstreams that omit it.
             cost=usage.get("cost"),
+            server_tool_use=_server_tool_usage(usage),
         ),
     )
+
+
+def _server_tool_usage(usage: dict[str, Any]) -> SimpleNamespace:
+    """Anthropic-shape ``usage.server_tool_use`` from OpenRouter's usage.
+
+    On the wire the count sits under ``usage.server_tool_use_details``
+    (``{"web_search_requests": N, "tool_calls_requested": N,
+    "tool_calls_executed": N}``, observed on the chat-completions endpoint);
+    a flat ``usage.web_search_requests`` (the shape the docs show) is
+    accepted too. 0 when neither is present."""
+    details = usage.get("server_tool_use_details")
+    raw = (
+        details.get("web_search_requests", 0)
+        if isinstance(details, dict)
+        else usage.get("web_search_requests", 0)
+    )
+    try:
+        count = int(raw or 0)
+    except (TypeError, ValueError, OverflowError):
+        count = 0
+    return SimpleNamespace(web_search_requests=count)
 
 
 def _extract_cache_token_counts(usage: dict[str, Any]) -> tuple[int, int]:
@@ -695,6 +763,10 @@ class StreamAccumulator:
         self._cite_pending = ""
         # tool_calls[idx] = {"id": ..., "name": ..., "arg_chunks": [..]}
         self._tool_calls: dict[int, dict[str, Any]] = {}
+        # Indices of server-side tool calls (typed only on their first
+        # delta); their continuation chunks carry only index + arguments
+        # and must be dropped too.
+        self._server_tool_indices: set[int] = set()
         # OpenRouter streams ``delta.reasoning_details`` chunks; collected
         # verbatim and re-emitted as one block at finalize().
         self._reasoning_details: list[Any] = []
@@ -755,6 +827,12 @@ class StreamAccumulator:
 
         for tc in delta.get("tool_calls") or []:
             idx = tc.get("index", 0)
+            if _is_server_tool_call(tc):
+                self._server_tool_indices.add(idx)
+                logger.debug("openrouter: skipping server-side tool call %r", tc.get("type"))
+                continue
+            if idx in self._server_tool_indices:
+                continue  # continuation chunk of a server-side call
             slot = self._tool_calls.setdefault(
                 idx, {"id": "", "name": "", "arg_chunks": []}
             )
@@ -800,10 +878,7 @@ class StreamAccumulator:
         for idx in sorted(self._tool_calls):
             slot = self._tool_calls[idx]
             joined_args = "".join(slot["arg_chunks"])
-            try:
-                parsed = json.loads(joined_args) if joined_args else {}
-            except json.JSONDecodeError:
-                parsed = {}
+            parsed = _parse_tool_arguments(joined_args or "{}", slot["name"])
             content_blocks.append(
                 _block(
                     "tool_use",
@@ -823,7 +898,11 @@ class StreamAccumulator:
             role="assistant",
             model=self._model,
             content=content_blocks,
-            stop_reason=_stop_reason_from_openai(self._finish_reason),
+            stop_reason=(
+                "end_turn"
+                if self._server_tool_indices and not self._tool_calls
+                else _stop_reason_from_openai(self._finish_reason)
+            ),
             stop_sequence=None,
             usage=SimpleNamespace(
                 input_tokens=self._usage.get("prompt_tokens", 0),
@@ -833,5 +912,6 @@ class StreamAccumulator:
                 # Actual USD charged, from the stream's final usage chunk when
                 # the request set `usage: {include: true}`. None if absent.
                 cost=self._usage.get("cost"),
+                server_tool_use=_server_tool_usage(self._usage),
             ),
         )

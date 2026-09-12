@@ -20,11 +20,13 @@ from openexecutive.config import get_settings
 WEB_SEARCH_TOOL_NAME = "web_search"
 
 
-def build_web_search_tool() -> dict[str, Any] | None:
+def build_web_search_tool(*, max_uses: int | None = None) -> dict[str, Any] | None:
     """Return the Anthropic web_search tool dict, or None when disabled.
 
     Read at tool-list assembly time (per turn) so toggling the env var
-    without a restart takes effect on the next turn.
+    without a restart takes effect on the next turn. ``max_uses`` overrides
+    the shared ``WEB_SEARCH_MAX_USES`` knob for callers with their own
+    (the research fan-out uses ``RESEARCH_WEB_SEARCH_MAX_USES``).
     """
     settings = get_settings()
     if not settings.enable_web_search:
@@ -33,7 +35,7 @@ def build_web_search_tool() -> dict[str, Any] | None:
     tool: dict[str, Any] = {
         "type": "web_search_20250305",
         "name": WEB_SEARCH_TOOL_NAME,
-        "max_uses": settings.web_search_max_uses,
+        "max_uses": max_uses if max_uses is not None else settings.web_search_max_uses,
     }
     if settings.web_search_allowed_domains:
         tool["allowed_domains"] = settings.web_search_allowed_domains

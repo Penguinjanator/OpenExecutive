@@ -339,7 +339,11 @@ PROPOSE_WATCH_TOOL: dict[str, Any] = {
             },
             "finding_index": {
                 "type": "integer",
-                "description": "The 1-based '#N' of the finding this proposal comes from.",
+                "description": (
+                    "REQUIRED. The 1-based '#N' of the finding this proposal comes "
+                    "from — the one whose urls or text name this source. A proposal "
+                    "with no finding behind it is rejected as having no evidence."
+                ),
             },
             "certainty": {
                 "type": "string",
@@ -354,7 +358,9 @@ PROPOSE_WATCH_TOOL: dict[str, Any] = {
             "trigger": {"type": "object", "description": "Optional adapter trigger; policy adds quiet defaults."},
             "route_to_specialist": {"type": "string"},
         },
-        "required": ["slug", "signal_type", "target", "grounding_entity", "rationale", "certainty"],
+        "required": [
+            "slug", "signal_type", "target", "grounding_entity", "rationale", "finding_index", "certainty",
+        ],
     },
 }
 
@@ -446,7 +452,7 @@ async def _validated_target(
 
     config = _display_label_config(signal_type, tool_input.get("display_label"))
     # Validate the target before it lands: a non-feed rss URL is converted
-    # to a scrape-backed page_watch (when scrapeable) or rejected, so the
+    # to a page_watch (when the page has readable text) or rejected, so the
     # research workflow can't seed the watchlist with dead feed rows.
     try:
         signal_type, target, config = await validate_and_normalize_target(
@@ -565,6 +571,8 @@ async def handle_propose_watch(tool_input: dict[str, Any], collector: list[Any])
     finding_index: int | None
     try:
         # 1-based "#N" from the findings turn; 0 or negative means "none".
+        # Tolerated here even though the schema requires it: the policy
+        # links the finding that cites the source when it is missing.
         finding_index = int(raw_index) - 1 if raw_index is not None and int(raw_index) >= 1 else None
     except (TypeError, ValueError):
         finding_index = None

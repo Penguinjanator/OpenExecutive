@@ -315,7 +315,7 @@ def test_pipeline_adds_department_tag_from_channel(monkeypatch, db: Path) -> Non
 
     async def run():
         _, aid = await pipeline.evaluate_and_dispatch(
-            AlertEvent(source="email", external_id="d", body="x", channel="department:Finance"),
+            AlertEvent(source="email", external_id="d", body="x", department="Finance"),
             db_path=db,
         )
         return aid

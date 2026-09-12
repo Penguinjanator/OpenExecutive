@@ -46,13 +46,26 @@ def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     db_path = tmp_path / "policy.db"
     monkeypatch.setattr("openexecutive.memory.episodic.DB_PATH", db_path)
     monkeypatch.setattr("openexecutive.alerts.store.DB_PATH", db_path)
+    monkeypatch.setattr("openexecutive.departments.store.DB_PATH", db_path)
+    monkeypatch.setattr("openexecutive.people.store.DB_PATH", db_path)
     initialize_episodic_db(db_path)
     initialize_alerts_db(db_path)
     ms.initialize_db(db_path)
+    from openexecutive.departments import registry as dept_registry
+    from openexecutive.departments import store as dept_store
+    from openexecutive.people import registry as people_registry
+    from openexecutive.people import store as people_store
+
+    dept_store.initialize_db(db_path)
+    people_store.initialize_db(db_path)
+    dept_registry.invalidate()
+    people_registry.invalidate()
     audit = AuditLogger(db_path=db_path)
     audit.initialize_db()
     set_audit_logger(audit)
-    return db_path
+    yield db_path
+    dept_registry.invalidate()
+    people_registry.invalidate()
 
 
 def _profile() -> CompanyProfile:
@@ -114,12 +127,13 @@ def test_vocabulary_covers_profile_initiatives_and_watch_labels(db: Path) -> Non
     vocab = wp.grounding_vocabulary(
         _profile(), [SimpleNamespace(title="Launch Helios API")], ms.list_watchlist(db_path=db),
     )
-    assert vocab["sente labs"] == wp.KIND_COMPANY
-    assert vocab["acme corp"] == wp.KIND_COMPETITOR
-    assert vocab["stripe"] == wp.KIND_VENDOR
-    assert vocab["acme"] == wp.KIND_TICKER
-    assert vocab["launch helios api"] == wp.KIND_INITIATIVE
-    assert vocab["hubspot"] == wp.KIND_WATCH and vocab["hubs"] == wp.KIND_WATCH
+    assert vocab["sente labs"].kind == wp.KIND_COMPANY
+    assert vocab["acme corp"].kind == wp.KIND_COMPETITOR
+    assert vocab["stripe"].kind == wp.KIND_VENDOR
+    assert vocab["acme"].kind == wp.KIND_TICKER
+    assert vocab["launch helios api"].kind == wp.KIND_INITIATIVE
+    assert vocab["hubspot"].kind == wp.KIND_WATCH and vocab["hubs"].kind == wp.KIND_WATCH
+    assert all(entry.department == "" for entry in vocab.values())
 
 
 def test_match_entity_is_token_based_and_prefers_company_data() -> None:
@@ -201,15 +215,15 @@ def _initech_finding(**kw: Any) -> ResearchFinding:
 
 def test_entity_not_in_company_data_is_never_direct() -> None:
     p = _proposal(grounding_entity="Initech", target="https://initech.com/feed.xml")
-    d = wp.classify(p, _initech_finding(verification="confirmed", source_specialist="cso,cfo"), _ctx())
+    d = wp.classify(p, _initech_finding(source_specialist="cso,cfo"), _ctx())
     assert d.tier == wp.TIER_SUGGEST
-    assert d.score == 3  # own-source +1 needs an entity; high +1, verified +1, consensus +1
+    assert d.score == 2  # own-source +1 needs an entity; high +1, consensus +1
 
 
 def test_medium_confidence_grounded_needs_more_corroboration() -> None:
     d = wp.classify(_proposal(), _finding(confidence="medium"), _ctx())
     assert d.tier == wp.TIER_SUGGEST and d.score == 3
-    d2 = wp.classify(_proposal(), _finding(confidence="medium", verification="confirmed"), _ctx())
+    d2 = wp.classify(_proposal(), _finding(confidence="medium", source_specialist="cso,cfo"), _ctx())
     assert d2.tier == wp.TIER_DIRECT and d2.score == 4
 
 
@@ -223,7 +237,7 @@ def test_unsure_only_downgrades() -> None:
 
 def test_query_is_always_a_suggestion() -> None:
     p = _proposal(slug="q-acme", signal_type="query", target="Acme Corp pricing", grounding_entity="Acme Corp")
-    d = wp.classify(p, _finding(verification="confirmed"), _ctx())
+    d = wp.classify(p, _finding(source_specialist="cso,cfo"), _ctx())
     assert d.tier == wp.TIER_SUGGEST and "standing web queries" in d.reasons[-1]
 
 
@@ -259,6 +273,14 @@ def test_own_source_uses_the_site_label_only() -> None:
     assert wp._site_label("status.acme.com") == "acme"
     assert wp._site_label("acme.co.uk") == "acme"
     assert wp._site_label("api.unrelated-vendor.com") == "unrelated-vendor"
+    # The label must be the entity's leading name or its words run together,
+    # never a generic trailing word: "Acme Payments" is not payments.io.
+    vocab = {"acme payments": wp.KIND_VENDOR}
+    generic = _proposal(slug="rss-pay", target="https://payments.io/feed", grounding_entity="Acme Payments")
+    assert not wp._is_own_source(generic, "acme payments", vocab)
+    for host in ("https://acme.com/feed", "https://status.acmepayments.com/feed"):
+        own = _proposal(slug="rss-own", target=host, grounding_entity="Acme Payments")
+        assert wp._is_own_source(own, "acme payments", vocab)
     p = _proposal(slug="pw", signal_type="page_watch", target="https://api.unrelated.com/pricing",
                   grounding_entity="Launch Helios API")
     assert "own source" not in " ".join(wp.classify(p, _finding(), _ctx()).reasons)
@@ -269,7 +291,7 @@ def test_own_source_uses_the_site_label_only() -> None:
 def test_vocabulary_prefers_the_strongest_kind() -> None:
     profile = CompanyProfile.model_validate({"name": "Acme", "vendors": ["Acme"], "tickers": ["ACME"]})
     vocab = wp.grounding_vocabulary(profile, [SimpleNamespace(title="Acme")], [])
-    assert vocab["acme"] == wp.KIND_COMPANY
+    assert vocab["acme"].kind == wp.KIND_COMPANY
 
 
 def test_history_adjusts_only_with_enough_samples() -> None:
@@ -333,17 +355,17 @@ def test_apply_honours_budgets_and_duplicate_targets(db: Path) -> None:
                   target="https://status.stripe.com/feed.atom", grounding_entity="Stripe", finding_index=1),
         _proposal(slug="rss-acme-blog"),  # third direct → budget → suggestion
         _proposal(slug="rss-initech", target="https://initech.com/feed.xml", grounding_entity="Initech",
-                  finding_index=2),
+                  finding_index=2),  # not in company data: the weakest → loses the budget
         _proposal(slug="rss-globex", target="https://globex.com/feed.xml", grounding_entity="Globex",
-                  certainty="unsure"),  # suggestion budget spent → rejected
+                  certainty="unsure"),  # a competitor, own source: outranks Initech despite filing last
     ]
     ctx = _ctx(settings=wp.PolicySettings(max_direct_adds=2, max_suggestions=2))
     out = wp.apply_proposals(proposals, findings, ctx, db_path=db)
     assert [o["outcome"] for o in out] == [
-        "added", "rejected", "added", "suggested", "suggested", "rejected",
+        "added", "rejected", "added", "suggested", "rejected", "suggested",
     ]
     assert "duplicate" in out[1]["result_preview"]
-    assert "budget" in out[5]["result_preview"]
+    assert "budget" in out[4]["result_preview"]
     # The caller's context is not mutated by the run.
     assert ctx.existing == []
 
@@ -531,10 +553,22 @@ def test_sweep_nudges_once_suggestions_pile_up(db: Path) -> None:
     assert len(alerts) == 1 and "4 watch suggestions" in alerts[0].headline
 
 
+def test_direct_add_needs_a_finding_that_cites_the_source() -> None:
+    # Department entity + own source + a decision mention reach the score
+    # bar without any finding evidence about the target; that is still only
+    # a suggestion — nothing goes live on hearsay.
+    decided = SimpleNamespace(summary="Move expense cards to Brex", department="finance", timestamp="")
+    unrelated = _finding(confidence="high")  # about Acme, cites acme.com
+    d = wp.classify(_brex_proposal(), unrelated, _dept_ctx(recent_decisions=[decided]))
+    assert d.score >= wp.DIRECT_THRESHOLD and d.tier == wp.TIER_SUGGEST
+    assert "no finding cites this source" in d.reasons
+    assert wp.classify(_brex_proposal(), _brex_finding(), _dept_ctx(recent_decisions=[decided])).tier == wp.TIER_DIRECT
+
+
 def test_finding_points_need_a_finding_about_this_source() -> None:
     # A strong finding about Acme lends nothing to an unrelated attacker URL.
     p = _proposal(target="https://totally-unrelated.attacker.net/feed", grounding_entity="Acme Corp")
-    d = wp.classify(p, _finding(verification="confirmed", source_specialist="cso,cfo"), _ctx())
+    d = wp.classify(p, _finding(source_specialist="cso,cfo"), _ctx())
     assert d.score == 2 and d.tier == wp.TIER_SUGGEST
     assert "does not mention this source" in " ".join(d.reasons)
     # A finding that names the ticker does support a ticker watch on it.
@@ -546,7 +580,7 @@ def test_direct_add_requires_the_entitys_own_source() -> None:
     # A well-corroborated third-party page about a competitor is the
     # principal's call, never a direct add.
     p = _proposal(target="https://news.example.com/acme-feed.xml", grounding_entity="Acme Corp")
-    f = _finding(verification="confirmed", source_specialist="cso,cfo",
+    f = _finding(source_specialist="cso,cfo",
                  relevant_urls=["https://news.example.com/acme-pricing"])
     d = wp.classify(p, f, _ctx())
     assert d.score >= wp.DIRECT_THRESHOLD and d.tier == wp.TIER_SUGGEST
@@ -556,7 +590,7 @@ def test_direct_add_requires_the_entitys_own_source() -> None:
 def test_initiative_or_priority_grounding_is_never_direct() -> None:
     p = _proposal(slug="rss-helios", target="https://helios.com/feed.xml", grounding_entity="Helios API")
     f = _finding(title="Helios API launch", summary="Launch Helios API shipped.",
-                 verification="confirmed", relevant_urls=["https://helios.com/launch"])
+                 relevant_urls=["https://helios.com/launch"])
     d = wp.classify(p, f, _ctx())
     assert d.grounding_kind == wp.KIND_INITIATIVE and d.score >= wp.DIRECT_THRESHOLD
     assert d.tier == wp.TIER_SUGGEST and "needs a named competitor" in d.reasons[-1]
@@ -575,7 +609,7 @@ def test_vocabulary_from_url_targets_uses_the_site_label(db: Path) -> None:
     ms.insert_watchlist_item(slug="vendor-stripe", signal_type="vendor_status",
                              target="https://status.stripe.com/history.atom", db_path=db)
     vocab = wp.grounding_vocabulary(CompanyProfile(name="X"), [], ms.list_watchlist(db_path=db))
-    assert vocab.get("stripe") == wp.KIND_WATCH
+    assert vocab["stripe"].kind == wp.KIND_WATCH
     assert not any(t.startswith("https") for t in vocab)
     assert wp.match_entity("Status Labs", vocab) is None
 
@@ -641,3 +675,521 @@ def test_insert_failure_is_reported_without_exception_text(db: Path, monkeypatch
     out = wp.apply_proposals([_proposal()], [_finding()], _ctx(), db_path=db)
     assert out[0]["outcome"] == "rejected" and "see server log" in out[0]["result_preview"]
     assert "/secret/path" not in out[0]["result_preview"]
+
+
+# --------------------------------------------------------------------- #
+# Departments + episodic decisions
+# --------------------------------------------------------------------- #
+
+
+def _department(slug: str, title: str, *, watched: list[str] | None = None,
+                scope: list[str] | None = None, head: int | None = None,
+                goals: list[str] | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        config=SimpleNamespace(
+            slug=slug, title=title, head_person_id=head,
+            watched_entities=list(watched or []),
+            charter=SimpleNamespace(scope=list(scope or [])),
+        ),
+        goals=[SimpleNamespace(key_result=g) for g in (goals or [])],
+    )
+
+
+def _finance(head: int | None = 7) -> SimpleNamespace:
+    return _department(
+        "finance", "Finance", watched=["Brex"], scope=["Expense card programs"],
+        goals=["Close the books in 5 days"], head=head,
+    )
+
+
+def _dept_ctx(*departments: Any, existing: list[Any] | None = None, **kw: Any) -> wp.PolicyContext:
+    profile = _profile()
+    departments = departments or (_finance(),)
+    existing = existing or []
+    return wp.PolicyContext(
+        vocabulary=wp.grounding_vocabulary(profile, [], existing, list(departments)),
+        priority_terms=wp.priority_terms(profile),
+        existing=existing,
+        departments=wp.department_refs(list(departments)),
+        **kw,
+    )
+
+
+def _brex_finding(**kw: Any) -> ResearchFinding:
+    return _finding(
+        title="Brex outage", summary="Brex card authorizations failed for 2h on 2026-09-01.",
+        relevant_urls=["https://status.brex.com/incidents/1"], source_specialist="cfo", **kw,
+    )
+
+
+def _brex_proposal(**kw: Any) -> wp.WatchProposal:
+    return _proposal(
+        slug="vendor-brex", signal_type="vendor_status", target="https://status.brex.com",
+        grounding_entity="Brex", rationale="Finance is on Brex cards", **kw,
+    )
+
+
+def test_department_vocabulary_kinds_and_department_merge() -> None:
+    finance = _department("finance", "Finance", watched=["Brex", "Acme Corp"],
+                          scope=["Expense card programs"], goals=["Close the books in 5 days"])
+    vocab = wp.grounding_vocabulary(_profile(), [], [], [finance])
+    assert vocab["brex"] == wp.VocabEntry(wp.KIND_DEPARTMENT_ENTITY, "finance")
+    assert vocab["expense card programs"] == wp.VocabEntry(wp.KIND_DEPARTMENT_SCOPE, "finance")
+    assert vocab["close the books in 5 days"].kind == wp.KIND_DEPARTMENT_SCOPE
+    # A profile competitor that Finance also lists keeps the stronger kind
+    # and still routes to Finance; so does a profile vendor (profile kinds
+    # outrank department kinds, so the vendor history keeps applying).
+    assert vocab["acme corp"] == wp.VocabEntry(wp.KIND_COMPETITOR, "finance")
+    stripe_vocab = wp.grounding_vocabulary(_profile(), [], [], [_department("finance", "Finance", watched=["Stripe"])])
+    assert stripe_vocab["stripe"] == wp.VocabEntry(wp.KIND_VENDOR, "finance")
+    # Two departments: the one supplying the winning kind owns the term.
+    eng = _department("eng", "Engineering", scope=["Acme Migration"])
+    fin = _department("finance", "Finance", watched=["Acme Migration"])
+    both = wp.grounding_vocabulary(None, [], [], [eng, fin])
+    assert both["acme migration"] == wp.VocabEntry(wp.KIND_DEPARTMENT_ENTITY, "finance")
+    # Legacy plain-kind dicts still match.
+    assert wp.match_entity("Brex Inc", vocab) == ("brex", wp.KIND_DEPARTMENT_ENTITY)
+    assert wp.match_entity("Brex", {"brex": wp.KIND_VENDOR}) == ("brex", wp.KIND_VENDOR)
+    assert wp.department_refs([_finance(head=7)]) == {"finance": wp.DepartmentRef("Finance", 7)}
+
+
+def test_department_watched_entity_grounds_a_direct_add_and_routes(db: Path) -> None:
+    d = wp.classify(_brex_proposal(), _brex_finding(), _dept_ctx())
+    assert d.tier == wp.TIER_DIRECT and d.grounding_kind == wp.KIND_DEPARTMENT_ENTITY
+    assert d.department == "finance" and "Finance watched entity" in d.reasons[0]
+    out = wp.apply_proposals([_brex_proposal()], [_brex_finding()], _dept_ctx(), db_path=db)
+    assert [o["outcome"] for o in out] == ["added"]
+    row = ms.get_watchlist_item_by_slug("vendor-brex", db_path=db)
+    assert row is not None and row.mode == MODE_ACTIVE
+    assert row.route_to_department == "finance" and row.route_to_person_id == 7
+    assert wp.policy_stamp_of(row)["department"] == "finance"
+
+
+def test_department_scope_grounding_is_suggestion_only(db: Path) -> None:
+    p = _proposal(slug="rss-expense", signal_type="rss", target="https://expensecards.example/feed",
+                  grounding_entity="Expense card programs")
+    f = _finding(title="Expense card programs shift", summary="New expense card programs launched.",
+                 relevant_urls=["https://expensecards.example/feed"],
+                 source_specialist="cfo,coo")
+    d = wp.classify(p, f, _dept_ctx())
+    assert d.tier == wp.TIER_SUGGEST and d.department == "finance"
+    assert d.grounding_kind == wp.KIND_DEPARTMENT_SCOPE and "Finance scope item" in d.reasons[0]
+    # Even on its own source a scope item cannot be direct.
+    own = _proposal(slug="rss-programs", signal_type="rss", target="https://expense.example/feed",
+                    grounding_entity="Expense card programs")
+    own_f = _finding(title="programs", summary="s", relevant_urls=["https://expense.example/feed"],
+                     source_specialist="cfo,coo")
+    own_d = wp.classify(own, own_f, _dept_ctx())
+    assert own_d.tier == wp.TIER_SUGGEST and any("grounded only in a department_scope" in r for r in own_d.reasons)
+    out = wp.apply_proposals([p], [f], _dept_ctx(), db_path=db)
+    assert out[0]["outcome"] == "suggested"
+    row = ms.get_watchlist_item_by_slug("rss-expense", db_path=db)
+    assert row is not None and row.mode == MODE_DRY_RUN and row.route_to_department == "finance"
+
+
+def test_recent_decision_adds_a_point_and_a_routing_hint() -> None:
+    decided = SimpleNamespace(summary="Evaluate Stripe as the EU payments vendor",
+                              department="finance", timestamp="2026-09-01T00:00:00+00:00")
+    p = _proposal(slug="vendor-stripe", signal_type="vendor_status", target="https://status.stripe.com",
+                  grounding_entity="Stripe")
+    f = _finding(title="Stripe incident", summary="Stripe API errors on 2026-09-01.",
+                 relevant_urls=["https://status.stripe.com/"], confidence="medium")
+    base = wp.classify(p, f, _dept_ctx())
+    with_decision = wp.classify(p, f, _dept_ctx(recent_decisions=[decided]))
+    assert with_decision.score == base.score + 1 and "named in a recent decision" in with_decision.reasons
+    # Stripe is a profile vendor with no department; the decision's is used.
+    assert base.department == "" and with_decision.department == "finance"
+    # A decision for an unknown department is not a routing hint, and one
+    # that names nothing relevant scores nothing.
+    other = SimpleNamespace(summary="Move Stripe to annual billing", department="ops", timestamp="")
+    assert wp.classify(p, f, _dept_ctx(recent_decisions=[other])).department == ""
+    unrelated = SimpleNamespace(summary="Hire two SDRs in Q4", department="finance", timestamp="")
+    assert wp.classify(p, f, _dept_ctx(recent_decisions=[unrelated])).score == base.score
+    assert wp.named_in_decision("acme corp", SimpleNamespace(summary="Acme Corp pricing review"))
+    assert wp.named_in_decision("acme corp", SimpleNamespace(summary="Acme pricing review"))
+    assert not wp.named_in_decision("acme corp", SimpleNamespace(summary="The corp retreat"))
+    # Every distinctive token must appear: a common word shared with the
+    # term is not a mention, and a watch label never earns the point.
+    assert not wp.named_in_decision("acme security", SimpleNamespace(summary="Review the security policy"))
+    hijack = SimpleNamespace(summary="Adopt the new pricing policy", department="finance", timestamp="")
+    label_only = _proposal(slug="rss-hubs", signal_type="rss", target="https://hubspot.com/feed",
+                           grounding_entity="HubSpot pricing")
+    ctx = _dept_ctx(existing=[SimpleNamespace(
+        slug="stock-hubs", signal_type="stock", target="HUBS", enabled=True,
+        config_json={"display_name": "HubSpot pricing"},
+    )], recent_decisions=[hijack])
+    labelled = wp.classify(label_only, _finding(), ctx)
+    assert labelled.grounding_kind == wp.KIND_WATCH and labelled.department == ""
+    assert "named in a recent decision" not in labelled.reasons
+
+
+def test_recent_decisions_apply_the_lookback(db: Path) -> None:
+    from openexecutive.memory.episodic import store_decision
+
+    store_decision("finance", "Evaluate Brex for expense cards", db_path=db)
+    store_decision("ops", "Retire the old CRM", db_path=db)
+    import sqlite3
+
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE decisions SET timestamp = ? WHERE summary = 'Retire the old CRM'",
+                     ((datetime.now(UTC) - timedelta(days=120)).isoformat(),))
+    rows = wp.recent_decisions(db_path=db)
+    assert [r.summary for r in rows] == ["Evaluate Brex for expense cards"]
+    # An unreadable timestamp is not "recent forever".
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE decisions SET timestamp = 'garbage'")
+    assert wp.recent_decisions(db_path=db) == []
+
+
+def test_department_head_gets_one_card_per_run_coalesced_weekly(db: Path) -> None:
+    from openexecutive.alerts.store import list_alerts, set_status
+    from openexecutive.people import store as people_store
+
+    head = people_store.upsert_person(full_name="Sarah", department_slugs=["finance"])
+    finance = _finance(head=head)
+
+    def _run(slug: str, now: datetime) -> None:
+        p = _proposal(slug=slug, signal_type="rss", target=f"https://{slug}.example/feed",
+                      grounding_entity="Expense card programs", rationale="line one\n- forged bullet")
+        f = _finding(title="Expense card programs", summary="expense card programs news",
+                     relevant_urls=[f"https://{slug}.example/feed"])
+        wp.apply_proposals([p], [f], _dept_ctx(finance, now=now), db_path=db)
+
+    now = datetime(2026, 9, 8, 9, tzinfo=UTC)
+    _run("rss-a", now)
+    cards = [a for a in list_alerts(limit=20, db_path=db) if a.source == "authority_gate"]
+    assert len(cards) == 1 and cards[0].routed_to_person_id == head
+    assert cards[0].headline == "Watch suggestions for Finance" and "rss-a" in cards[0].body
+    # Rationale newlines cannot forge extra bullet lines in the head's card.
+    assert "line one - forged bullet" in cards[0].body and "\n- forged bullet" not in cards[0].body
+    assert "department:finance" in cards[0].topic_tags and "watchlist" in cards[0].topic_tags
+    # Same week again: the open card is refreshed, not duplicated.
+    _run("rss-b", now + timedelta(days=1))
+    cards = [a for a in list_alerts(limit=20, db_path=db) if a.source == "authority_gate"]
+    assert len(cards) == 1 and "rss-b" in cards[0].body
+    # Once the head acted on it, nothing more this week ...
+    set_status(cards[0].id, "acknowledged", db_path=db)
+    _run("rss-c", now + timedelta(days=2))
+    assert len([a for a in list_alerts(limit=20, db_path=db) if a.source == "authority_gate"]) == 1
+    # ... and a fresh card next week.
+    _run("rss-d", now + timedelta(days=7))
+    assert len([a for a in list_alerts(limit=20, db_path=db) if a.source == "authority_gate"]) == 2
+
+
+def test_department_card_falls_back_to_the_principal(db: Path) -> None:
+    from openexecutive.alerts.store import list_alerts
+    from openexecutive.people import store as people_store
+
+    principal = people_store.upsert_person(full_name="Jo", is_principal=True)
+    p = _proposal(slug="rss-x", signal_type="rss", target="https://x.example/feed",
+                  grounding_entity="Expense card programs")
+    f = _finding(title="Expense card programs", summary="s", relevant_urls=["https://x.example/feed"])
+    wp.apply_proposals([p], [f], _dept_ctx(_finance(head=None)), db_path=db)
+    cards = [a for a in list_alerts(limit=20, db_path=db) if a.source == "authority_gate"]
+    assert len(cards) == 1 and cards[0].routed_to_person_id == principal
+    row = ms.get_watchlist_item_by_slug("rss-x", db_path=db)
+    assert row is not None and row.route_to_department == "finance" and row.route_to_person_id is None
+
+
+def test_nudge_counts_only_suggestions_no_head_received(db: Path) -> None:
+    from openexecutive.alerts.store import list_alerts
+
+    for i in range(3):
+        ms.insert_watchlist_item(
+            slug=f"rss-d{i}", signal_type="rss", target=f"https://d{i}.com/feed",
+            mode=MODE_DRY_RUN, origin=ORIGIN_RESEARCH_PROPOSED, route_to_department="finance",
+            route_to_person_id=7, db_path=db,
+        )
+        _backdate(db, f"rss-d{i}", 8)
+    assert wp.sweep(datetime.now(UTC), db_path=db)["nudged"] == 0
+    assert not [a for a in list_alerts(limit=10, db_path=db) if a.source == wp.NUDGE_ALERT_SOURCE]
+    # A department without a head is still the principal's pile: those rows
+    # count, so they can never become invisible.
+    for i in range(3):
+        ms.insert_watchlist_item(
+            slug=f"rss-n{i}", signal_type="rss", target=f"https://n{i}.com/feed",
+            mode=MODE_DRY_RUN, origin=ORIGIN_RESEARCH_PROPOSED, route_to_department="ops",
+            db_path=db,
+        )
+        _backdate(db, f"rss-n{i}", 8)
+    assert wp.sweep(datetime.now(UTC), db_path=db)["nudged"] == 1
+
+
+# --------------------------------------------------------------------- #
+# Profile entry parsing, short names, finding auto-link
+# --------------------------------------------------------------------- #
+
+
+def test_entity_names_parse_profile_entries() -> None:
+    assert wp.entity_names("Tesla (TSLA) — Model Y is the volume benchmark") == (["Tesla"], ["TSLA"], [])
+    assert wp.entity_names("GM / Chevrolet (Equinox EV, Blazer EV) — direct competitor") == (["GM", "Chevrolet"], [], [])
+    assert wp.entity_names("BYD — global cost leader; tariff-gated out of the US") == (["BYD"], [], [])
+    assert wp.entity_names("Hyundai / Kia (Ioniq 5, EV6, EV9) - strong value") == (["Hyundai", "Kia"], [], [])
+    assert wp.entity_names("BYD (1211.HK)") == (["BYD"], ["1211.HK"], [])
+    assert wp.entity_names("Stripe: payments") == (["Stripe"], [], [])
+    assert wp.entity_names("Brex (brex.com, status.brex.com) — expense cards") == (["Brex"], [], ["brex.com", "status.brex.com"])
+    # A parenthesised list, or a product name, is never a ticker; hyphenated
+    # names survive; whitespace and length are bounded.
+    assert wp.entity_names("Apple (IOS, MAC) — CarPlay") == (["Apple"], [], [])
+    assert wp.entity_names("Mercedes-Benz (MBG.DE)") == (["Mercedes-Benz"], ["MBG.DE"], [])
+    assert wp.entity_names("Acme" + " " * 100000 + "Corp — x").names == ["Acme Corp"]
+    assert wp.entity_names("  ") == ([], [], [])
+    # Dashes without spaces still split; ordinary abbreviations are not
+    # tickers; lower-case tickers are upper-cased; a URL entry grounds as its
+    # site label with the host pinned; nested parentheses are stripped.
+    assert wp.entity_names("Tesla (TSLA)—Model Y is the volume benchmark") == (["Tesla"], ["TSLA"], [])
+    assert wp.entity_names("Stripe (US, EU) — payments").tickers == []
+    assert wp.entity_names("Gartner (IT) — research").tickers == []
+    assert wp.entity_names("Tesla (tsla)") == (["Tesla"], [], [])  # tickers are typed in capitals
+    # Only the name part's parentheses are read: description text can
+    # neither pin a domain nor mint a ticker; a capitalised brand or a
+    # product name is never a ticker; one-letter tickers and a ticker
+    # beside a host both work; text after a ticker symbol is a note.
+    assert wp.entity_names("BYD — cost leader (byd-watch.com)") == (["BYD"], [], [])
+    assert wp.entity_names("Tesla — the (BEV) leader").tickers == []
+    assert wp.entity_names("Alphabet (Waymo) — self-driving") == (["Alphabet"], [], [])
+    assert wp.entity_names("Ford (F) — legacy OEM") == (["Ford"], ["F"], [])
+    assert wp.entity_names("Acme Corp (ACME, acme.com)") == (["Acme Corp"], ["ACME"], ["acme.com"])
+    assert wp.entity_names("GM (GM.COM)") == (["GM"], [], ["gm.com"])  # a host typed in capitals
+    assert wp.entity_names("GM (gm.com.)") == (["GM"], [], ["gm.com"])
+    assert wp.entity_names("Apple (Siri) — assistant") == (["Apple"], [], [])
+    assert wp.entity_names("Acme (Mach-E) - EVs") == (["Acme"], [], [])
+    assert wp.ticker_symbol("NVDA — our supplier") == "NVDA"
+    assert wp.ticker_symbol("1211.HK (BYD)") == "1211.HK"
+    profile = CompanyProfile.model_validate({"name": "X", "tickers": ["NVDA — our supplier", "f"]})
+    tick_vocab = wp.grounding_vocabulary(profile, [], [])
+    assert wp.match_entity("NVDA", tick_vocab) == ("nvda", wp.KIND_TICKER)
+    assert wp.match_entity("F", tick_vocab) == ("f", wp.KIND_TICKER)
+    assert wp.entity_names("https://status.stripe.com") == (["stripe"], [], ["status.stripe.com"])
+    assert wp.entity_names("GM (Chevrolet (EV) brand)") == (["GM"], [], [])
+    assert wp.entity_names("Stripe (stripe.com/blog; payments)").names == ["Stripe"]
+
+
+def _descriptive_profile() -> CompanyProfile:
+    return CompanyProfile.model_validate({
+        "name": "Halcyon Motors",
+        "competitive_landscape": {"primary_competitors": [
+            "Tesla (TSLA) — Model Y is the volume benchmark and price-cut pace-setter",
+            "BYD — global cost leader; tariff-gated out of the US for now",
+            "GM / Chevrolet (Equinox EV, Blazer EV) — direct mainstream-price competitor",
+            "Hyundai / Kia (Ioniq 5, EV6, EV9) — strong value + charging speed",
+        ]},
+        "vendors": ["CATL — sole LFP cell source"],
+        "tickers": ["1211.HK"],
+    })
+
+
+def test_descriptive_profile_entries_ground_by_name_only() -> None:
+    vocab = wp.grounding_vocabulary(_descriptive_profile(), [], [])
+    assert vocab["tesla"].kind == wp.KIND_COMPETITOR and vocab["tsla"].kind == wp.KIND_TICKER
+    assert vocab["byd"].kind == wp.KIND_COMPETITOR and vocab["gm"].kind == wp.KIND_COMPETITOR
+    assert vocab["chevrolet"].kind == wp.KIND_COMPETITOR and vocab["kia"].kind == wp.KIND_COMPETITOR
+    assert vocab["catl"].kind == wp.KIND_VENDOR and vocab["1211 hk"].kind == wp.KIND_TICKER
+    # The description never becomes a term, so "Model Y" or "global" ground nothing.
+    assert wp.match_entity("Model Y", vocab) is None and wp.match_entity("global cost leader", vocab) is None
+    # Short names match as whole words, in longer forms too.
+    assert wp.match_entity("BYD", vocab) == ("byd", wp.KIND_COMPETITOR)
+    assert wp.match_entity("BYD Auto", vocab) == ("byd", wp.KIND_COMPETITOR)
+    assert wp.match_entity("GM", vocab) == ("gm", wp.KIND_COMPETITOR)
+    assert wp.match_entity("General Motors", vocab) is None  # a different name is not a match
+    # A ticker grounds only as itself: never as part of a longer name.
+    assert wp.match_entity("TSLA", vocab) == ("tsla", wp.KIND_TICKER)
+    assert wp.match_entity("TSLA Holdings", vocab) is None
+    assert wp.match_entity("1211.HK", vocab) == ("1211 hk", wp.KIND_TICKER)
+
+
+def test_short_names_get_own_source_and_finding_support() -> None:
+    profile = _descriptive_profile()
+    vocab = wp.grounding_vocabulary(profile, [], [])
+    ctx = wp.PolicyContext(vocabulary=vocab, priority_terms=[], existing=[])
+    f = _finding(title="BYD enters Mexico", summary="BYD launched the Seal in Mexico on 2026-09-05.",
+                 relevant_urls=["https://www.byd.com/news/mexico"], source_specialist="cso")
+    p = _proposal(slug="rss-byd", target="https://www.byd.com/news/feed", grounding_entity="BYD")
+    d = wp.classify(p, f, ctx)
+    assert d.tier == wp.TIER_DIRECT and "target is the entity's own source" in d.reasons
+    # A look-alike registration carries the same site label, so it passes the
+    # label rule — pinning the entity's domains in the profile closes that.
+    look_alike = _proposal(slug="rss-byd-fake", target="https://byd.co.ke/feed", grounding_entity="BYD")
+    fake_f = f.model_copy(update={"relevant_urls": ["https://byd.co.ke/news"]})
+    assert wp.classify(look_alike, fake_f, ctx).tier == wp.TIER_DIRECT
+    pinned = CompanyProfile.model_validate({
+        "name": "X", "competitive_landscape": {"primary_competitors": ["BYD (byd.com) — cost leader"]},
+    })
+    pinned_ctx = wp.PolicyContext(vocabulary=wp.grounding_vocabulary(pinned, [], []), priority_terms=[], existing=[])
+    assert pinned_ctx.vocabulary["byd"].domains == ("byd.com",)
+    fake_d = wp.classify(look_alike, fake_f, pinned_ctx)
+    assert fake_d.tier == wp.TIER_SUGGEST and "target is the entity's own source" not in fake_d.reasons
+    assert wp.classify(p, f, pinned_ctx).tier == wp.TIER_DIRECT
+    # A subdomain of a pinned host is the entity's; a host that merely ends
+    # in the pinned name is not.
+    sub = _proposal(slug="rss-byd-news", target="https://news.byd.com/feed", grounding_entity="BYD")
+    assert wp._is_own_source(sub, "byd", pinned_ctx.vocabulary)
+    evil = _proposal(slug="rss-byd-evil", target="https://byd.com.evil.example/feed", grounding_entity="BYD")
+    assert not wp._is_own_source(evil, "byd", pinned_ctx.vocabulary)
+    # A dotted ticker: own source when grounded as the ticker, and named in
+    # text as a phrase.
+    f2 = _finding(title="BYD (1211.HK) slides", summary="1211.HK fell 6% on 2026-09-05.", relevant_urls=[])
+    stock = _proposal(slug="stock-byd", signal_type="stock", target="1211.HK", grounding_entity="1211.HK")
+    d2 = wp.classify(stock, f2, ctx)
+    assert d2.tier == wp.TIER_DIRECT and d2.grounding_kind == wp.KIND_TICKER
+    # Grounded as the competitor name instead, the ticker is not its own
+    # source, so it is a suggestion.
+    assert wp.classify(_proposal(slug="stock-byd2", signal_type="stock", target="1211.HK",
+                                 grounding_entity="BYD"), f2, ctx).tier == wp.TIER_SUGGEST
+    decided = SimpleNamespace(summary="Benchmark C1 pricing against BYD monthly", department="", timestamp="")
+    assert wp.named_in_decision("byd", decided, vocab)
+    # A short name inside a longer term needs the vocabulary to count.
+    two_word = SimpleNamespace(summary="Benchmark against BYD Auto monthly", department="", timestamp="")
+    assert wp.named_in_decision("byd auto", two_word, vocab)
+    # Every distinctive word must appear: "BYD Auto" is not named by "BYD pricing".
+    assert not wp.named_in_decision("byd auto", SimpleNamespace(summary="Watch BYD pricing"), vocab)
+    assert wp.entity_declined("BYD Auto", [SimpleNamespace(reason="not_relevant", entity="BYD")])
+    assert not wp.entity_declined("Rivian", [SimpleNamespace(reason="not_relevant", entity="BYD")])
+    # A generic declined word never blocks, and a longer declined name does
+    # not block the short profile name inside it.
+    assert not wp.entity_declined("Acme Data Systems", [SimpleNamespace(reason="not_relevant", entity="data")])
+    assert not wp.entity_declined("GM", [SimpleNamespace(reason="not_relevant", entity="GM Financial")])
+
+
+def test_proposal_without_finding_index_is_linked_to_the_citing_finding(db: Path) -> None:
+    findings = [
+        _finding(title="Unrelated", summary="Globex raised prices.", relevant_urls=["https://globex.com/blog"]),
+        _finding(title="Acme cut prices", summary="Acme Corp cut list prices 20%.",
+                 relevant_urls=["https://www.acme.com/blog/pricing"]),
+        _finding(title="ACME slides", summary="ACME fell 8% on 2026-09-01.", relevant_urls=[]),
+    ]
+    ctx = _ctx()
+    unlinked = _proposal(finding_index=None)
+    assert wp.auto_link_finding(unlinked, findings, ctx) == 1
+    stock = _proposal(slug="stock-acme", signal_type="stock", target="ACME", grounding_entity="ACME",
+                      finding_index=None)
+    assert wp.auto_link_finding(stock, findings, ctx) == 1  # names the entity first
+    nowhere = _proposal(slug="rss-else", target="https://elsewhere.com/feed", grounding_entity="Acme Corp",
+                        finding_index=None)
+    assert wp.auto_link_finding(nowhere, findings, ctx) is None
+    # A guessed index that does not concern the source is repaired too.
+    wrong = _proposal(finding_index=0)
+    out = wp.apply_proposals([unlinked, nowhere, wrong], findings, ctx, db_path=db)
+    assert [o["outcome"] for o in out] == ["added", "rejected", "rejected"]  # 3rd: same source as 1st
+    assert "duplicate target" in out[2]["result_preview"]
+    row = ms.get_watchlist_item_by_slug("rss-acme-blog", db_path=db)
+    assert row is not None
+    assert wp.policy_stamp_of(row)["reasons"][0] == "linked to finding #2, which concerns this source"
+    assert wp.policy_stamp_of(row)["specialist"] == "cso"
+    assert wp.policy_stamp_of(row)["source_url"] == "https://www.acme.com/blog/pricing"
+    assert unlinked.finding_index is None  # the caller's proposal is left as filed
+    repaired = wp.apply_proposals([_proposal(slug="rss-acme-2", target="https://acme.com/news/feed",
+                                             finding_index=0)], findings, ctx, db_path=db)
+    assert repaired[0]["outcome"] == "added"
+    row2 = ms.get_watchlist_item_by_slug("rss-acme-2", db_path=db)
+    assert row2 is not None and wp.policy_stamp_of(row2)["reasons"][0].endswith("(the cited #1 did not)")
+    # A cited finding that does not concern the source, with nothing better
+    # to link, still makes the proposal a suggestion (it came from research)
+    # but is never the evidence link shown beside Approve.
+    stray = wp.apply_proposals([_proposal(slug="rss-stray", target="https://elsewhere.com/feed",
+                                          grounding_entity="Acme Corp", finding_index=0)], findings, ctx, db_path=db)
+    assert stray[0]["outcome"] == "suggested"
+    stray_row = ms.get_watchlist_item_by_slug("rss-stray", db_path=db)
+    assert stray_row is not None and wp.policy_stamp_of(stray_row)["source_url"] == ""
+
+
+def test_auto_link_prefers_the_finding_that_cites_the_source() -> None:
+    ctx = _ctx()
+    findings = [
+        _finding(title="Globex beats, Acme called a laggard", summary="Acme lags Globex; Initech too.",
+                 relevant_urls=["https://globex.com/ir/q3"],
+                 source_specialist="cfo,cso"),
+        _finding(title="Acme Q3", summary="ACME reported Q3.", relevant_urls=["https://acme.com/ir/q3"],
+                 confidence="medium"),
+    ]
+    stock = _proposal(slug="stock-acme", signal_type="stock", target="ACME", grounding_entity="ACME",
+                      finding_index=None)
+    assert wp.auto_link_finding(stock, findings, ctx) == 1  # names the ticker, not just the entity
+    # With the entity's domains pinned, only a finding citing those sites
+    # counts as "the entity's site" — a look-alike page cannot shop for the
+    # evidence slot.
+    pinned = CompanyProfile.model_validate({"name": "X", "competitive_landscape": {
+        "primary_competitors": ["GM (gm.com)"]}})
+    pctx = wp.PolicyContext(vocabulary=wp.grounding_vocabulary(pinned, [], []), priority_terms=[], existing=[])
+    gm_findings = [
+        _finding(title="GM recall", summary="GM recalled the Blazer EV.", relevant_urls=["https://news.gm.com/x"],
+                 confidence="medium"),
+        _finding(title="GM news", summary="GM slashes prices.", relevant_urls=["https://gm.co.ke/news"],
+                 source_specialist="cso,cfo"),
+    ]
+    gm = _proposal(slug="stock-gm", signal_type="stock", target="GM", grounding_entity="GM", finding_index=None)
+    assert wp.auto_link_finding(gm, gm_findings, pctx) == 0
+    feed = _proposal(slug="rss-acme-ir", target="https://acme.com/ir/feed", grounding_entity="Acme Corp",
+                     finding_index=None)
+    assert wp.auto_link_finding(feed, findings, ctx) == 1  # cites the site
+    # An entity outside company data never links by name (classify would
+    # not honour it either); a cited site still does.
+    stranger = _proposal(slug="stock-intc", signal_type="stock", target="INTC", grounding_entity="Initech Holdings",
+                         finding_index=None)
+    assert wp.auto_link_finding(stranger, findings, ctx) is None
+
+
+def test_budgets_go_to_the_strongest_proposals_not_the_earliest(db: Path) -> None:
+    """The dev run that motivated this: two score-3 suggestions filed first
+    took the whole suggestion budget, and a score-4 Finance watched-entity
+    proposal filed third was rejected as over budget. Proposals are now
+    applied strongest first; summaries keep file order; ties keep file
+    order (the first-filed of the two score-3 proposals survives)."""
+    ctx = _dept_ctx(settings=wp.PolicySettings(max_direct_adds=2, max_suggestions=2))
+    # Two query watches (always suggestions) grounded in a competitor and a
+    # vendor: score 3 each. Brex on its own status page, a Finance watched
+    # entity, high-confidence finding: score 4, marked unsure.
+    weak_a = _proposal(slug="q-globex", signal_type="query", target="Globex pricing moves",
+                       grounding_entity="Globex", finding_index=0)
+    weak_b = _proposal(slug="q-stripe", signal_type="query", target="Stripe outage history",
+                       grounding_entity="Stripe", finding_index=1)
+    strong = _brex_proposal(finding_index=2, certainty="unsure")
+    findings = [
+        _finding(title="Globex cuts prices", summary="Globex cut list prices 10%.", confidence="high",
+                 relevant_urls=["https://globex.com/pricing"]),
+        _finding(title="Stripe outage", summary="Stripe had a two-hour outage.", confidence="high",
+                 relevant_urls=["https://status.stripe.com/incidents/9"]),
+        _brex_finding(),
+    ]
+    out = wp.apply_proposals([weak_a, weak_b, strong], findings, ctx, db_path=db)
+    assert [(o["slug"], o["outcome"]) for o in out] == [
+        ("q-globex", "suggested"), ("q-stripe", "rejected"), (strong.slug, "suggested"),
+    ]
+    assert "suggestion budget spent this run" in out[1]["result_preview"]
+
+
+def test_duplicate_target_keeps_its_strongest_filing(db: Path) -> None:
+    weak = _proposal(slug="rss-weak", grounding_entity="Initech")  # not in company data
+    strong = _proposal(slug="rss-strong", grounding_entity="Acme Corp")  # same target, direct
+    out = wp.apply_proposals([weak, strong], [_finding()], _ctx(), db_path=db)
+    assert [(o["slug"], o["outcome"]) for o in out] == [("rss-weak", "rejected"), ("rss-strong", "added")]
+    assert "duplicate target" in out[0]["result_preview"]
+
+
+def test_a_direct_add_outranks_a_higher_scoring_suggestion_for_the_last_slot(db: Path) -> None:
+    """Score is not the whole story: a standing query can outscore a direct
+    add but can only ever be a suggestion, so at the enabled-watch ceiling
+    the live add must take the slot."""
+    ctx = _ctx(settings=wp.PolicySettings(max_enabled=1, max_direct_adds=2, max_suggestions=2),
+               recent_decisions=[SimpleNamespace(summary="Globex pricing review", department="")])
+    direct = _proposal(slug="rss-acme-blog", finding_index=1)
+    query = _proposal(slug="q-globex", signal_type="query", target="Globex pricing moves",
+                      grounding_entity="Globex", finding_index=0)
+    findings = [
+        _finding(title="Globex cuts prices", summary="Globex cut list prices 10%.", confidence="high",
+                 source_specialist="cso,cfo"),
+        _finding(),
+    ]
+    out = wp.apply_proposals([direct, query], findings, ctx, db_path=db)
+    assert [(o["slug"], o["outcome"]) for o in out] == [("rss-acme-blog", "added"), ("q-globex", "rejected")]
+
+
+def test_a_stronger_insert_makes_a_weaker_same_site_proposal_already_watched(db: Path) -> None:
+    """The persisting pass classifies again, so the row inserted for the
+    stronger proposal is 'already watched' for a weaker one on its site."""
+    strong = _proposal(slug="rss-acme-blog", target="https://www.acme.com/blog/feed.xml")
+    weaker = _proposal(slug="rss-acme-news", target="https://www.acme.com/news/feed.xml",
+                       certainty="unsure")  # same site, a suggestion at most
+    out = wp.apply_proposals([weaker, strong], [_finding()], _ctx(), db_path=db)
+    assert [(o["slug"], o["outcome"]) for o in out] == [("rss-acme-news", "rejected"), ("rss-acme-blog", "added")]
+    assert "already watched" in out[0]["result_preview"]

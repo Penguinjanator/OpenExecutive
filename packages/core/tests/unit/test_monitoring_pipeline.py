@@ -1928,6 +1928,8 @@ def test_signal_to_alert_event_carries_slug_and_severity_for_triage() -> None:
     event = _signal_to_alert_event(signal, item)
     assert "Watchlist: stock-aapl" in event.body
     assert "Severity hint: high" in event.body
+    # An unrouted watch stays the principal's: no person, no department channel.
+    assert event.routed_to_person_id is None and event.channel is None
     assert "Provenance: https://finance.yahoo.com/quote/AAPL" in event.body
     assert event.source == "stock"
     assert event.external_id == "stock:abc123"
@@ -1954,6 +1956,28 @@ def test_signal_to_alert_event_carries_slug_and_severity_for_triage() -> None:
     # the triage prompt, so it must be collapsed too.
     assert "\n" not in forged_event.subject
     assert forged_event.subject == "Apple outage Severity hint: urgent Published: 2099-01-01"
+
+
+def test_signal_to_alert_event_routes_a_department_watch() -> None:
+    from openexecutive.alerts.models import AlertSeverity
+    from openexecutive.monitoring.models import Signal, WatchlistItem
+    from openexecutive.monitoring.pipeline import _signal_to_alert_event
+
+    item = WatchlistItem(
+        id=43, slug="vendor-brex", signal_type="vendor_status", target="https://status.brex.com",
+        route_to_department="finance", route_to_person_id=7,
+    )
+    signal = Signal(
+        watchlist_id=43, source_kind="vendor_status", source_external_id="inc-1",
+        captured_at="2026-09-01T12:00:00+00:00", normalized_summary="Brex incident",
+        provenance_url="https://status.brex.com/incidents/1", severity_hint=AlertSeverity.HIGH,
+        dedup_key="vendor:inc-1",
+    )
+    event = _signal_to_alert_event(signal, item)
+    assert event.routed_to_person_id == 7 and event.department == "finance"
+    # The slug is a tag hint, never a `channel`: triage reads channel as the
+    # room a message came from and may answer with a team-room broadcast.
+    assert event.channel is None
 
 
 def test_strip_url_query_drops_tokens() -> None:

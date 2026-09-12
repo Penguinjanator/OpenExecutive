@@ -85,15 +85,6 @@ class ResearchFinding(BaseModel):
         default="",
         description="Specialist slug (cso/cfo/...) that surfaced this. Set by the workflow.",
     )
-    verification: str | None = Field(
-        default=None,
-        description=(
-            "Set by the post-dedup verify pass (None when not verified): "
-            "'confirmed' (source backs the claim), 'contradicted', "
-            "'unsupported' (page doesn't support it), or "
-            "'source_unreachable' (cited URL couldn't be scraped)."
-        ),
-    )
 
 
 class ResearchRunSummary(BaseModel):

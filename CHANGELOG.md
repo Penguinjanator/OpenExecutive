@@ -8,13 +8,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Research watch policy grounds in departments and recent decisions, and
+  routes to department heads.** Departments gain a `watched_entities` list
+  (`PATCH /departments/{slug}`, edited one per line on the department page).
+  Named there, an entity is strong grounding for the research watch policy —
+  like a profile vendor or ticker — so a proposal about it can be added on
+  its own, and the watch is inserted with `route_to_department` /
+  `route_to_person_id` (the head). Those columns now actually route: every
+  watch alert carries the department's head and a `department:<slug>` tag,
+  so it queues on the head's briefing instead of the principal's. Charter
+  scope phrases and goal key results ground suggestions only. Suggestions in
+  a department's area go to its head as one "Watch suggestions for
+  <Department>" card per run (refreshed in place, re-issued weekly after it
+  is handled; the principal when the department has no head), and the
+  principal's pile-up nudge counts only their own. The ten most recent
+  episodic decisions from the last 90 days are rendered to the research
+  council and add a point to a proposal whose entity they name (with the
+  decision's department as a routing hint). The research fingerprint tracks
+  department watch interests and the decisions that name a known entity, so
+  a new watched entity or a relevant decision triggers the next scan.
+  `/watchlist` shows "for: <department>" on routed rows.
+- **Watch proposals are linked to their evidence, and profile entries ground
+  by name.** `propose_watch` now requires `finding_index`, and when the model
+  omits it the policy links the finding that cites the source itself instead
+  of rejecting the proposal for lack of evidence. Profile competitor / vendor
+  / ticker entries and department watched entities are parsed to their names
+  ("Tesla (TSLA) — Model Y…" grounds as Tesla plus the ticker TSLA; "GM /
+  Chevrolet (…)" as both), so short names such as BYD, GM or Kia match and
+  the description text can no longer stand in for the entity.
 - **Research watchlist policy — grounded watches go straight in, uncertain
   ones become suggestions.** The research council's watchlist pass no longer
   adds watches itself; its only tool is `propose_watch`, and deterministic
   policy (`monitoring.research.watch_policy`) decides from company data. A
   proposal tied to a named competitor, vendor, ticker, initiative or
   priority (the profile gains `vendors` and `tickers` for this) and
-  corroborated (own source, high-confidence / verified finding, consensus,
+  corroborated (own source, high-confidence finding, consensus,
   the policy's own track record) is added on its own — quietly: daily
   cadence, medium severity floor, a keyword trigger for feeds, 5 % for
   stocks — and shows up in the brief's "handled overnight" block as
@@ -74,6 +102,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dismissing a watch-sourced alert lowers that watch's `trust_score` (and
   bumps `dismiss_count`); approving recovers it. Trust now discounts the
   ranking and is shown to the review as evidence.
+
+### Changed
+- **Specialists are told what departments watch.** The research context
+  every specialist receives now carries a `DEPARTMENT WATCH INTERESTS`
+  block (each department's watched entities), and the grounding rule
+  admits a department interest or a company named in a recent decision.
+  A Finance head who lists Brex now gets Brex findings; before, the
+  specialists were never told and their grounding rule dropped them. The
+  per-specialist finding cap is enforced in the tool schema and the
+  parser, not only in prompt text.
+- **The research run has its own controls.** `RESEARCH_WEB_SEARCH_MAX_USES`
+  (default 3) caps searches per specialist independently of the chat knob;
+  `RESEARCH_SPECIALISTS` picks which of the seven specialists run; the
+  routing pass can no longer start a workflow (`run_workflow` is withheld,
+  `suggest_workflow` remains); the periodic run's default interval moves
+  from 120 to 360 minutes.
+- **Web search reaches every OpenRouter model.** The provider feature gate
+  stripped the web-search tool for non-Claude models, so a research
+  specialist or the Executive pinned to Gemini, GPT, Llama, DeepSeek or
+  Grok ran without search (and the research prompt then told it to emit
+  nothing). The tool is now kept for any OpenRouter model and replaced by
+  OpenRouter's own `openrouter:web_search` server tool (the deprecated web
+  plugin is no longer used); only a self-hosted OpenAI-compatible backend
+  still strips it. The server tool carries the same contract as
+  Anthropic's: the model decides when to search, `max_uses` caps searches
+  server-side, the domain allow/block lists apply, and the search count is
+  reported, so `RESEARCH_WEB_SEARCH_MAX_USES` and `WEB_SEARCH_MAX_USES`
+  mean the same thing on both deployment types.
+- **Per-run watch budgets go to the strongest proposals.** The policy
+  classifies every proposal first and applies them by tier (direct adds
+  before suggestions) and descending score, so when the model files more
+  candidates than the budgets or the ceiling allow, a better-grounded
+  proposal filed later no longer loses its slot to weaker ones filed
+  earlier, and a duplicate target keeps its strongest filing.
+- **Every model call is recorded.** Research specialists, the research
+  routing and watchlist passes, triage and the chat memory extractor now
+  write the same `cache_event` audit row the Executive's chat turns always
+  did (tokens, cache hits, cost, and the server-side web searches the call
+  made). A research run's result and its `watchlist_research_periodic_ran`
+  audit row carry a `usage` block summing its calls per source, and
+  `GET /audit/usage` (and the usage page) gain a by-source breakdown.
+
+### Removed
+- **The xcrawl scrape service and everything that depended on it.** The
+  research run no longer has a post-dedup verify pass or an optional
+  read-before-cite scrape loop, and the watch policy no longer scores a
+  "verified" point; the `XCRAWL_*`, `EXTERNAL_RESEARCH_VERIFY_*`,
+  `RESEARCH_AGENTIC_*`, `RESEARCH_SCRAPE_*` and `RESEARCH_LOOP_*` settings
+  are gone (a deployment that still sets them is unaffected). Every
+  watchlist fetch is the keyless, SSRF-guarded httpx fetcher: a page watch
+  written under the old `fetch: xcrawl` marker re-captures its baseline on
+  the next poll without reporting a change, and an `rss` target that is not
+  a feed becomes a `page_watch` when the page already fetched by the feed
+  check has readable text (otherwise it is rejected, as before).
 
 ### Changed
 - The research routing pass no longer carries the watchlist write tools

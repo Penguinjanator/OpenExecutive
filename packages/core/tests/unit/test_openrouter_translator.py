@@ -247,7 +247,7 @@ def test_request_flattens_user_content_to_string_when_no_cache_control() -> None
     assert user_msg["content"] == "Part one\n\nPart two"
 
 
-def test_request_drops_web_search_tool_but_injects_web_plugin() -> None:
+def test_request_replaces_anthropic_web_search_with_openrouter_server_tool() -> None:
     body = to_openai_request(
         "anthropic/claude-opus-4.7",
         {
@@ -257,43 +257,57 @@ def test_request_drops_web_search_tool_but_injects_web_plugin() -> None:
             ],
         },
     )
-    # The Anthropic server tool has no OpenAI equivalent — it's still dropped
-    # from ``tools`` so the body doesn't carry a phantom function entry...
-    assert "tools" not in body or body["tools"] == []
-    # ...but its intent is reproduced via OpenRouter's ``web`` plugin so search
-    # actually runs (the bug this fixes: research specialists got no search and
-    # emitted zero findings). Default max_results when no max_uses is given.
-    assert body["plugins"] == [{"id": "web", "max_results": 5}]
+    # The Anthropic server tool has no OpenAI equivalent, so it is replaced
+    # in ``tools`` by OpenRouter's own server tool (the bug this fixes:
+    # research specialists got no search and emitted zero findings). With
+    # no max_uses or domain lists there are no parameters.
+    assert body["tools"] == [{"type": "openrouter:web_search"}]
+    assert "plugins" not in body
 
 
-def test_request_web_search_max_uses_maps_to_capped_max_results() -> None:
-    # max_uses within the cap is honored verbatim.
+def test_request_web_search_translates_cap_and_domain_lists() -> None:
+    # max_uses is a search count on both sides: it passes through unchanged,
+    # so RESEARCH_WEB_SEARCH_MAX_USES caps searches via OpenRouter too.
     body = to_openai_request(
+        "google/gemini-2.5-flash",
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"name": "emit", "input_schema": {"type": "object"}},
+                {"type": "web_search_20250305", "name": "web_search", "max_uses": 3,
+                 "allowed_domains": ["sec.gov", "federalregister.gov"]},
+            ],
+        },
+    )
+    assert body["tools"] == [
+        {"type": "function", "function": {"name": "emit", "description": "", "parameters": {"type": "object"}}},
+        {"type": "openrouter:web_search",
+         "parameters": {"max_uses": 3, "allowed_domains": ["sec.gov", "federalregister.gov"]}},
+    ]
+    blocked = to_openai_request(
         "anthropic/claude-opus-4.7",
         {
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [
-                {"type": "web_search_20250305", "name": "web_search", "max_uses": 8},
+                {"type": "web_search_20250305", "name": "web_search", "max_uses": 8,
+                 "blocked_domains": ["example.com"]},
             ],
         },
     )
-    assert body["plugins"] == [{"id": "web", "max_results": 8}]
-
-    # An oversized max_uses is capped so a search *count* can't become an
-    # unbounded result *count* (Exa bills per result).
-    capped = to_openai_request(
-        "anthropic/claude-opus-4.7",
-        {
-            "messages": [{"role": "user", "content": "hi"}],
-            "tools": [
-                {"type": "web_search_20250305", "name": "web_search", "max_uses": 50},
-            ],
-        },
-    )
-    assert capped["plugins"] == [{"id": "web", "max_results": 10}]
+    assert blocked["tools"] == [
+        {"type": "openrouter:web_search",
+         "parameters": {"max_uses": 8, "excluded_domains": ["example.com"]}},
+    ]
+    # A bool or non-positive max_uses is not a cap.
+    for bad in (True, 0, -1, "3"):
+        odd = to_openai_request(
+            "anthropic/claude-opus-4.7",
+            {"messages": [], "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": bad}]},
+        )
+        assert odd["tools"] == [{"type": "openrouter:web_search"}]
 
 
-def test_request_no_web_plugin_without_web_search_tool() -> None:
+def test_request_no_server_tool_without_web_search_tool() -> None:
     body = to_openai_request(
         "anthropic/claude-opus-4.7",
         {
@@ -307,9 +321,69 @@ def test_request_no_web_plugin_without_web_search_tool() -> None:
             ],
         },
     )
-    # Ordinary client tools must not trigger the web plugin.
-    assert "plugins" not in body
+    # Ordinary client tools must not trigger the web-search server tool.
+    assert [t["type"] for t in body["tools"]] == ["function"]
     assert body["tools"][0]["function"]["name"] == "consult_specialist"
+
+
+def test_response_reports_search_count_and_skips_server_tool_calls() -> None:
+    msg = from_openai_response({
+        "id": "x", "model": "anthropic/claude-sonnet-5",
+        "choices": [{"finish_reason": "tool_calls", "message": {
+            "role": "assistant", "content": "done",
+            "tool_calls": [
+                {"id": "s1", "type": "openrouter:web_search", "function": {"name": "web_search", "arguments": "{}"}},
+                {"id": "c1", "type": "function",
+                 "function": {"name": "emit_research_findings", "arguments": "{\"findings\": []}"}},
+            ],
+        }}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2,
+                  "server_tool_use_details": {"web_search_requests": 3, "tool_calls_executed": 3}},
+    })
+    assert msg.usage.server_tool_use.web_search_requests == 3
+    # The flat shape the docs show is accepted as well.
+    flat = from_openai_response({
+        "id": "f", "model": "m",
+        "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "web_search_requests": 2},
+    })
+    assert flat.usage.server_tool_use.web_search_requests == 2
+    assert [b.name for b in msg.content if b.type == "tool_use"] == ["emit_research_findings"]
+    assert msg.stop_reason == "tool_use"  # a client tool call remains
+
+    # Only server-side calls: nothing is left for the caller to run, so the
+    # turn is complete — not "tool_use" with no tool blocks (that would make
+    # the Executive loop append an empty tool-result turn and spin).
+    only_server = from_openai_response({
+        "id": "x", "model": "m",
+        "choices": [{"finish_reason": "tool_calls", "message": {
+            "role": "assistant", "content": "searched and answered",
+            "tool_calls": [{"id": "s1", "type": "openrouter:web_search",
+                            "function": {"name": "web_search", "arguments": "{}"}}],
+        }}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "web_search_requests": 1},
+    })
+    assert only_server.stop_reason == "end_turn"
+    assert [b.type for b in only_server.content] == ["text"]
+
+    # An ordinary function call without a `type` field (quirky backends)
+    # is still a client tool call.
+    untyped = from_openai_response({
+        "id": "x", "model": "m",
+        "choices": [{"finish_reason": "tool_calls", "message": {
+            "role": "assistant", "content": None,
+            "tool_calls": [{"id": "c9", "function": {"name": "emit", "arguments": "{}"}}],
+        }}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    })
+    assert [b.name for b in untyped.content if b.type == "tool_use"] == ["emit"]
+    # Absent → 0, never missing (audit usage reads it on every row).
+    plain = from_openai_response({
+        "id": "y", "model": "m",
+        "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    })
+    assert plain.usage.server_tool_use.web_search_requests == 0
 
 
 def test_request_lifts_assistant_tool_use_blocks_to_tool_calls() -> None:
@@ -666,6 +740,42 @@ def test_response_strips_cite_markup_from_nested_tool_arguments() -> None:
     assert finding["relevant_urls"] == ["https://example.com/crude"]
 
 
+def test_response_parses_tool_arguments_with_raw_cite_markup(monkeypatch) -> None:
+    """The web plugin's <cite> markup inside an argument string carries
+    unescaped quotes; stripping it before parsing keeps the payload."""
+    raw = '{"findings": [{"title": "Acme<cite index="3-14">raised</cite> $5M"}]}'
+    msg = from_openai_response({
+        "id": "x", "model": "google/gemini-2.5-flash",
+        "choices": [{"finish_reason": "tool_calls", "message": {
+            "role": "assistant", "content": None,
+            "tool_calls": [{"id": "c1", "type": "function",
+                            "function": {"name": "emit_research_findings", "arguments": raw}}],
+        }}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    })
+    block = next(b for b in msg.content if b.type == "tool_use")
+    assert block.input == {"findings": [{"title": "Acmeraised $5M"}]}
+
+    # Arguments that still do not parse are logged, not silently emptied.
+    # Patch the module logger directly: earlier tests may reconfigure
+    # logging propagation, which would make caplog miss the record.
+    from openexecutive.providers import translator as tr
+    warnings: list[str] = []
+    monkeypatch.setattr(tr.logger, "warning", lambda msg, *a, **k: warnings.append(msg % a if a else msg))
+    if True:
+        bad = from_openai_response({
+            "id": "x", "model": "m",
+            "choices": [{"finish_reason": "tool_calls", "message": {
+                "role": "assistant", "content": None,
+                "tool_calls": [{"id": "c2", "type": "function",
+                                "function": {"name": "emit_research_findings", "arguments": "{not json"}}],
+            }}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        })
+    assert next(b for b in bad.content if b.type == "tool_use").input == {}
+    assert any("unparseable JSON arguments" in w for w in warnings)
+
+
 def test_response_strips_orphan_closing_cite_tag() -> None:
     """A fragment carrying only a closing ``</cite>`` (no matching open) must
     still be stripped — the fast-path guard must not skip it."""
@@ -949,3 +1059,45 @@ def test_stream_accumulator_emits_legitimate_trailing_text_with_angle_bracket() 
             if ev.type == "content_block_delta" and ev.delta.type == "text_delta":
                 streamed += ev.delta.text
     assert streamed == "5 < 10 is true."
+
+
+def test_stream_accumulator_reports_search_count() -> None:
+    acc = StreamAccumulator()
+    acc.feed({"id": "s", "model": "m", "choices": [{"delta": {"content": "hi"}, "finish_reason": None}]})
+    acc.feed({"id": "s", "model": "m", "choices": [{"delta": {}, "finish_reason": "stop"}],
+              "usage": {"prompt_tokens": 5, "completion_tokens": 1,
+                        "server_tool_use_details": {"web_search_requests": 2}}})
+    msg = acc.finalize()
+    assert msg.usage.server_tool_use.web_search_requests == 2
+
+
+def test_stream_accumulator_drops_server_tool_call_continuation_chunks() -> None:
+    """A server-side call is typed only on its first delta; the argument
+    chunks that follow carry just index + arguments and must be dropped with
+    it, or a phantom tool_use with an empty id and name would be emitted."""
+    acc = StreamAccumulator()
+    acc.feed({"id": "s", "model": "m", "choices": [{"delta": {"tool_calls": [
+        {"index": 0, "id": "srv_1", "type": "openrouter:web_search",
+         "function": {"name": "web_search", "arguments": ""}}]}, "finish_reason": None}]})
+    acc.feed({"id": "s", "model": "m", "choices": [{"delta": {"tool_calls": [
+        {"index": 0, "function": {"arguments": "{\"query\": \"acme layoffs\"}"}}]}, "finish_reason": None}]})
+    acc.feed({"id": "s", "model": "m", "choices": [{"delta": {"tool_calls": [
+        {"index": 1, "id": "c1", "type": "function",
+         "function": {"name": "consult_specialist", "arguments": "{\"q\": 1}"}}]}, "finish_reason": None}]})
+    acc.feed({"id": "s", "model": "m", "choices": [{"delta": {"content": "Acme cut staff."},
+                                                    "finish_reason": "tool_calls"}]})
+    msg = acc.finalize()
+    tool_uses = [b for b in msg.content if b.type == "tool_use"]
+    assert [(b.id, b.name) for b in tool_uses] == [("c1", "consult_specialist")]
+    assert msg.stop_reason == "tool_use"
+
+    # Only a server-side call in the stream: the turn is complete.
+    acc2 = StreamAccumulator()
+    acc2.feed({"id": "s", "model": "m", "choices": [{"delta": {"tool_calls": [
+        {"index": 0, "id": "srv_1", "type": "openrouter:web_search",
+         "function": {"name": "web_search", "arguments": ""}}]}, "finish_reason": None}]})
+    acc2.feed({"id": "s", "model": "m", "choices": [{"delta": {"tool_calls": [
+        {"index": 0, "function": {"arguments": "{}"}}]}, "finish_reason": None}]})
+    acc2.feed({"id": "s", "model": "m", "choices": [{"delta": {"content": "done"}, "finish_reason": "tool_calls"}]})
+    final = acc2.finalize()
+    assert [b.type for b in final.content] == ["text"] and final.stop_reason == "end_turn"

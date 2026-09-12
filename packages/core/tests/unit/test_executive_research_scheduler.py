@@ -25,6 +25,10 @@ def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monitoring_store.initialize_db(db_path)
     monkeypatch.setattr("openexecutive.people.store.DB_PATH", db_path)
     initialize_people_db(db_path)
+    monkeypatch.setattr("openexecutive.departments.store.DB_PATH", db_path)
+    from openexecutive.departments import store as dept_store
+
+    dept_store.initialize_db(db_path)
     audit_db = AuditLogger(db_path=db_path)
     audit_db.initialize_db()
     set_audit_logger(audit_db)
@@ -67,6 +71,47 @@ def test_state_hash_ignores_suggestions_and_disabled_rows(db: Path) -> None:
     assert research_scheduler.compute_research_state_hash(db_path=db) == before
 
 
+def test_state_hash_tracks_department_watch_interests(db: Path) -> None:
+    from openexecutive.departments import store as dept_store
+
+    dept_store.seed_default_departments(db)
+    before = research_scheduler.compute_research_state_hash(db_path=db)
+    dept_store.update_department("finance", watched_entities=["Brex"], db_path=db)
+    after = research_scheduler.compute_research_state_hash(db_path=db)
+    assert before != after
+
+
+def test_state_hash_moves_only_for_decisions_that_name_known_entities(
+    db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openexecutive.departments import store as dept_store
+    from openexecutive.memory.company_profile import CompanyProfile
+    from openexecutive.memory.episodic import store_decision
+
+    profile = CompanyProfile.model_validate({"name": "Sente Labs", "vendors": ["Stripe"]})
+    monkeypatch.setattr(
+        "openexecutive.onboarding.profile_builder.load_or_create_profile", lambda: profile,
+    )
+    dept_store.seed_default_departments(db)
+    dept_store.update_department("finance", watched_entities=["Brex"], db_path=db)
+    before = research_scheduler.compute_research_state_hash(db_path=db)
+    store_decision("ops", "Hire two SDRs in Q4", db_path=db)
+    assert research_scheduler.compute_research_state_hash(db_path=db) == before
+    store_decision("finance", "Evaluate Brex for expense cards", db_path=db)
+    after = research_scheduler.compute_research_state_hash(db_path=db)
+    assert after != before
+    store_decision("finance", "Move Stripe to annual billing", db_path=db)
+    third = research_scheduler.compute_research_state_hash(db_path=db)
+    assert third not in (before, after)
+    # An initiative title is vocabulary too.
+    from openexecutive.memory.episodic import store_initiative
+
+    store_initiative("Project Halo", "active", db_path=db)
+    with_initiative = research_scheduler.compute_research_state_hash(db_path=db)
+    store_decision("ops", "Pause the Project Halo rollout", db_path=db)
+    assert research_scheduler.compute_research_state_hash(db_path=db) != with_initiative
+
+
 def test_state_hash_changes_when_initiative_added(db: Path) -> None:
     from openexecutive.memory.episodic import store_initiative
 
@@ -94,8 +139,9 @@ def test_bootstrap_is_idempotent(db: Path) -> None:
 
 
 class _MinimalInput:
-    def __init__(self, note: str = "", **_: Any) -> None:
+    def __init__(self, note: str = "", run_id: str | None = None, **_: Any) -> None:
         self.note = note
+        self.run_id = run_id
 
     def model_dump(self) -> dict[str, Any]:
         return {"note": self.note}
@@ -133,6 +179,47 @@ def _make_workflow_stub(
     workflow.input_model.return_value = _MinimalInput
     workflow.title = "Executive Research"
     return workflow
+
+
+@pytest.mark.asyncio
+async def test_scan_audit_row_carries_the_runs_usage(
+    db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The workflow's `usage` rollup lands on the `_ran` audit row so a run's
+    weight can be read from the audit log."""
+    usage = {
+        "calls": 9, "input_tokens": 1200, "cache_read_input_tokens": 300,
+        "cache_creation_input_tokens": 0, "output_tokens": 400, "web_search_requests": 14,
+        "by_source": {"specialist_research": {"calls": 7, "web_search_requests": 14}},
+    }
+
+    seen_inputs: list[Any] = []
+
+    async def fake_run(*, inputs, store):
+        from openexecutive.workflows.base import WorkflowEvent
+        seen_inputs.append(inputs)
+        yield WorkflowEvent(
+            type="result", data={"findings": [], "tool_calls": [], "usage": usage},
+        )
+        yield WorkflowEvent(type="artifact", content="(empty)")
+        yield WorkflowEvent(type="done")
+
+    workflow = MagicMock()
+    workflow.run = fake_run
+    workflow.input_model.return_value = _MinimalInput
+    workflow.title = "Executive Research"
+    monkeypatch.setitem(
+        __import__("openexecutive.workflows", fromlist=["WORKFLOW_REGISTRY"]).WORKFLOW_REGISTRY,
+        "executive_research", workflow,
+    )
+    await research_scheduler.run_watchlist_research_scan(db_path=db, store=MagicMock())
+
+    from openexecutive.audit import get_audit_logger
+    ran = get_audit_logger().query(event_type=research_scheduler.EVENT_RAN, limit=1)
+    assert (ran[0].details or {}).get("usage") == usage
+    assert "9 model call(s), 14 search(es)" in ran[0].summary
+    # The scheduler hands its run id to the workflow so usage rows link to it.
+    assert seen_inputs[0].run_id == (ran[0].details or {}).get("run_id")
 
 
 @pytest.mark.asyncio

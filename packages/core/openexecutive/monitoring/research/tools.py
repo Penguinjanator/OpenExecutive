@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from openexecutive.monitoring.research.prompts import PER_SPECIALIST_FINDING_CAP
+
 EMIT_RESEARCH_FINDINGS_TOOL: dict[str, Any] = {
     "name": "emit_research_findings",
     "description": (
@@ -26,10 +28,13 @@ EMIT_RESEARCH_FINDINGS_TOOL: dict[str, Any] = {
         "properties": {
             "findings": {
                 "type": "array",
+                # The cap is part of the schema, not only the prompt; the
+                # parser applies the same number after parsing, so it holds
+                # whether or not the provider honours maxItems.
+                "maxItems": PER_SPECIALIST_FINDING_CAP,
                 "description": (
-                    "Cap your list at the per-specialist limit named "
-                    "in your task instructions. Prefer fewer "
-                    "high-signal findings over many low-signal ones — "
+                    f"At most {PER_SPECIALIST_FINDING_CAP} findings. Prefer "
+                    "fewer high-signal findings over many low-signal ones — "
                     "an empty list is the right answer when nothing in "
                     "your domain warrants the Executive's attention."
                 ),

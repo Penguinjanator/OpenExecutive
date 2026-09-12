@@ -4,6 +4,7 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any
 
+from openexecutive.audit.usage import log_model_usage
 from openexecutive.config import get_settings
 from openexecutive.providers import get_provider, model_supports_deep_reasoning
 
@@ -166,6 +167,7 @@ class BaseAgent(ABC):
         timeout_seconds: float = _SPECIALIST_TIMEOUT,
         model_override: str | None = None,
         deep_reasoning_override: bool | None = None,
+        actor: str = "specialist_tools",
     ) -> Any:
         """Tool-use variant of ``analyze`` — returns the raw provider Message.
 
@@ -191,6 +193,10 @@ class BaseAgent(ABC):
         reasoning off) without disturbing the agent's chat-time defaults. When
         None, the per-instance effective_* values apply, matching prior
         behavior.
+
+        ``actor`` names the caller on the ``cache_event`` usage row recorded
+        for the call (``specialist_research``, ``query_watch``, …), which is
+        what the per-source usage breakdown groups on.
         """
         settings = get_settings()
         system_prompt = self.effective_system_prompt() + (
@@ -228,4 +234,6 @@ class BaseAgent(ABC):
             create_kwargs["max_tokens"] = max(max_tokens, 16000)
 
         provider = get_provider(model)
-        return await provider.messages_create(**create_kwargs)
+        message = await provider.messages_create(**create_kwargs)
+        log_model_usage(message, model=model, actor=actor)
+        return message

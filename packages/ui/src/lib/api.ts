@@ -1606,9 +1606,10 @@ export async function getAuditSession(
   return res.json();
 }
 
-// Cross-session token-usage aggregate used by /audit/usage. Totals plus by-day
-// and by-model breakdowns, summed from cache_event rows. `cost_usd` is the
-// actual OpenRouter charge captured per call (0 for rows that predate capture).
+// Cross-session token-usage aggregate used by /audit/usage. Totals plus by-day,
+// by-model and by-source breakdowns, summed from cache_event rows. `cost_usd` is
+// the actual OpenRouter charge captured per call (0 for rows that predate
+// capture); `web_search_requests` counts server-side searches the calls made.
 
 export interface UsageTotals {
   calls: number;
@@ -1616,6 +1617,8 @@ export interface UsageTotals {
   cache_read_input_tokens: number;
   cache_creation_input_tokens: number;
   output_tokens: number;
+  // Absent on rows written before searches were recorded.
+  web_search_requests?: number;
   cost_usd: number;
 }
 
@@ -1627,12 +1630,20 @@ export interface UsageByModel extends UsageTotals {
   model: string;
 }
 
+// One row per call source (the audit `actor`): executive, specialist_research,
+// research_synthesis, research_watchlist, triage, memory_extractor, …
+export interface UsageBySource extends UsageTotals {
+  source: string;
+}
+
 export interface UsageSummary {
   since: string | null;
   until: string | null;
   totals: UsageTotals;
   by_day: UsageByDay[];
   by_model: UsageByModel[];
+  // Absent on a backend older than the by-source breakdown.
+  by_source?: UsageBySource[];
 }
 
 export async function getAuditUsage(
@@ -1870,6 +1881,10 @@ export interface DepartmentConfig {
   slack_channel_id: string | null;
   discord_channel_id: string | null;
   telegram_chat_id: string | null;
+  // Named external entities this department wants monitored. The research
+  // watch policy treats them as strong grounding: a proposal about one can
+  // be added to the watch list on its own and is routed to this department.
+  watched_entities: string[];
 }
 
 export type PeriodType = "week" | "month" | "quarter" | "year" | "ongoing";
@@ -1924,6 +1939,7 @@ export interface DepartmentPatch {
   slack_channel_id?: string | null;
   discord_channel_id?: string | null;
   telegram_chat_id?: string | null;
+  watched_entities?: string[];
 }
 
 export async function updateDepartment(slug: string, patch: DepartmentPatch): Promise<DepartmentState> {

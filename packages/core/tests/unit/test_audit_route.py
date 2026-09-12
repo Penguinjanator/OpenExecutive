@@ -239,6 +239,21 @@ def test_usage_endpoint_aggregates_across_sessions(tmp_path: Path) -> None:
     assert by_model["claude-opus-4-8"]["cost_usd"] == pytest.approx(0.05)
 
 
+def test_usage_endpoint_breaks_down_by_source(tmp_path: Path) -> None:
+    client = _session_client(tmp_path)
+    audit = client.app.state.audit  # type: ignore[attr-defined]
+    audit.log("cache_event", "chat", session_id="sA", turn_id="t1", actor="executive",
+              details={"model": "m", "input_tokens": 100, "web_search_requests": 1})
+    audit.log("cache_event", "research", actor="specialist_research",
+              details={"model": "m", "input_tokens": 40, "web_search_requests": 4})
+
+    data = client.get("/audit/usage").json()
+    assert data["totals"]["web_search_requests"] == 5
+    by_source = {s["source"]: s for s in data["by_source"]}
+    assert by_source["executive"]["calls"] == 1
+    assert by_source["specialist_research"]["web_search_requests"] == 4
+
+
 def test_usage_endpoint_cost_missing_rows_contribute_zero(tmp_path: Path) -> None:
     # A row predating cost capture (no cost_usd) must not break the sum.
     client = _session_client(tmp_path)

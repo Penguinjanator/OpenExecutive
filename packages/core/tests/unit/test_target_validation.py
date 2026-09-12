@@ -1,8 +1,9 @@
 """Unit tests for insert-time watchlist target validation.
 
 Covers: non-rss passthrough (no network), valid-feed keep, non-feed →
-page_watch conversion, non-feed-non-scrapeable reject, transient-failure
-keep, and the 4xx → reject path. All network is mocked.
+page_watch conversion when the fetched page has readable text, non-feed
+reject when it has none, transient-failure keep, and the 4xx → reject path.
+All network is mocked.
 """
 from __future__ import annotations
 
@@ -12,10 +13,7 @@ import httpx
 import pytest
 
 from openexecutive.monitoring import target_validation as tv
-from openexecutive.monitoring.models import (
-    PAGE_WATCH_FETCH_KEY,
-    PAGE_WATCH_FETCH_XCRAWL,
-)
+from openexecutive.monitoring.models import PAGE_WATCH_FETCH_KEY
 from openexecutive.monitoring.sources import page_watch
 from openexecutive.monitoring.sources._http import FetchOverflowError
 
@@ -29,24 +27,23 @@ _EMPTY_FEED = (
     b'<?xml version="1.0"?><rss version="2.0"><channel>'
     b"<title>Brand new feed</title></channel></rss>"
 )
-_NOT_FEED = b"<html><body><h1>Pricing</h1><p>not a feed</p></body></html>"
+_NOT_FEED = (
+    b"<html><body><h1>Pricing</h1><p>Our Pro plan is now priced per seat, "
+    b"with annual billing available for teams of ten or more. Enterprise "
+    b"customers get SSO, audit logs, a dedicated success manager and a "
+    b"99.9% uptime commitment. Contact sales for volume pricing.</p></body></html>"
+)
+# Answers, but reduces to no visible text (a JS-only shell).
+_EMPTY_SHELL = b"<html><head><script>boot()</script></head><body></body></html>"
+# Answers with a one-line page: too little text to be worth watching.
+_THIN_PAGE = b"<html><body>Error 404 - not found</body></html>"
+# A binary body (PDF magic + NUL bytes) that would decode to garbage.
+_BINARY = b"%PDF-1.7\x00\x00" + bytes(range(256)) * 8
 
 
-def _install(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    fetch: Any,
-    scrape_result: str | None = None,
-) -> None:
+def _install(monkeypatch: pytest.MonkeyPatch, *, fetch: Any) -> None:
     monkeypatch.setattr(tv, "validate_target_url", lambda u: (True, ""))
     monkeypatch.setattr(tv, "fetch_bounded", fetch)
-
-    async def fake_scrape(url: str) -> str | None:
-        return scrape_result
-
-    monkeypatch.setattr(
-        "openexecutive.integrations.xcrawl_client.scrape", fake_scrape,
-    )
 
 
 def _fetch_returning(body: bytes) -> Any:
@@ -87,20 +84,24 @@ async def test_valid_feed_kept(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_non_feed_scrapeable_converts_to_page_watch(
+async def test_non_feed_readable_page_converts_to_page_watch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _install(
-        monkeypatch, fetch=_fetch_returning(_NOT_FEED),
-        scrape_result="# Pricing\n\ncontent",
-    )
+    calls: list[str] = []
+
+    async def fetch(url: str, max_bytes: int, **kw: object) -> bytes:
+        calls.append(url)
+        return _NOT_FEED
+
+    _install(monkeypatch, fetch=fetch)
     st, target, config = await tv.validate_and_normalize_target(
         "rss", "https://news.example/page", {"feed_label": "News"},
     )
     assert st == page_watch.PageWatchSource.kind  # "page_watch"
-    # Drift guard: the conversion must match the shared xcrawl sentinel that
-    # page_watch reads (both key and value).
-    assert config[PAGE_WATCH_FETCH_KEY] == PAGE_WATCH_FETCH_XCRAWL
+    # The body the feed check fetched decides the conversion — one fetch.
+    assert calls == ["https://news.example/page"]
+    # No fetch-source marker is written; the plain fetcher is the only path.
+    assert PAGE_WATCH_FETCH_KEY not in config
     # feed_label is remapped to the label key page_watch reads.
     assert config.get("label") == "News"
     assert "feed_label" not in config
@@ -125,16 +126,33 @@ async def test_empty_body_is_not_feed_no_crash(
 ) -> None:
     # HTTP 200 with a zero-byte body: feedparser yields a dict with no
     # `version` key — must classify as not_feed, not raise AttributeError.
-    _install(monkeypatch, fetch=_fetch_returning(b""), scrape_result=None)
+    _install(monkeypatch, fetch=_fetch_returning(b""))
     with pytest.raises(tv.WatchlistTargetError):
         await tv.validate_and_normalize_target("rss", "https://empty.example", {})
 
 
 @pytest.mark.asyncio
-async def test_non_feed_not_scrapeable_rejected(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.asyncio
+async def test_readability_check_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the head of a huge body is reduced for the readability check."""
+    calls: list[int] = []
+
+    def fake_html_to_text(body: bytes) -> str:
+        calls.append(len(body))
+        return "x" * 500
+
+    monkeypatch.setattr(tv, "html_to_text", fake_html_to_text)
+    _install(monkeypatch, fetch=_fetch_returning(b"<p>" * 1_000_000))
+    st, _target, _config = await tv.validate_and_normalize_target("rss", "https://big.example/x", {})
+    assert st == "page_watch"
+    assert calls == [tv._READABILITY_SCAN_BYTES]
+
+
+@pytest.mark.parametrize("body", [_EMPTY_SHELL, _THIN_PAGE, _BINARY], ids=["shell", "thin", "binary"])
+async def test_non_feed_without_readable_text_rejected(
+    monkeypatch: pytest.MonkeyPatch, body: bytes,
 ) -> None:
-    _install(monkeypatch, fetch=_fetch_returning(_NOT_FEED), scrape_result=None)
+    _install(monkeypatch, fetch=_fetch_returning(body))
     with pytest.raises(tv.WatchlistTargetError) as ei:
         await tv.validate_and_normalize_target(
             "rss", "https://dead.example/x", {},
@@ -151,7 +169,7 @@ async def test_404_status_is_not_feed_then_rejected(
         request=httpx.Request("GET", "https://x.example"),
         response=httpx.Response(404),
     )
-    _install(monkeypatch, fetch=_fetch_raising(exc), scrape_result=None)
+    _install(monkeypatch, fetch=_fetch_raising(exc))
     with pytest.raises(tv.WatchlistTargetError):
         await tv.validate_and_normalize_target("rss", "https://x.example", {})
 
@@ -171,10 +189,8 @@ async def test_transient_failure_keeps_rss_unverified(
 async def test_oversized_body_is_not_feed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _install(
-        monkeypatch, fetch=_fetch_raising(FetchOverflowError()),
-        scrape_result=None,
-    )
+    _install(monkeypatch, fetch=_fetch_raising(FetchOverflowError()))
+    # Oversized: no body to inspect, so it cannot become a page_watch either.
     with pytest.raises(tv.WatchlistTargetError):
         await tv.validate_and_normalize_target("rss", "https://big.example", {})
 
@@ -188,13 +204,7 @@ async def test_ssrf_rejected_target_is_not_feed(
     async def boom(*a: object, **k: object) -> bytes:
         raise AssertionError("must not fetch an SSRF-rejected target")
 
-    async def boom_scrape(url: str) -> str | None:
-        raise AssertionError("must not hand an SSRF-rejected target to xcrawl")
-
     monkeypatch.setattr(tv, "fetch_bounded", boom)
-    monkeypatch.setattr(
-        "openexecutive.integrations.xcrawl_client.scrape", boom_scrape,
-    )
-    # Rejected outright as "blocked" — neither fetched locally nor scraped.
+    # Rejected outright as "blocked" — never fetched.
     with pytest.raises(tv.WatchlistTargetError):
         await tv.validate_and_normalize_target("rss", "http://169.254.169.254", {})

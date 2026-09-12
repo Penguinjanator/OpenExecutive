@@ -81,6 +81,20 @@ def test_patch_rejects_invalid_authority(client: TestClient) -> None:
     assert resp.status_code == 422
 
 
+def test_patch_watched_entities_cleans_and_validates(client: TestClient) -> None:
+    resp = client.patch(
+        "/departments/finance",
+        json={"watched_entities": ["  Brex ", "brex", "", "Stripe   Inc"]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["config"]["watched_entities"] == ["Brex", "Stripe Inc"]
+    # Omitting the field leaves it alone; sending [] clears it.
+    assert client.patch("/departments/finance", json={"headcount": 2}).json()["config"]["watched_entities"] == ["Brex", "Stripe Inc"]
+    assert client.patch("/departments/finance", json={"watched_entities": []}).json()["config"]["watched_entities"] == []
+    assert client.patch("/departments/finance", json={"watched_entities": ["x" * 129]}).status_code == 422
+    assert client.patch("/departments/finance", json={"watched_entities": [f"e{i}" for i in range(51)]}).status_code == 422
+
+
 def test_patch_unknown_department(client: TestClient) -> None:
     resp = client.patch("/departments/nope", json={"headcount": 1})
     assert resp.status_code == 404

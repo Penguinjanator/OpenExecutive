@@ -71,10 +71,38 @@ def test_specialist_research_passes_resolved_knobs(
 
     agent = SimpleNamespace(analyze_with_tools=AsyncMock(side_effect=fake_analyze_with_tools))
     # Web search off so the tool list is deterministic.
-    monkeypatch.setattr(sr, "build_web_search_tool", lambda: None)
+    monkeypatch.setattr(sr, "build_web_search_tool", lambda **_kw: None)
 
     asyncio.run(sr.research_one_specialist("cso", agent, "CONTEXT"))
 
     assert captured["model_override"] == "claude-cheap-research"
     assert captured["deep_reasoning_override"] is False
     assert "## TASK: RESEARCH FINDINGS" in captured["system_addendum"]
+
+
+def test_specialist_research_uses_the_research_search_cap(
+    isolated_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fan-out's web_search tool is capped by RESEARCH_WEB_SEARCH_MAX_USES,
+    not the chat knob — the chat value is multiplied by seven here."""
+    from openexecutive.monitoring.research import specialist_research as sr
+
+    monkeypatch.setenv("WEB_SEARCH_MAX_USES", "8")
+    monkeypatch.setenv("RESEARCH_WEB_SEARCH_MAX_USES", "2")
+    seen: dict = {}
+
+    def fake_build(**kwargs: object) -> dict:
+        seen.update(kwargs)
+        return {"type": "web_search_20250305", "name": "web_search", **kwargs}
+
+    monkeypatch.setattr(sr, "build_web_search_tool", fake_build)
+    tools_seen: dict = {}
+
+    async def fake_analyze_with_tools(user_content: str, **kwargs: object) -> object:
+        tools_seen.update(kwargs)
+        return SimpleNamespace(content=[])
+
+    agent = SimpleNamespace(analyze_with_tools=AsyncMock(side_effect=fake_analyze_with_tools))
+    asyncio.run(sr.research_one_specialist("cfo", agent, "CONTEXT"))
+    assert seen == {"max_uses": 2}
+    assert any(t.get("name") == "web_search" and t.get("max_uses") == 2 for t in tools_seen["tools"])

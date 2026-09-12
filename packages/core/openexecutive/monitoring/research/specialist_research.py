@@ -13,7 +13,10 @@ from typing import Any
 from openexecutive.agents.base import BaseAgent
 from openexecutive.config import get_settings
 from openexecutive.monitoring.research.models import ResearchFinding
-from openexecutive.monitoring.research.prompts import research_addendum_for
+from openexecutive.monitoring.research.prompts import (
+    PER_SPECIALIST_FINDING_CAP,
+    research_addendum_for,
+)
 from openexecutive.monitoring.research.tools import (
     EMIT_RESEARCH_FINDINGS_TOOL,
 )
@@ -38,26 +41,17 @@ async def research_one_specialist(
     asyncio.gather doesn't abort on one specialist's crash. The
     workflow records per-specialist outcomes separately for the artifact.
     """
-    settings = get_settings()
-    if settings.research_agentic_scrape_enabled and settings.xcrawl_enabled:
-        # Read-before-cite: the specialist runs a search→scrape_url→emit
-        # loop so it grounds claims in full sources it actually read. Local
-        # import avoids a module-load cycle (agentic imports _extract_findings
-        # from here). Single-shot path below is unchanged when disabled.
-        from openexecutive.monitoring.research.agentic import (
-            run_specialist_agentic,
-        )
-        return await run_specialist_agentic(
-            specialist_slug, agent, research_context,
-        )
-
     from openexecutive.agents.research_council import (
         get_research_model,
         get_research_use_deep_reasoning,
     )
 
     tools: list[dict[str, Any]] = [EMIT_RESEARCH_FINDINGS_TOOL]
-    web_search = build_web_search_tool()
+    # The research fan-out has its own search cap (each specialist gets
+    # this many searches; the chat knob stays with chat and standing queries).
+    web_search = build_web_search_tool(
+        max_uses=get_settings().research_web_search_max_uses,
+    )
     if web_search is not None:
         tools.append(web_search)
 
@@ -71,6 +65,7 @@ async def research_one_specialist(
     try:
         message = await agent.analyze_with_tools(
             research_context,
+            actor="specialist_research",
             tools=tools,
             system_addendum=research_addendum_for(specialist_slug),
             timeout_seconds=_RESEARCH_TIMEOUT_SECONDS,
@@ -140,6 +135,15 @@ def _extract_findings(
             )
             continue
         parsed.append(finding)
+    if len(parsed) > PER_SPECIALIST_FINDING_CAP:
+        # The schema states the cap; a provider may not enforce it. Applied
+        # after parsing so malformed items never crowd out valid ones — the
+        # model was told to lead with the material findings.
+        logger.warning(
+            "research: specialist=%s emitted %d findings — keeping the first %d",
+            specialist_slug, len(parsed), PER_SPECIALIST_FINDING_CAP,
+        )
+        parsed = parsed[:PER_SPECIALIST_FINDING_CAP]
     return parsed
 
 

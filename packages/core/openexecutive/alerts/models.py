@@ -53,6 +53,11 @@ class AlertEvent(BaseModel):
     # Executive's create_alert tool). Lands on the row so the "principal
     # owns unrouted" rule stops sweeping every triage-born alert to them.
     routed_to_person_id: int | None = None
+    # Department the alert belongs to (slug). Becomes the row's
+    # ``department:<slug>`` topic tag — a routing hint only, unlike
+    # ``channel``, which triage reads as the room a message came from and may
+    # answer with a team-room broadcast.
+    department: str = ""
 
 
 class TriageDecision(BaseModel):

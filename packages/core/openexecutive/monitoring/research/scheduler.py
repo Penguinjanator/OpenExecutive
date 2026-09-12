@@ -2,7 +2,7 @@
 
 PR-D wired the workflow to two triggers (manual chat tool, onboarding
 completion). PR-E adds a third: a cron tick that re-runs the workflow
-every ``watchlist_research_interval_minutes`` (default 120). The cost
+every ``watchlist_research_interval_minutes`` (default 360). The cost
 shape of a research run is real — 7 LLM calls × web_search — so each
 tick first computes a fingerprint of the inputs the workflow reads
 (company profile, active initiatives, existing watchlist slugs) and
@@ -42,6 +42,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -75,9 +76,17 @@ def compute_research_state_hash(db_path: Path | None = None) -> str:
     """Hash the inputs the research workflow reads.
 
     The inputs are: the company profile's prompt-form text, the
-    titles + statuses of every active initiative, and the slug+target
-    list of every enabled, ACTIVE watchlist row. A change to any of these
-    invalidates the prior research; everything else is irrelevant.
+    titles + statuses of every active initiative, the slug+target list of
+    every enabled, ACTIVE watchlist row, each department's watched
+    entities / charter scope / goal key results, and the recent episodic
+    decisions that name something in the grounding vocabulary. A change
+    to any of these invalidates the prior research; everything else is
+    irrelevant.
+
+    Only *matching* decisions count: the chat memory extractor writes
+    decisions freely, and one that names nothing the policy knows cannot
+    change what the policy would do, so it must not trigger a 7-specialist
+    re-run.
 
     Dry-run rows are excluded on purpose: the research pass files its own
     suggestions as dry-run rows, and the principal approving or declining
@@ -110,6 +119,7 @@ def compute_research_state_hash(db_path: Path | None = None) -> str:
         logger.exception("research.scheduler: profile load failed")
         return "error:profile"
 
+    initiatives: list = []
     try:
         from openexecutive.memory.episodic import DB_PATH, get_active_initiatives
 
@@ -117,10 +127,8 @@ def compute_research_state_hash(db_path: Path | None = None) -> str:
         # `get_active_initiatives` binds DB_PATH at def time; route
         # through the resolver so monkeypatched DB_PATH in tests
         # (and any future multi-DB harness) actually takes effect.
-        for i in sorted(
-            get_active_initiatives(db_path=db_path or DB_PATH),
-            key=lambda x: (getattr(x, "title", "") or ""),
-        ):
+        initiatives = list(get_active_initiatives(db_path=db_path or DB_PATH))
+        for i in sorted(initiatives, key=lambda x: (getattr(x, "title", "") or "")):
             parts.append(
                 f"{getattr(i, 'title', '')}::{getattr(i, 'status', '')}"
             )
@@ -144,8 +152,44 @@ def compute_research_state_hash(db_path: Path | None = None) -> str:
         logger.exception("research.scheduler: watchlist load failed")
         parts.append("WATCHLIST_ERROR")
 
+    from openexecutive.monitoring.research import watch_policy
+
+    departments = watch_policy.load_departments(db_path)
+    _append_part(parts, "DEPARTMENTS", lambda: [
+        f"{state.config.slug}::"
+        + "|".join(state.config.watched_entities)
+        + "::" + "|".join(state.config.charter.scope)
+        + "::" + "|".join(g.key_result for g in state.goals)
+        for state in sorted(departments, key=lambda d: d.config.slug)
+    ])
+
+    def _matching_decisions() -> list[str]:
+        # The same vocabulary the policy grounds with (minus watch labels,
+        # which never ground), so a decision moves the hash exactly when it
+        # would move a classification.
+        vocabulary = watch_policy.grounding_vocabulary(profile, initiatives, [], departments)
+        return [
+            f"{getattr(decision, 'id', '')}::{str(getattr(decision, 'summary', '') or '')[:120]}"
+            for decision in watch_policy.recent_decisions(db_path=db_path)
+            if any(watch_policy.named_in_decision(term, decision, vocabulary) for term in vocabulary)
+        ]
+
+    _append_part(parts, "DECISIONS", _matching_decisions)
+
     digest = hashlib.sha256("\n".join(parts).encode()).hexdigest()
     return digest
+
+
+def _append_part(parts: list[str], label: str, lines: Callable[[], list[str]]) -> None:
+    """Append one labelled fingerprint section, or a ``<LABEL>_ERROR``
+    sentinel when loading it fails (logged; the hash still differs from a
+    healthy run so the failure is visible in the audit trail)."""
+    parts.append(f"{label}:")
+    try:
+        parts.extend(lines())
+    except Exception:
+        logger.exception("research.scheduler: %s load failed", label.lower())
+        parts.append(f"{label}_ERROR")
 
 
 def _last_successful_research_run() -> tuple[str | None, str | None]:
@@ -415,11 +459,14 @@ async def run_watchlist_research_scan(
 
         workflow = WORKFLOW_REGISTRY["executive_research"]
         input_cls = workflow.input_model()
+        run_id = str(uuid.uuid4())
+        # The workflow tags every model-usage row it writes with this id, so
+        # a run that times out or crashes is still traceable to its calls.
         wf_inputs = input_cls(
             note=f"periodic research tick at {now.isoformat()}",
+            run_id=run_id,
         )
 
-        run_id = str(uuid.uuid4())
         try:
             create_run(
                 run_id,
@@ -440,9 +487,10 @@ async def run_watchlist_research_scan(
         artifact = ""
         findings: list[dict[str, Any]] = []
         tool_calls: list[dict[str, Any]] = []
+        usage: dict[str, Any] | None = None
 
         async def _drive() -> None:
-            nonlocal artifact, findings, tool_calls
+            nonlocal artifact, findings, tool_calls, usage
             async for event in workflow.run(
                 inputs=wf_inputs, store=effective_store,
             ):
@@ -453,6 +501,9 @@ async def run_watchlist_research_scan(
                     raw_calls = event.data.get("tool_calls")
                     if isinstance(raw_calls, list):
                         tool_calls = raw_calls
+                    raw_usage = event.data.get("usage")
+                    if isinstance(raw_usage, dict):
+                        usage = raw_usage
                 elif event.type == "artifact" and event.content:
                     artifact = event.content
                 elif event.type == "error" and event.message:
@@ -487,21 +538,31 @@ async def run_watchlist_research_scan(
         # next tick — bounded, not lost.
         post_state_hash = compute_research_state_hash(db_path=db_path)
         ok_tool_calls = sum(1 for t in tool_calls if t.get("ok"))
+        usage_note = ""
+        if usage:
+            usage_note = (
+                f", {usage.get('calls', 0)} model call(s), "
+                f"{usage.get('web_search_requests', 0)} search(es)"
+            )
+        details: dict[str, Any] = {
+            "state_hash": post_state_hash,
+            "trigger": run_trigger,
+            "findings": len(findings),
+            "tool_calls": len(tool_calls),
+            "ok_tool_calls": ok_tool_calls,
+            "run_id": run_id,
+        }
+        if usage:
+            # What the run did: calls, tokens and searches, per source.
+            details["usage"] = usage
         audit_log(
             EVENT_RAN,
             (
                 f"Executive research ran — {len(findings)} finding(s), "
-                f"{ok_tool_calls}/{len(tool_calls)} tool call(s) ok"
+                f"{ok_tool_calls}/{len(tool_calls)} tool call(s) ok{usage_note}"
             ),
             actor="scheduler",
-            details={
-                "state_hash": post_state_hash,
-                "trigger": run_trigger,
-                "findings": len(findings),
-                "tool_calls": len(tool_calls),
-                "ok_tool_calls": ok_tool_calls,
-                "run_id": run_id,
-            },
+            details=details,
         )
         return len(findings)
     except TimeoutError:
@@ -516,7 +577,7 @@ async def run_watchlist_research_scan(
             EVENT_FAILED,
             "Watchlist research timed out",
             actor="scheduler",
-            details={"state_hash": state_hash, "reason": "timeout"},
+            details={"state_hash": state_hash, "reason": "timeout", "run_id": run_id},
         )
         return 0
     except Exception as exc:
@@ -528,7 +589,7 @@ async def run_watchlist_research_scan(
             EVENT_FAILED,
             f"Watchlist research crashed: {exc}",
             actor="scheduler",
-            details={"state_hash": state_hash, "error": str(exc)[:300]},
+            details={"state_hash": state_hash, "error": str(exc)[:300], "run_id": run_id},
         )
         return 0
 

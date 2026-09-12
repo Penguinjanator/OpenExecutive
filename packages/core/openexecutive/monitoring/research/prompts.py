@@ -52,6 +52,11 @@ def shared_research_addendum() -> str:
         "  - a vendor / dependency named in the profile or directly "
         "implied by the stack (e.g. 'Stripe' for a SaaS company)\n"
         "  - a tracked ticker (own or competitor) — for stock moves\n"
+        "  - an entity a department listed under DEPARTMENT WATCH "
+        "INTERESTS (a department head asked for it — treat it like a "
+        "named vendor or competitor)\n"
+        "  - a company named in a RECENT DECISIONS line (what the company "
+        "just decided is its freshest statement of what matters)\n"
         "\n"
         "If you cannot reference one of these by name, DO NOT emit the "
         "finding. 'Industry trend' / 'sector news' / 'general "
@@ -114,42 +119,7 @@ def shared_research_addendum() -> str:
         "DROPPED by the workflow before the Executive sees them** — do "
         "not emit a finding you would not stake 'medium' on."
     )
-    return addendum + _read_before_cite_addendum()
-
-
-def _read_before_cite_addendum() -> str:
-    """Extra contract that only applies when the agentic scrape loop is on:
-    the specialist has a ``scrape_url`` tool and MUST read sources before
-    citing. Empty otherwise so the prompt always matches the available
-    tools. Static per-deployment (the flag is constant in-process), so it
-    does not break the cached system block.
-    """
-    from openexecutive.config import get_settings
-
-    if not get_settings().research_agentic_scrape_enabled:
-        return ""
-    return (
-        "\n\n## READ BEFORE YOU CITE\n"
-        "\n"
-        "You have a `scrape_url` tool. web_search returns SNIPPETS — they "
-        "are NOT enough to cite. Before emitting ANY finding:\n"
-        "  1. Use web_search to find candidate sources.\n"
-        "  2. Call `scrape_url` on the 1-3 most promising results to READ "
-        "the full article.\n"
-        "  3. Ground every number / date / quote in the finding's summary "
-        "in what the scraped page ACTUALLY says.\n"
-        "  4. In `relevant_urls`, cite the specific ARTICLE url you "
-        "scraped and read — never a homepage or section link, and never a "
-        "page you did not read.\n"
-        "\n"
-        "**This is enforced, not advisory: if you call "
-        "`emit_research_findings` before scraping at least one source, the "
-        "emit is REJECTED and you are sent back to scrape first.** So always "
-        "`scrape_url` at least one source before you emit. A finding whose "
-        "source you did not scrape + read will also be demoted or dropped by "
-        "the verification pass. When you have read enough, call "
-        "`emit_research_findings` once."
-    )
+    return addendum
 
 
 # Per-specialist focus tails. Appended AFTER the shared addendum so the

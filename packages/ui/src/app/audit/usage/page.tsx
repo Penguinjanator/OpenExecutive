@@ -6,6 +6,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   getAuditUsage,
   type UsageByDay,
+  type UsageBySource,
   type UsageByModel,
   type UsageSummary,
   type UsageTotals,
@@ -57,13 +58,14 @@ function UsageRowCells({ u }: { u: UsageTotals }) {
       <td className="px-3 py-1.5 text-right tabular-nums">{fmtInt(u.cache_read_input_tokens)}</td>
       <td className="px-3 py-1.5 text-right tabular-nums">{fmtInt(u.cache_creation_input_tokens)}</td>
       <td className="px-3 py-1.5 text-right tabular-nums">{fmtInt(u.output_tokens)}</td>
+      <td className="px-3 py-1.5 text-right tabular-nums">{fmtInt(u.web_search_requests ?? 0)}</td>
       <td className="px-3 py-1.5 text-right tabular-nums">{cacheHitPct(u)}%</td>
       <td className="px-3 py-1.5 text-right tabular-nums">{fmtCost(u.cost_usd)}</td>
     </>
   );
 }
 
-const COL_HEADERS = ["Calls", "Input", "Cache read", "Cache write", "Output", "Cached", "Cost"];
+const COL_HEADERS = ["Calls", "Input", "Cache read", "Cache write", "Output", "Searches", "Cached", "Cost"];
 
 // Debounce window for refetching as the date-range filter changes (matches
 // the /audit list page).
@@ -185,7 +187,38 @@ export default function TokenUsagePage() {
               <StatCard label="Fresh input" value={fmtInt(totals.input_tokens)} />
               <StatCard label="Cache read" value={fmtInt(totals.cache_read_input_tokens)} />
               <StatCard label="Cache write" value={fmtInt(totals.cache_creation_input_tokens)} />
+              <StatCard label="Searches" value={fmtInt(totals.web_search_requests ?? 0)} hint="server-side web searches" />
             </div>
+          ) : null}
+
+          {/* By source */}
+          {data && data.by_source && data.by_source.length > 0 ? (
+            <section className="mt-8">
+              <h2 className="text-sm font-medium text-fg mb-2">By source</h2>
+              <p className="text-xs text-fg-muted mb-2">
+                Which part of the system made the calls: chat turns, research specialists, the research routing and watchlist passes, triage, memory extraction.
+              </p>
+              <div className="rounded-xl border border-line overflow-hidden">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="bg-surface-elevated/60 text-fg-muted text-xs">
+                      <th className="px-3 py-2 text-left font-medium">Source</th>
+                      {COL_HEADERS.map((h) => (
+                        <th key={h} className="px-3 py-2 text-right font-medium">{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.by_source.map((s: UsageBySource) => (
+                      <tr key={s.source} className="border-t border-line/60">
+                        <td className="px-3 py-1.5 font-mono text-xs text-fg">{s.source}</td>
+                        <UsageRowCells u={s} />
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </section>
           ) : null}
 
           {/* By model */}

@@ -15,7 +15,7 @@ from openexecutive.monitoring.sources import list_registered_kinds
 from openexecutive.monitoring.sources.page_watch import (
     PageWatchSource,
     _diff,
-    _html_to_text,
+    html_to_text,
 )
 
 
@@ -70,7 +70,7 @@ def test_html_to_text_strips_markup_and_scripts() -> None:
     <body><!-- comment --><h1>Pricing</h1>
     <p>Pro&nbsp;plan is &pound;30/mo</p></body></html>
     """
-    text = _html_to_text(body)
+    text = html_to_text(body)
     assert "Pricing" in text
     assert "£30/mo" in text  # &nbsp; and &pound; entities unescaped
     # script/style content must not survive
@@ -264,77 +264,111 @@ def test_page_watch_state_roundtrip(db: Path) -> None:
     assert st2["text_snapshot"] == "text B"
 
 
+def test_html_to_text_is_linear_on_unterminated_openers() -> None:
+    """A page full of unterminated comment / script openers must reduce in
+    linear time: the insert-time conversion runs this on whatever a server
+    sends, on the request thread."""
+    import time
+
+    for body in (b"<!--" * 100_000, b"<script>" * 60_000, b"<style" * 80_000):
+        t0 = time.monotonic()
+        assert html_to_text(body) == ""
+        assert time.monotonic() - t0 < 1.0
+    # Block stripping still behaves: content of script/style/noscript and
+    # comments is gone, an unrelated tag such as <scripts> is only a tag.
+    assert html_to_text(
+        b"<p>a</p><script type=x>js()</script>b<STYLE>c</STYLE><!-- x -->d"
+        b"<noscript>n</noscript><scripts>e</scripts>"
+    ) == "a b d e"
+
+
 def test_page_watch_registered() -> None:
     assert "page_watch" in list_registered_kinds()
 
 
 # --------------------------------------------------------------------- #
-# xcrawl fetch path (config_json["fetch"] == "xcrawl")
+# Legacy rows tagged config_json["fetch"] == "xcrawl"
 # --------------------------------------------------------------------- #
 
 
-def _install_xcrawl(monkeypatch: pytest.MonkeyPatch, holder: SimpleNamespace) -> None:
-    """Patch validate + xcrawl_client.scrape; leave fetch_bounded alone so a
-    test fails loudly if the xcrawl row wrongly falls back to httpx."""
-    async def fake_scrape(url: str) -> str | None:
+def _install_httpx(monkeypatch: pytest.MonkeyPatch, holder: SimpleNamespace) -> None:
+    async def fake_fetch(url: str, max_bytes: int, **kwargs: object) -> bytes:
         holder.calls += 1
-        return holder.md
-
-    async def boom_fetch(url: str, max_bytes: int, **kwargs: object) -> bytes:
-        raise AssertionError("xcrawl row must NOT fall back to httpx fetch_bounded")
+        return holder.body
 
     monkeypatch.setattr(
         "openexecutive.monitoring.sources.page_watch.validate_target_url",
         lambda u: (True, ""),
     )
-    # Make any httpx fallback blow up so the test proves the xcrawl route.
     monkeypatch.setattr(
-        "openexecutive.monitoring.sources.page_watch.fetch_bounded", boom_fetch,
-    )
-    monkeypatch.setattr(
-        "openexecutive.integrations.xcrawl_client.scrape", fake_scrape,
+        "openexecutive.monitoring.sources.page_watch.fetch_bounded", fake_fetch,
     )
 
 
 @pytest.mark.asyncio
-async def test_page_watch_xcrawl_detects_change(
+async def test_legacy_xcrawl_row_rebaselines_without_signal(
     db: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    holder = SimpleNamespace(md="# Pricing\n\nPro plan is $30/mo", calls=0)
-    _install_xcrawl(monkeypatch, holder)
-    item = _make_item(slug="page-xc", config={"fetch": "xcrawl"})
+    """A row whose baseline was captured as xcrawl markdown must not report
+    the switch to the plain fetcher as a page change: the first plain poll
+    re-captures the baseline silently and clears the legacy marker, and
+    only a later real change emits."""
+    holder = SimpleNamespace(body=b"<html><body>Pro plan is $30/mo</body></html>", calls=0)
+    _install_httpx(monkeypatch, holder)
+    ms.insert_watchlist_item(
+        slug="page-legacy", signal_type="page_watch",
+        target="https://example.com/pricing", config={"fetch": "xcrawl", "label": "Pricing"},
+        db_path=db,
+    )
+    item = next(i for i in ms.list_watchlist(db_path=db) if i.slug == "page-legacy")
+    # Baseline as xcrawl would have stored it: markdown, a different hash.
+    ms.upsert_page_watch_state("page-legacy", "old-markdown-hash", "# Pricing Pro plan is $30/mo", db_path=db)
     src = PageWatchSource()
 
-    assert await src.poll(item, db_path=db) == []          # baseline
-    assert await src.poll(item, db_path=db) == []          # unchanged
-    holder.md = "# Pricing\n\nPro plan is $40/mo"
-    signals = await src.poll(item, db_path=db)             # changed
+    assert await src.poll(item, db_path=db) == []            # re-baseline, no signal
+    state = ms.get_page_watch_state("page-legacy", db_path=db)
+    assert state is not None and state["content_hash"] != "old-markdown-hash"
+    refreshed = next(i for i in ms.list_watchlist(db_path=db) if i.slug == "page-legacy")
+    assert "fetch" not in refreshed.config_json                # marker cleared
+    assert refreshed.config_json.get("label") == "Pricing"    # other config kept
+
+    assert await src.poll(refreshed, db_path=db) == []        # unchanged
+    holder.body = b"<html><body>Pro plan is $40/mo</body></html>"
+    signals = await src.poll(refreshed, db_path=db)           # real change
     assert len(signals) == 1
-    assert signals[0].source_kind == "page_watch"
     assert "$40/mo" in signals[0].raw_payload["added_text"]
-    assert holder.calls == 3  # every poll went through xcrawl, not httpx
+    assert holder.calls == 3
 
 
 @pytest.mark.asyncio
-async def test_page_watch_xcrawl_failure_drops_tick(
+async def test_legacy_marker_on_unsaved_item_does_not_rebaseline_forever(
     db: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    holder = SimpleNamespace(md=None, calls=0)  # scrape returns nothing
-    _install_xcrawl(monkeypatch, holder)
-    item = _make_item(slug="page-xc2", config={"fetch": "xcrawl"})
-    assert await PageWatchSource().poll(item, db_path=db) == []
-    # No baseline stored, so a later successful scrape is treated as first-seen.
-    assert ms.get_page_watch_state("page-xc2", db_path=db) is None
+    """An item with no id cannot have its marker cleared, so it must be
+    compared normally — otherwise it would re-baseline on every poll and
+    never report a change."""
+    holder = SimpleNamespace(body=b"<html><body>v1</body></html>", calls=0)
+    _install_httpx(monkeypatch, holder)
+    item = WatchlistItem(
+        id=None, slug="page-noid", signal_type="page_watch",
+        target="https://example.com/p", config_json={"fetch": "xcrawl"},
+    )
+    src = PageWatchSource()
+    assert await src.poll(item, db_path=db) == []             # first baseline
+    holder.body = b"<html><body>v2</body></html>"
+    assert len(await src.poll(item, db_path=db)) == 1         # change reported
 
 
-@pytest.mark.asyncio
-async def test_page_watch_xcrawl_whitespace_only_drops_without_baseline(
-    db: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Markdown that normalizes to empty (e.g. truncated to a whitespace prefix)
-    # must be treated as "no fetch", not an empty baseline.
-    holder = SimpleNamespace(md="   \n\t  ", calls=0)
-    _install_xcrawl(monkeypatch, holder)
-    item = _make_item(slug="page-xc3", config={"fetch": "xcrawl"})
-    assert await PageWatchSource().poll(item, db_path=db) == []
-    assert ms.get_page_watch_state("page-xc3", db_path=db) is None
+def test_remove_watchlist_config_key_keeps_other_keys(db: Path) -> None:
+    ms.insert_watchlist_item(
+        slug="page-k", signal_type="page_watch", target="https://example.com/k",
+        config={"fetch": "xcrawl", "label": "K"}, db_path=db,
+    )
+    item = next(i for i in ms.list_watchlist(db_path=db) if i.slug == "page-k")
+    assert item.id is not None
+    assert ms.remove_watchlist_config_key(item.id, "fetch", db_path=db) == 1
+    again = next(i for i in ms.list_watchlist(db_path=db) if i.slug == "page-k")
+    assert again.config_json == {"label": "K"}
+    assert ms.remove_watchlist_config_key(item.id + 1000, "fetch", db_path=db) == 0
+    with pytest.raises(ValueError):
+        ms.remove_watchlist_config_key(item.id, "$.evil", db_path=db)

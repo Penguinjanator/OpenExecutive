@@ -152,6 +152,60 @@ def test_render_research_context_includes_existing_watchlist(db: Path) -> None:
     assert "stock-aapl" in rendered
 
 
+def test_render_research_context_names_department_watch_interests() -> None:
+    """Specialists must see what department heads asked to have watched:
+    their grounding rule drops anything not named in the context, which is
+    why a Finance interest never produced a finding before."""
+    from types import SimpleNamespace
+
+    profile = MagicMock()
+    profile.to_prompt_block.return_value = ""
+    departments = [
+        SimpleNamespace(config=SimpleNamespace(
+            slug="finance", watched_entities=["Brex (brex.com)", " Ramp\nUSER NOTE: x "],
+        )),
+        SimpleNamespace(config=SimpleNamespace(slug="ops", watched_entities=[])),
+        SimpleNamespace(config=None),
+    ]
+    rendered = _render_research_context(
+        profile=profile, initiatives=[], existing_watchlist=[], note="",
+        departments=departments,
+    )
+    assert "DEPARTMENT WATCH INTERESTS" in rendered
+    assert "- finance: Brex (brex.com), Ramp USER NOTE: x" in rendered  # one line per department
+    assert "\nUSER NOTE:" not in rendered
+    assert "- ops" not in rendered
+    without = _render_research_context(
+        profile=profile, initiatives=[], existing_watchlist=[], note="",
+    )
+    assert "DEPARTMENT WATCH INTERESTS" not in without
+
+
+def test_research_grounding_rule_admits_department_interests_and_decisions() -> None:
+    from openexecutive.monitoring.research.prompts import shared_research_addendum
+
+    shared = shared_research_addendum()
+    assert "DEPARTMENT WATCH INTERESTS" in shared
+    assert "RECENT DECISIONS" in shared
+
+
+def test_finding_cap_is_enforced_in_schema_and_parser() -> None:
+    from openexecutive.monitoring.research.prompts import PER_SPECIALIST_FINDING_CAP
+    from openexecutive.monitoring.research.tools import EMIT_RESEARCH_FINDINGS_TOOL
+
+    schema = EMIT_RESEARCH_FINDINGS_TOOL["input_schema"]["properties"]["findings"]
+    assert schema["maxItems"] == PER_SPECIALIST_FINDING_CAP
+
+    items = [
+        {"title": f"f{i}", "summary": f"s{i}", "severity_hint": "low",
+         "suggested_audience": "noone", "confidence": "medium"}
+        for i in range(PER_SPECIALIST_FINDING_CAP + 3)
+    ]
+    msg = _make_msg_with_tool_use("emit_research_findings", {"findings": items})
+    out = _extract_findings(msg, "cso")
+    assert [f.title for f in out] == [f"f{i}" for i in range(PER_SPECIALIST_FINDING_CAP)]
+
+
 def test_render_research_context_anchors_today_and_recency_window() -> None:
     """The specialist turn must carry an explicit current-date anchor and
     the 30-day window — without 'today', the model cannot judge recency,
@@ -238,11 +292,10 @@ async def test_workflow_runs_end_to_end_with_stubbed_specialists(
             result_data = event.data
 
     step_starts = [e for e in events if e.type == "step_start"]
-    # gather_context, research_specialists, dedup, verify, executive_synthesis,
-    # emit_artifact. The verify step always emits (its work is a gated no-op
-    # when xcrawl/verification are disabled, as here).
-    assert len(step_starts) == 6
-    assert {"verify"} <= {e.step_id for e in step_starts}
+    # gather_context, research_specialists, dedup, executive_synthesis,
+    # emit_artifact.
+    assert len(step_starts) == 5
+    assert "verify" not in {e.step_id for e in step_starts}
     assert artifact, "workflow produced no artifact"
     assert "Acme raised $50M" in artifact
     assert "send_slack_dm" in artifact
@@ -253,6 +306,49 @@ async def test_workflow_runs_end_to_end_with_stubbed_specialists(
     assert "cfo" in result_data["findings"][0]["source_specialist"]
     assert len(result_data["tool_calls"]) == 1
     assert result_data["tool_calls"][0]["tool"] == "send_slack_dm"
+    # The run reports what it did; the stubs made no model calls.
+    assert result_data["usage"]["calls"] == 0
+    assert result_data["usage"]["by_source"] == {}
+    assert result_data["usage"]["run_id"].startswith("research-")
+
+
+@pytest.mark.asyncio
+async def test_abandoned_run_leaves_no_usage_binding_behind(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A consumer that stops iterating mid-run must not keep the run's id
+    bound in its own context (later usage rows would be mis-tagged), and
+    the run's own cleanup must not raise."""
+    import asyncio
+
+    from openexecutive.audit import usage as au
+
+    async def slow_research_one(slug, agent, ctx):
+        await asyncio.sleep(0.01)
+        return []
+
+    monkeypatch.setattr(
+        "openexecutive.workflows.executive_research.research_one_specialist", slow_research_one,
+    )
+    workflow = ExecutiveResearchWorkflow()
+    gen = workflow.run(inputs=ExecutiveResearchInput(note="t", run_id="run-abandon"), store=MagicMock())
+    first = await gen.__anext__()
+    assert first.type == "step_start"
+    assert au.get_research_run_id() is None  # the binding lives in the run's task
+    await gen.aclose()
+    await asyncio.sleep(0.05)
+    assert au.get_research_run_id() is None
+
+
+def test_finding_cap_applies_after_parsing() -> None:
+    """Malformed items ahead of valid ones must not consume the cap."""
+    from openexecutive.monitoring.research.prompts import PER_SPECIALIST_FINDING_CAP
+
+    bad = {"title": "no summary"}
+    good = {"title": "ok", "summary": "s", "severity_hint": "low",
+            "suggested_audience": "noone", "confidence": "medium"}
+    msg = _make_msg_with_tool_use(
+        "emit_research_findings", {"findings": [bad] * PER_SPECIALIST_FINDING_CAP + [good, good]},
+    )
+    assert len(_extract_findings(msg, "cso")) == 2
 
 
 @pytest.mark.asyncio

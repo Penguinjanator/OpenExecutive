@@ -12,12 +12,20 @@ Two tiers:
 
 - **direct** — added live, quietly (daily cadence, medium floor, keyword
   trigger). Requires the grounding entity to be *in company data* (a named
-  competitor / vendor / ticker / initiative / priority / the company itself)
-  plus enough corroboration (see :func:`classify`). This is the "high
-  likelihood, worth watching — just add it" case.
+  competitor / vendor / ticker / initiative / priority / the company itself,
+  or an entity a department lists under its watched entities) plus enough
+  corroboration (see :func:`classify`). This is the "high likelihood, worth
+  watching — just add it" case.
 - **suggest** — inserted in ``dry_run`` (polls, never alerts) with
-  ``origin=research_proposed``; the principal approves or declines it on
-  ``/watchlist``. This is the "not sure" case.
+  ``origin=research_proposed``; the principal — or, when the grounding term
+  belongs to a department, that department's head — approves or declines
+  it on ``/watchlist``. This is the "not sure" case.
+
+Company data is more than the static profile: a department's watched
+entities, charter scope and goals, and the entities named in recent
+episodic decisions all feed the grounding vocabulary, and a term that came
+from a department carries that department along so the watch (and every
+alert it raises) is routed to it.
 
 A proposal with nothing vouching for it (no linked finding, score 0), one
 for a source already watched, one past the enabled-watch ceiling or the
@@ -33,7 +41,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from openexecutive.alerts.models import AlertSeverity
 from openexecutive.audit import log_event as audit_log
@@ -56,6 +64,7 @@ from openexecutive.monitoring.models import (
 )
 from openexecutive.monitoring.research.models import ResearchFinding
 from openexecutive.monitoring.sources._http import validate_target_url
+from openexecutive.monitoring.sources.base import collapse_whitespace
 from openexecutive.monitoring.validation import normalize_target, registrable_domain
 
 logger = logging.getLogger(__name__)
@@ -101,22 +110,36 @@ KIND_VENDOR = "vendor"
 KIND_TICKER = "ticker"
 KIND_INITIATIVE = "initiative"
 KIND_PRIORITY = "priority"
+# A department's explicit `watched_entities` list: a named external entity,
+# like a profile vendor, so it may ground a direct add.
+KIND_DEPARTMENT_ENTITY = "department_entity"
+# A department's charter scope phrase or goal key result: free text, so it
+# grounds suggestions only (like a priority).
+KIND_DEPARTMENT_SCOPE = "department_scope"
 KIND_WATCH = "watch"  # already watched (label/target) — corroborates, never grounds
 GROUNDING_KINDS: frozenset[str] = frozenset({
     KIND_COMPANY, KIND_COMPETITOR, KIND_VENDOR, KIND_TICKER, KIND_INITIATIVE, KIND_PRIORITY,
+    KIND_DEPARTMENT_ENTITY, KIND_DEPARTMENT_SCOPE,
 })
 # Kinds that name an external ENTITY the company deals with. Only these can
 # ground a direct add: an initiative title or a priority sentence is company
 # data too, but it is a bag of common words ("growth", "platform") that a
 # planted finding can echo, so a watch grounded only in one is a suggestion.
 STRONG_GROUNDING_KINDS: frozenset[str] = frozenset({
-    KIND_COMPANY, KIND_COMPETITOR, KIND_VENDOR, KIND_TICKER,
+    KIND_COMPANY, KIND_COMPETITOR, KIND_VENDOR, KIND_TICKER, KIND_DEPARTMENT_ENTITY,
 })
-# When one term appears in several sources the strongest kind wins.
+# When one term appears in several sources the strongest kind wins. Profile
+# kinds outrank department kinds on purpose: a vendor the profile names and
+# Finance also lists stays a `vendor` (so the policy's vendor history keeps
+# applying to it) and merely gains Finance as its department.
 _KIND_RANK: dict[str, int] = {
-    KIND_COMPANY: 7, KIND_COMPETITOR: 6, KIND_VENDOR: 5, KIND_TICKER: 4,
-    KIND_INITIATIVE: 3, KIND_PRIORITY: 2, KIND_WATCH: 1,
+    KIND_COMPANY: 9, KIND_COMPETITOR: 8, KIND_VENDOR: 7, KIND_TICKER: 6,
+    KIND_DEPARTMENT_ENTITY: 5, KIND_INITIATIVE: 4, KIND_PRIORITY: 3,
+    KIND_DEPARTMENT_SCOPE: 2, KIND_WATCH: 1,
 }
+# Recent decisions are consulted this far back, and only this many.
+DECISION_LOOKBACK_DAYS = 90
+DECISION_LIMIT = 10
 
 # Material-event words every research feed trigger carries, so a competitor
 # blog surfaces "we raised / we launched / pricing" and not every post.
@@ -162,6 +185,9 @@ _POLL_HISTORY_TO_READ = 10
 _NUDGE_MIN_PENDING = 3
 _NUDGE_MIN_AGE_DAYS = 7
 NUDGE_ALERT_SOURCE = "watchlist_suggestions"
+# Department-routed suggestions go to the department head as one card per
+# department per run (see _notify_department_heads).
+DEPARTMENT_CARD_MAX_LINES = 10
 
 
 # --------------------------------------------------------------------- #
@@ -211,16 +237,43 @@ class PolicySettings:
             return cls()
 
 
+class VocabEntry(NamedTuple):
+    """One grounding-vocabulary value: the term's kind, the department that
+    supplied or also claims it, and the entity's own domains when the
+    profile / department entry names them ("Brex (brex.com)"). With
+    domains pinned, only those sites are the entity's own source; without,
+    the site label has to be the entity's name."""
+
+    kind: str
+    department: str = ""
+    domains: tuple[str, ...] = ()
+
+
+class DepartmentRef(NamedTuple):
+    """What the policy needs to know about a department for routing."""
+
+    title: str
+    head_person_id: int | None = None
+
+
+Vocabulary = dict[str, VocabEntry]
+
+
 @dataclass
 class PolicyContext:
     """Everything classify() needs, gathered once per run."""
 
-    vocabulary: dict[str, str]  # normalized term -> kind
+    vocabulary: Vocabulary  # normalized term -> (kind, department slug)
     priority_terms: list[str]
     existing: list[WatchlistItem]
     outcome_counts: dict[tuple[str, str], dict[str, int]] = field(default_factory=dict)
     settings: PolicySettings = field(default_factory=PolicySettings)
     now: datetime = field(default_factory=lambda: datetime.now(UTC))
+    # slug -> (title, head person id); routing targets for department terms.
+    departments: dict[str, DepartmentRef] = field(default_factory=dict)
+    # Recent episodic decisions (memory.episodic.Decision or anything with
+    # ``summary`` / ``department`` attributes), newest first.
+    recent_decisions: list[Any] = field(default_factory=list)
 
 
 @dataclass
@@ -230,6 +283,8 @@ class Decision:
     entity: str
     grounding_kind: str
     reasons: list[str]
+    # Department the watch is routed to ("" = the principal's).
+    department: str = ""
 
 
 # --------------------------------------------------------------------- #
@@ -241,22 +296,193 @@ def _norm(term: str) -> str:
     return " ".join(_TOKEN_RE.findall((term or "").lower()))
 
 
+# A profile list entry is often "Name (TICKER) — free-text description" or
+# "Name A / Name B (products…)". Only the NAME grounds; the description is a
+# bag of common words that would both hide the name (short names such as BYD
+# never match inside a sentence) and poison own-source checks ("global" in
+# "BYD — global cost leader" would make global.com BYD's own site).
+# Em/en dashes split regardless of spacing (typography varies); a plain
+# hyphen only when spaced, so "Mercedes-Benz" and "T-Mobile" survive.
+_ENTRY_SPLIT_RE = re.compile(r"\s*[—–]\s*| - |[:;]")
+_PAREN_RE = re.compile(r"\(([^()]*)\)")
+_TICKER_RE = re.compile(r"^(?:[A-Z]{1,5}(?:\.[A-Z]{1,3})?|\d{3,6}\.[A-Z]{2,3})$")
+_DOMAIN_RE = re.compile(r"^(?:[a-z0-9-]+\.)+[a-z]{2,}$")
+_URL_RE = re.compile(r"^(?:https?://)?((?:[a-z0-9-]+\.)+[a-z]{2,})(?:[/?#].*)?$", re.IGNORECASE)
+# Upper-case words that appear in parentheses in ordinary profile prose and
+# are not tickers. A parenthesised token is a ticker only when it is alone
+# in its group and not one of these; the profile's own `tickers` list is
+# taken as-is.
+# An ALL-CAPS dotted token ending in one of these is a host someone typed
+# in capitals ("GM.COM"), not an exchange ticker ("1211.HK", "MBG.DE").
+_TLD_NOT_EXCHANGE: frozenset[str] = frozenset({
+    "COM", "NET", "ORG", "IO", "CO", "AI", "DEV", "APP", "EDU", "GOV", "INFO", "BIZ", "US", "UK",
+    "CA", "EU", "IN", "AU",
+})
+_NOT_TICKERS: frozenset[str] = frozenset({
+    "US", "USA", "EU", "UK", "EV", "EVS", "AI", "ML", "IT", "HR", "PR", "IR", "IP", "ALL", "NOW",
+    "NEW", "OEM", "OEMS", "LFP", "NMC", "EMEA", "APAC", "LATAM", "CEO", "CFO", "COO", "CTO", "CMO",
+    "CPO", "CHRO", "GC", "IPO", "ESG", "API", "SAAS", "B2B", "B2C", "SMB", "SME", "TCO", "ROI",
+    "KPI", "OKR", "GTM", "R2", "R3", "C1", "C2", "Q1", "Q2", "Q3", "Q4", "FY", "YOY", "QOQ",
+})
+# Profile entries are free text; bound what the parser looks at so a
+# pathological value cannot stall the scheduler tick.
+_MAX_ENTRY_CHARS = 256
+
+
+class ParsedEntity(NamedTuple):
+    names: list[str]
+    tickers: list[str]
+    domains: list[str]
+
+
+def _strip_parens(text: str) -> tuple[str, list[str]]:
+    """Remove parenthesised groups (innermost first, a few levels deep) and
+    return the bare text plus the groups' contents."""
+    groups: list[str] = []
+    for _ in range(3):
+        found = _PAREN_RE.findall(text)
+        if not found:
+            break
+        groups.extend(found)
+        text = _PAREN_RE.sub(" ", text)
+    return text, groups
+
+
+def _entry_head(text: str) -> str:
+    """The name part of an entry: everything before the first separator
+    that is not inside parentheses."""
+    depth = 0
+    masked = []
+    for ch in text:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        masked.append(" " if depth and ch not in "()" else ch)
+    cut = _ENTRY_SPLIT_RE.search("".join(masked))
+    return text[: cut.start()] if cut else text
+
+
+def _host_under(host: str, pinned: tuple[str, ...]) -> bool:
+    """``host`` is one of the pinned hosts or a subdomain of one
+    (news.gm.com under gm.com; never gm.com.evil.com)."""
+    host = host.lower().rstrip(".")
+    return bool(host) and any(host == d or host.endswith("." + d) for d in pinned)
+
+
+def _url_host(url: str) -> str:
+    try:
+        from urllib.parse import urlsplit
+
+        return (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _ticker_in_group(parts: list[str]) -> str | None:
+    """The one ticker in a parenthesised group: an ALL-CAPS ticker-shaped
+    token ("TSLA", "F", "1211.HK") that is not an ordinary abbreviation, when
+    it is the only such token and every other part is a host."""
+    candidates = [
+        part for part in parts
+        if part == part.upper() and _TICKER_RE.match(part) and part not in _NOT_TICKERS
+    ]
+    others = [part for part in parts if part not in candidates]
+    if len(candidates) == 1 and all(_DOMAIN_RE.match(o.lower()) for o in others):
+        return candidates[0]
+    return None
+
+
+def entity_names(raw: str) -> ParsedEntity:
+    """``(names, tickers, domains)`` parsed from one profile / department entry.
+
+    "Tesla (TSLA) — Model Y is the benchmark" → names ["Tesla"], tickers
+    ["TSLA"]; "GM / Chevrolet (Equinox EV, Blazer EV) — direct competitor" →
+    names ["GM", "Chevrolet"]; "Brex (brex.com, status.brex.com)" → names
+    ["Brex"], domains ["brex.com", "status.brex.com"]; "Acme (ACME,
+    acme.com)" → ticker and domain; a bare URL or host
+    ("https://status.stripe.com") → names ["stripe"], domains
+    ["status.stripe.com"]; "Stripe" → ["Stripe"].
+
+    Only parentheses in the NAME part (before the dash / colon) are read;
+    anything in the description is prose. A group yields a ticker only for
+    a single ALL-CAPS ticker-shaped token that is not an ordinary
+    abbreviation ("US", "EV", "IT") — a capitalised brand ("(Waymo)") or a
+    product list is never a ticker; type tickers in capitals. Lower-case
+    dotted tokens are hosts, which pin the entity's own domains.
+    Parenthesised brand names ("Alphabet (Google)") are NOT aliases: list
+    them as entries of their own."""
+    text = " ".join(str(raw or "").split())[:_MAX_ENTRY_CHARS]
+    if not text:
+        return ParsedEntity([], [], [])
+    url = _URL_RE.match(text)
+    # A URL, or a bare lower-case host ("status.stripe.com"); an upper-case
+    # dotted symbol ("1211.HK") is a ticker, handled by the caller.
+    if url and ("://" in text or "/" in text or (" " not in text and text == text.lower())):
+        host = url.group(1).lower()
+        label = _site_label(host)
+        return ParsedEntity([label] if label else [], [], [host])
+    head, groups = _strip_parens(_entry_head(text))
+    tickers: list[str] = []
+    domains: list[str] = []
+    for group in groups:
+        parts = [part.strip().rstrip(".") for part in re.split(r"[,/;]", group) if part.strip(". ")]
+        for part in parts:
+            typed_host = part != part.upper() or part.rsplit(".", 1)[-1] in _TLD_NOT_EXCHANGE
+            if typed_host and _DOMAIN_RE.match(part.lower()) and part.lower() not in domains:
+                domains.append(part.lower())
+        ticker = _ticker_in_group([p for p in parts if p.lower() not in domains])
+        if ticker and ticker not in tickers:
+            tickers.append(ticker)
+    names = [n.strip(" ,") for n in head.split("/")]
+    names = [n for n in names if len(_norm(n)) >= 2]
+    return ParsedEntity(names, tickers, domains)
+
+
+def ticker_symbol(raw: str) -> str:
+    """The symbol in a profile `tickers` entry as typed, minus any trailing
+    note: "NVDA — our supplier" → "NVDA", "1211.HK (BYD)" → "1211.HK"."""
+    text = " ".join(str(raw or "").split())[:_MAX_ENTRY_CHARS]
+    head, _groups = _strip_parens(_entry_head(text))
+    return head.strip(" ,").upper()
+
+
 def grounding_vocabulary(
     profile: Any,
     initiatives: list[Any],
     existing: list[WatchlistItem],
-) -> dict[str, str]:
-    """Normalized term → kind. Company-data kinds win over ``watch`` when a
-    term appears in both (a competitor that is already watched still grounds
-    a new watch on a *different* source of theirs)."""
-    vocab: dict[str, str] = {}
+    departments: list[Any] | None = None,
+) -> Vocabulary:
+    """Normalized term → :class:`VocabEntry`. Company-data kinds win over
+    ``watch`` when a term appears in both (a competitor that is already
+    watched still grounds a new watch on a *different* source of theirs).
 
-    def add(term: str, kind: str) -> None:
+    ``departments`` are ``DepartmentState`` rows: each watched entity is a
+    ``department_entity`` term and each charter-scope phrase / goal key
+    result a ``department_scope`` term, all tagged with the department's
+    slug. When a term is both a profile kind and a department's, the
+    stronger kind wins and the department is kept — a profile competitor
+    that Finance also lists stays a ``competitor`` and routes to Finance.
+    When two departments claim one term, the department that supplied the
+    winning kind owns it (a watched entity beats a scope phrase); on a tie
+    the first one seen keeps it."""
+    vocab: Vocabulary = {}
+
+    def add(term: str, kind: str, department: str = "", domains: tuple[str, ...] = ()) -> None:
         n = _norm(term)
-        if len(n) < 2:
+        # One-letter tickers (F, V, T) are real symbols; anything else that
+        # short is noise.
+        if len(n) < 2 and not (kind == KIND_TICKER and len(n) == 1):
             return
-        if n not in vocab or _KIND_RANK[kind] > _KIND_RANK[vocab[n]]:
-            vocab[n] = kind
+        current = vocab.get(n)
+        if current is None:
+            vocab[n] = VocabEntry(kind, department, domains)
+            return
+        merged = current.domains + tuple(d for d in domains if d not in current.domains)
+        if _KIND_RANK[kind] > _KIND_RANK[current.kind]:
+            vocab[n] = VocabEntry(kind, department or current.department, merged)
+        else:
+            vocab[n] = VocabEntry(current.kind, current.department or department, merged)
 
     for item in existing:
         for label_key in ("display_name", "feed_label", "vendor_label", "label"):
@@ -270,17 +496,92 @@ def grounding_vocabulary(
         add(item.slug.replace("-", " "), KIND_WATCH)
     for i in initiatives:
         add(str(getattr(i, "title", "") or ""), KIND_INITIATIVE)
+    def add_entity(raw: str, kind: str, department: str = "") -> None:
+        # Named-entity lists: only the parsed name(s) ground; a parenthesised
+        # ticker is a ticker term of its own; parenthesised domains pin the
+        # entity's own sites.
+        parsed = entity_names(raw)
+        for name in parsed.names:
+            add(name, kind, department, tuple(parsed.domains))
+        for ticker in parsed.tickers:
+            add(ticker, KIND_TICKER, department)
+
     if profile is not None:
         for p in list(getattr(getattr(profile, "strategic_priorities", None), "current_year", []) or []):
             add(str(p), KIND_PRIORITY)
         for t in list(getattr(profile, "tickers", []) or []):
-            add(str(t), KIND_TICKER)
+            add(ticker_symbol(str(t)), KIND_TICKER)
         for v in list(getattr(profile, "vendors", []) or []):
-            add(str(v), KIND_VENDOR)
+            add_entity(str(v), KIND_VENDOR)
         for c in list(getattr(getattr(profile, "competitive_landscape", None), "primary_competitors", []) or []):
-            add(str(c), KIND_COMPETITOR)
-        add(str(getattr(profile, "name", "") or ""), KIND_COMPANY)
+            add_entity(str(c), KIND_COMPETITOR)
+        add_entity(str(getattr(profile, "name", "") or ""), KIND_COMPANY)
+    for state in departments or []:
+        config = getattr(state, "config", None)
+        slug = str(getattr(config, "slug", "") or "")
+        if not slug:
+            continue
+        for entity in list(getattr(config, "watched_entities", []) or []):
+            add_entity(str(entity), KIND_DEPARTMENT_ENTITY, slug)
+        charter = getattr(config, "charter", None)
+        for phrase in list(getattr(charter, "scope", []) or []):
+            add(str(phrase), KIND_DEPARTMENT_SCOPE, slug)
+        for goal in list(getattr(state, "goals", []) or []):
+            add(str(getattr(goal, "key_result", "") or ""), KIND_DEPARTMENT_SCOPE, slug)
     return vocab
+
+
+def load_departments(db_path: Path | None = None) -> list[Any]:
+    """Every ``DepartmentState`` (watched entities, charter, goals, head),
+    or ``[]`` when the departments store is unavailable. Never raises."""
+    try:
+        from openexecutive.departments.store import list_departments
+
+        return list(list_departments(db_path))
+    except Exception:
+        logger.exception("watch_policy: list_departments failed")
+        return []
+
+
+def recent_decisions(
+    now: datetime | None = None, *, db_path: Path | None = None,
+) -> list[Any]:
+    """Episodic decisions from the last :data:`DECISION_LOOKBACK_DAYS`
+    days, newest first, at most :data:`DECISION_LIMIT`. Never raises."""
+    try:
+        from openexecutive.memory.episodic import get_recent_decisions
+
+        rows = get_recent_decisions(limit=DECISION_LIMIT, db_path=db_path)
+    except Exception:
+        logger.debug("watch_policy: recent decisions unavailable", exc_info=True)
+        return []
+    now = now or datetime.now(UTC)
+    cutoff = now - timedelta(days=DECISION_LOOKBACK_DAYS)
+    out: list[Any] = []
+    for row in rows:
+        ts = _parse(str(getattr(row, "timestamp", "") or ""))
+        # A row whose timestamp cannot be read must not count as "recent"
+        # forever; it is simply not recent.
+        if ts is None or ts < cutoff:
+            continue
+        out.append(row)
+    return out
+
+
+def department_refs(departments: list[Any] | None) -> dict[str, DepartmentRef]:
+    """``slug → DepartmentRef`` for :attr:`PolicyContext.departments`."""
+    refs: dict[str, DepartmentRef] = {}
+    for state in departments or []:
+        config = getattr(state, "config", None)
+        slug = str(getattr(config, "slug", "") or "")
+        if not slug:
+            continue
+        head = getattr(config, "head_person_id", None)
+        refs[slug] = DepartmentRef(
+            title=str(getattr(config, "title", "") or slug),
+            head_person_id=int(head) if isinstance(head, int) else None,
+        )
+    return refs
 
 
 def priority_terms(profile: Any) -> list[str]:
@@ -293,28 +594,51 @@ def priority_terms(profile: Any) -> list[str]:
     return out[:6]
 
 
-def _distinctive_tokens(text: str, vocabulary: dict[str, str] | None = None) -> set[str]:
-    """Tokens that may carry a partial match: not stopwords, and either long
-    enough or a whole vocabulary term in their own right (short names such
-    as IBM, AWS, SAP)."""
+def _name_tokens(text: str, vocabulary: dict[str, Any] | None = None) -> list[str]:
+    """Ordered tokens that may carry a partial match: not stopwords, and
+    either long enough or a whole vocabulary term in their own right (short
+    names such as IBM, AWS, BYD, GM)."""
     vocab = vocabulary or {}
-    return {
+    return [
         t for t in text.split()
         if t not in _STOPWORDS and (len(t) >= _MIN_PARTIAL_TOKEN or t in vocab)
-    }
+    ]
 
 
-def match_entity(entity: str, vocabulary: dict[str, str]) -> tuple[str, str] | None:
+def _distinctive_tokens(text: str, vocabulary: dict[str, Any] | None = None) -> set[str]:
+    """Set form of :func:`_name_tokens`."""
+    return set(_name_tokens(text, vocabulary))
+
+
+def _entry(value: Any) -> VocabEntry:
+    """Coerce a vocabulary value: a plain kind string (legacy / test dicts)
+    or a :class:`VocabEntry`."""
+    if isinstance(value, VocabEntry):
+        return value
+    if isinstance(value, tuple) and 2 <= len(value) <= 3:
+        return VocabEntry(str(value[0]), str(value[1] or ""), tuple(value[2]) if len(value) == 3 else ())
+    return VocabEntry(str(value), "")
+
+
+def match_entity(entity: str, vocabulary: dict[str, Any]) -> tuple[str, str] | None:
     """``(term, kind)`` for the vocabulary term the entity names, else None.
 
     Token containment both ways, so "Acme Corp" matches "Acme" and "Acme"
     matches "Acme Corp"; single-token matches must be a whole token."""
+    hit = match_vocab(entity, vocabulary)
+    return (hit[0], hit[1].kind) if hit else None
+
+
+def match_vocab(entity: str, vocabulary: dict[str, Any]) -> tuple[str, VocabEntry] | None:
+    """``(term, VocabEntry)`` for the vocabulary term the entity names, else
+    None — :func:`match_entity` with the department kept."""
     n = _norm(entity)
+    exact_value = vocabulary.get(n) if n else None
+    exact = _entry(exact_value) if exact_value is not None else None
+    if exact is not None and exact.kind != KIND_WATCH:
+        return n, exact
     if len(n) < 2:
         return None
-    exact = vocabulary.get(n)
-    if exact is not None and exact != KIND_WATCH:
-        return n, exact
     # Partial matching only on distinctive tokens: no stopwords, nothing
     # shorter than _MIN_PARTIAL_TOKEN unless the token is itself a whole
     # vocabulary term ("IBM Corp" still matches competitor "IBM"), so
@@ -323,19 +647,53 @@ def match_entity(entity: str, vocabulary: dict[str, str]) -> tuple[str, str] | N
     tokens = _distinctive_tokens(n, vocabulary)
     # An exact hit on a watch label is only the fallback: a company-data term
     # that contains (or is contained by) the entity still wins.
-    best: tuple[str, str] | None = (n, exact) if exact is not None else None
+    best: tuple[str, VocabEntry] | None = (n, exact) if exact is not None else None
     if not tokens:
         return best
-    for term, kind in vocabulary.items():
+    for term, value in vocabulary.items():
+        entry = _entry(value)
+        if entry.kind == KIND_TICKER:
+            # A ticker symbol grounds only when it IS the entity ("US" is
+            # not "US Foods", "IT" is not "IT Brew"); the exact case was
+            # handled above.
+            continue
         term_tokens = _distinctive_tokens(term, vocabulary)
         if not term_tokens or not (term_tokens <= tokens or tokens <= term_tokens):
             continue
         # Prefer a company-data kind over a watch label, then the longer term.
-        if best is None or (best[1] == KIND_WATCH and kind != KIND_WATCH) or (
-            best[1] == kind and len(term) > len(best[0])
+        if best is None or (best[1].kind == KIND_WATCH and entry.kind != KIND_WATCH) or (
+            best[1].kind == entry.kind and len(term) > len(best[0])
         ):
-            best = (term, kind)
+            best = (term, entry)
     return best
+
+
+def named_in_decision(
+    entity_term: str, decision: Any, vocabulary: dict[str, Any] | None = None,
+) -> bool:
+    """Does a recent episodic decision name this entity? The whole term as
+    a phrase, or EVERY distinctive token of the term as a whole word — so
+    "Acme Corp" is named by "Acme pricing review" (corp is a stopword) but
+    "Acme Security" is not named by "Review the security policy"."""
+    text = _norm(str(getattr(decision, "summary", "") or ""))
+    if not entity_term or not text:
+        return False
+    if f" {entity_term} " in f" {text} ":
+        return True
+    entity_tokens = _distinctive_tokens(entity_term, vocabulary)
+    return bool(entity_tokens) and entity_tokens <= set(text.split())
+
+
+def _decision_bonus(entity_term: str, ctx: PolicyContext) -> tuple[int, str, str]:
+    """``(points, reason, department hint)`` from the recent decisions: +1
+    when one names the entity; the department it was recorded for (when
+    the policy knows that department) is offered as a routing hint."""
+    for recent in ctx.recent_decisions:
+        if not named_in_decision(entity_term, recent, ctx.vocabulary):
+            continue
+        decided_for = str(getattr(recent, "department", "") or "")
+        return 1, "named in a recent decision", decided_for if decided_for in ctx.departments else ""
+    return 0, "", ""
 
 
 def entity_declined(entity: str, declines: list[Any]) -> bool:
@@ -351,7 +709,10 @@ def entity_declined(entity: str, declines: list[Any]) -> bool:
         dn = _norm(str(getattr(d, "entity", "") or ""))
         if len(dn) < 2:
             continue
-        if dn == n:
+        # Exact, or a one-word declined name ("BYD") as a whole word of the
+        # entity ("BYD Auto") and vice versa — short names have no
+        # distinctive tokens, so the token rule below cannot see them.
+        if dn == n or (" " not in dn and dn not in _STOPWORDS and dn in n.split()):
             return True
         d_tokens = {t for t in dn.split() if t not in _STOPWORDS and len(t) >= _MIN_PARTIAL_TOKEN}
         if tokens and d_tokens and (d_tokens <= tokens or tokens <= d_tokens):
@@ -364,7 +725,7 @@ def entity_declined(entity: str, declines: list[Any]) -> bool:
 # --------------------------------------------------------------------- #
 
 
-def _is_own_source(proposal: WatchProposal, entity_term: str, vocabulary: dict[str, str]) -> bool:
+def _is_own_source(proposal: WatchProposal, entity_term: str, vocabulary: dict[str, Any]) -> bool:
     """The target is the entity's own primary source: its ticker for
     stock/edgar, its own domain for a URL, or an allowlisted primary host."""
     if proposal.signal_type in (SOURCE_KIND_STOCK, SOURCE_KIND_EDGAR):
@@ -377,13 +738,26 @@ def _is_own_source(proposal: WatchProposal, entity_term: str, vocabulary: dict[s
         return False
     if host in PRIMARY_SOURCE_HOSTS or any(host.endswith("." + h) for h in PRIMARY_SOURCE_HOSTS):
         return True
+    # When the profile / department pins the entity's domains ("GM
+    # (gm.com)"), only those sites are its own source: a look-alike
+    # registration such as gm.co.ke does not qualify however well it
+    # imitates the entity.
+    entry_value = vocabulary.get(entity_term)
+    pinned = _entry(entry_value).domains if entry_value is not None else ()
+    if pinned:
+        return _host_under(host, pinned)
     # Only the site's own label counts ("acme" in status.acme.com / acme.co.uk);
     # subdomain labels and the TLD never do, so "api" or ".cloud" cannot
-    # make an unrelated host look like the entity's.
-    entity_tokens = {
-        t for t in entity_term.split() if len(t) >= _MIN_PARTIAL_TOKEN and t not in _STOPWORDS
-    }
-    return _site_label(host) in entity_tokens
+    # make an unrelated host look like the entity's. And the label must be
+    # the entity's NAME — its leading distinctive word, or all of its words
+    # run together (acmepayments.com) — not any word of a multi-word entity:
+    # "Acme Payments" is not payments.io. Entities are free text
+    # (departments type them), so a generic trailing word must never hand
+    # an unrelated domain "own source" credit.
+    entity_tokens = _name_tokens(entity_term, vocabulary)
+    if not entity_tokens:
+        return False
+    return _site_label(host) in {entity_tokens[0], "".join(entity_tokens)}
 
 
 # Second-level labels under which the real site label sits one step deeper
@@ -404,19 +778,26 @@ def _site_label(host: str) -> str:
     return labels[-2]
 
 
-def _finding_supports(proposal: WatchProposal, finding: ResearchFinding, entity_term: str) -> bool:
+def _finding_supports(
+    proposal: WatchProposal,
+    finding: ResearchFinding,
+    entity_term: str,
+    vocabulary: dict[str, Any] | None = None,
+) -> bool:
     """Does the cited finding actually concern this target? A URL target
     must share its site with one of the finding's cited URLs; a ticker or
     query target must appear in the finding's text or be about the entity
     the finding names."""
     text = _norm(f"{finding.title} {finding.summary}")
     text_tokens = set(text.split())
-    entity_tokens = {
-        t for t in entity_term.split() if len(t) >= _MIN_PARTIAL_TOKEN and t not in _STOPWORDS
-    }
-    names_entity = bool(entity_term) and (entity_term in text or bool(entity_tokens & text_tokens))
+    entity_tokens = _distinctive_tokens(entity_term, vocabulary)
+    names_entity = bool(entity_term) and (
+        f" {entity_term} " in f" {text} " or bool(entity_tokens & text_tokens)
+    )
     if proposal.signal_type in (SOURCE_KIND_STOCK, SOURCE_KIND_EDGAR):
-        return _norm(proposal.target) in text_tokens or names_entity
+        # Phrase containment: a dotted ticker normalizes to two words.
+        target_phrase = _norm(proposal.target)
+        return bool(target_phrase) and f" {target_phrase} " in f" {text} " or names_entity
     if proposal.signal_type == SOURCE_KIND_QUERY:
         return names_entity
     # A URL target must share its site with a cited URL: a finding that
@@ -467,36 +848,60 @@ def classify(
     +1 entity is already watched under another source (corroboration)
     +1 target is the entity's own source (its ticker / its domain / a primary host)
     +1 finding confidence is high
-    +1 finding verification is 'confirmed'
     +1 cross-specialist consensus on the finding
+    +1 the entity is named in a recent episodic decision
     ±1 policy history for (signal_type, grounding kind) at >=5 samples
 
     Finding points count only when the cited finding concerns this source
     (shares its site with a cited URL, or names the entity). Direct at
     >= DIRECT_THRESHOLD with the mandatory entity match, only for the
-    entity's OWN source, and only when the entity is a named competitor /
-    vendor / ticker / the company (STRONG_GROUNDING_KINDS); the model's own
-    ``certainty`` can only downgrade. ``query`` is never direct.
+    entity's OWN source, only with a finding that concerns this source,
+    and only when the entity is a named competitor /
+    vendor / ticker / the company / a department's watched entity
+    (STRONG_GROUNDING_KINDS); the model's own ``certainty`` can only
+    downgrade. ``query`` is never direct.
+
+    The decision carries a ``department`` when the matched term belongs to
+    one (or, failing that, when the decision that names the entity does):
+    the watch and its alerts are routed there instead of to the principal.
     """
     reasons: list[str] = []
     score = 0
-    match = match_entity(proposal.grounding_entity, ctx.vocabulary)
-    entity_term, kind = (match if match else ("", ""))
+    match = match_vocab(proposal.grounding_entity, ctx.vocabulary)
+    entity_term, entry = (match if match else ("", VocabEntry("", "")))
+    kind, department = entry.kind, entry.department
     grounded = kind in GROUNDING_KINDS
     if grounded:
         score += 2
-        reasons.append(f"entity '{proposal.grounding_entity}' is a company {kind}")
+        what = (
+            f"a {ctx.departments[department].title if department in ctx.departments else department} "
+            f"{'watched entity' if kind == KIND_DEPARTMENT_ENTITY else 'scope item'}"
+            if kind in (KIND_DEPARTMENT_ENTITY, KIND_DEPARTMENT_SCOPE) and department
+            else f"a company {kind}"
+        )
+        reasons.append(f"entity '{proposal.grounding_entity}' is {what}")
     elif kind == KIND_WATCH:
         score += 1
         reasons.append(f"entity '{proposal.grounding_entity}' matches an existing watch")
     else:
         reasons.append(f"entity '{proposal.grounding_entity}' is not in company data")
 
+    if grounded:
+        # Only a company-data entity earns the decision point; a bare watch
+        # label must not pick up a department from a decision.
+        bonus, why, hint = _decision_bonus(entity_term, ctx)
+        if bonus:
+            score += bonus
+            reasons.append(why)
+            # A decision made for a department is a routing hint when the
+            # term itself has none.
+            department = department or hint
+
     own_source = bool(entity_term) and _is_own_source(proposal, entity_term, ctx.vocabulary)
     if own_source:
         score += 1
         reasons.append("target is the entity's own source")
-    supported = finding is not None and _finding_supports(proposal, finding, entity_term)
+    supported = finding is not None and _finding_supports(proposal, finding, entity_term, ctx.vocabulary)
     if finding is not None and not supported:
         # The cited finding says nothing about THIS source, so it lends it
         # no credit — the model cannot borrow a strong finding's points for
@@ -506,9 +911,6 @@ def classify(
         if finding.confidence == "high":
             score += 1
             reasons.append("finding confidence high")
-        if finding.verification == "confirmed":
-            score += 1
-            reasons.append("source verified")
         if "," in (finding.source_specialist or ""):
             score += 1
             reasons.append("cross-specialist consensus")
@@ -519,7 +921,7 @@ def classify(
 
     if _same_source_already_watched(proposal, ctx.existing):
         reasons.append("same source already watched")
-        return Decision(TIER_REJECT, score, entity_term, kind, reasons)
+        return Decision(TIER_REJECT, score, entity_term, kind, reasons, department)
 
     enabled_count = sum(1 for i in ctx.existing if i.enabled)
     if enabled_count >= ctx.settings.max_enabled:
@@ -527,12 +929,12 @@ def classify(
         # it would latch: every run would add polling rows and no proposal
         # could ever be direct again.
         reasons.append(f"watchlist at its ceiling ({enabled_count} enabled)")
-        return Decision(TIER_REJECT, score, entity_term, kind, reasons)
+        return Decision(TIER_REJECT, score, entity_term, kind, reasons, department)
     if finding is None or score < SUGGEST_THRESHOLD:
         # Nothing vouches for it: no linked finding, or neither company data
         # nor evidence scored a point. Not worth the principal's time.
         reasons.append("no evidence to put in front of the principal")
-        return Decision(TIER_REJECT, score, entity_term, kind, reasons)
+        return Decision(TIER_REJECT, score, entity_term, kind, reasons, department)
 
     tier = TIER_SUGGEST
     if grounded and score >= DIRECT_THRESHOLD:
@@ -546,13 +948,22 @@ def classify(
         # competitor, however well corroborated, is the principal's call.
         tier = TIER_SUGGEST
         reasons.append("not the entity's own source")
+    if tier == TIER_DIRECT and not supported:
+        # Company data plus a decision mention can reach the bar on their
+        # own; adding without asking still needs a finding that actually
+        # cites this source, so nothing goes live on hearsay.
+        tier = TIER_SUGGEST
+        reasons.append("no finding cites this source")
     if tier == TIER_DIRECT and kind not in STRONG_GROUNDING_KINDS:
         tier = TIER_SUGGEST
-        reasons.append(f"grounded only in a {kind} — needs a named competitor, vendor or ticker")
+        reasons.append(
+            f"grounded only in a {kind} — needs a named competitor, vendor, ticker "
+            "or department watched entity"
+        )
     if tier == TIER_DIRECT and proposal.certainty != "confident":
         tier = TIER_SUGGEST
         reasons.append("model marked it unsure")
-    return Decision(tier, score, entity_term, kind, reasons)
+    return Decision(tier, score, entity_term, kind, reasons, department)
 
 
 # --------------------------------------------------------------------- #
@@ -606,23 +1017,128 @@ def _safe_source_url(finding: ResearchFinding | None) -> str:
     return ""
 
 
-def _policy_stamp(decision: Decision, proposal: WatchProposal, finding: ResearchFinding | None) -> dict[str, Any]:
+def _policy_stamp(
+    decision: Decision,
+    proposal: WatchProposal,
+    finding: ResearchFinding | None,
+    supported: bool = True,
+) -> dict[str, Any]:
     return {
         # The matched company-data term, else the model's own entity string,
         # so a not_relevant decline on an ungrounded suggestion still
         # blacklists the entity the model named.
         "entity": decision.entity or _norm(proposal.grounding_entity),
         "grounding_kind": decision.grounding_kind,
+        "department": decision.department,
         "specialist": (finding.source_specialist if finding else ""),
         "score": decision.score,
-        "reasons": decision.reasons[:6],
-        "source_url": _safe_source_url(finding),
+        "reasons": decision.reasons[:8],
+        "source_url": _safe_source_url(finding) if supported else "",
     }
+
+
+_CONFIDENCE_RANK = {"high": 2, "medium": 1, "low": 0}
+
+
+def auto_link_finding(
+    proposal: WatchProposal, findings: list[ResearchFinding], ctx: PolicyContext,
+) -> int | None:
+    """Index of the finding that best concerns this proposal's source, for a
+    proposal the model filed without a usable ``finding_index``.
+
+    Candidates pass the same test the score uses (:func:`_finding_supports`
+    with the entity term :func:`classify` would use), so the link can never
+    lend a proposal a finding the score would not honour. Among candidates,
+    one that cites the target's site or names the ticker outranks one that
+    only names the entity, then higher confidence, then the earlier finding — so the evidence URL stamped on the row is the
+    source's own, not an unrelated company's."""
+    match = match_vocab(proposal.grounding_entity, ctx.vocabulary)
+    entity_term = match[0] if match else ""
+    target_phrase = _norm(proposal.target)
+    host = registrable_domain(proposal.target)
+    entity_labels = set(_name_tokens(entity_term, ctx.vocabulary)) | {target_phrase.replace(" ", "")}
+    entry_value = ctx.vocabulary.get(entity_term) if entity_term else None
+    pinned = _entry(entry_value).domains if entry_value is not None else ()
+    best: tuple[tuple[int, int, int, int], int] | None = None
+    for index, finding in enumerate(findings):
+        if not _finding_supports(proposal, finding, entity_term, ctx.vocabulary):
+            continue
+        text = _norm(f"{finding.title} {finding.summary}")
+        cites_source = int(
+            bool(host) and any(registrable_domain(u) == host for u in finding.relevant_urls)
+            or bool(target_phrase) and f" {target_phrase} " in f" {text} "
+        )
+        # A finding whose own citations sit on the entity's site (acme.com
+        # for ACME) outranks one that names it from a rival's page, so the
+        # evidence link stamped on the row is the entity's, not a stranger's.
+        cites_entity_site = int(any(
+            _host_under(_url_host(u), pinned) if pinned
+            else _site_label(registrable_domain(u)) in entity_labels
+            for u in finding.relevant_urls
+        ))
+        key = (
+            cites_source,
+            cites_entity_site,
+            _CONFIDENCE_RANK.get(finding.confidence, 0),
+            -index,
+        )
+        if best is None or key > best[0]:
+            best = (key, index)
+    return best[1] if best else None
 
 
 def policy_stamp_of(item: WatchlistItem) -> dict[str, Any]:
     stamp = item.config_json.get("_policy") if isinstance(item.config_json, dict) else None
     return dict(stamp) if isinstance(stamp, dict) else {}
+
+
+# Order in which proposals are persisted: what could go live first, then what
+# could be suggested, then what is already rejected (consumes no budget).
+_TIER_RANK: dict[str, int] = {TIER_DIRECT: 0, TIER_SUGGEST: 1, TIER_REJECT: 2}
+
+
+def _link_evidence(
+    proposal: WatchProposal,
+    findings: list[ResearchFinding],
+    ctx: PolicyContext,
+) -> tuple[WatchProposal, ResearchFinding | None, bool, str]:
+    """Resolve the finding a proposal cites, repairing a missing or
+    unsupported ``finding_index`` with the finding that best concerns the
+    source. Returns ``(proposal, finding, supported, linked_note)``; the
+    proposal is a copy when its index was repaired (the caller's is left as
+    filed)."""
+    finding = (
+        findings[proposal.finding_index]
+        if proposal.finding_index is not None and 0 <= proposal.finding_index < len(findings)
+        else None
+    )
+    linked_note = ""
+    cited_term = match_vocab(proposal.grounding_entity, ctx.vocabulary)
+    given = proposal.finding_index
+    given_valid = given is not None and 0 <= given < len(findings)
+    if finding is None or not _finding_supports(
+        proposal, finding, cited_term[0] if cited_term else "", ctx.vocabulary,
+    ):
+        # The model routinely omits finding_index, or guesses one that
+        # does not concern this source; the finding that does is still
+        # the evidence, so link it (a copy: the caller's proposal is
+        # left as filed). A cited finding that does not concern the
+        # source is never kept as evidence.
+        cited_note = ""
+        if given is not None:
+            cited_note = f" (the cited #{given + 1} did not)" if given_valid else " (the cited index was invalid)"
+        auto_index = auto_link_finding(proposal, findings, ctx)
+        if auto_index is not None:
+            finding = findings[auto_index]
+            proposal = dataclasses.replace(proposal, finding_index=auto_index)
+            linked_note = f"linked to finding #{auto_index + 1}, which concerns this source" + cited_note
+    # A cited finding that does not concern the source still marks the
+    # proposal as research-derived (it may be a suggestion) but is never
+    # the evidence link shown beside Approve.
+    supported = finding is not None and _finding_supports(
+        proposal, finding, cited_term[0] if cited_term else "", ctx.vocabulary,
+    )
+    return proposal, finding, supported, linked_note
 
 
 def apply_proposals(
@@ -633,29 +1149,49 @@ def apply_proposals(
     db_path: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Classify and persist. Returns tool-call-shaped summaries
-    (``tool='propose_watch'``, plus ``outcome`` = added | suggested | rejected)
-    so the run's artifact and audit accounting stay uniform."""
-    summaries: list[dict[str, Any]] = []
+    (``tool='propose_watch'``, plus ``outcome`` = added | suggested | rejected),
+    one per proposal in the order they were filed, so the run's artifact and
+    audit accounting stay uniform.
+
+    Proposals are applied strongest first: each is classified once against
+    the run's starting state, then persisted in order of tier (direct adds,
+    then suggestions, then rejects) and descending score, ties in file order.
+    So when the model files more candidates than the per-run budgets or the
+    enabled-watch ceiling allow, the slots go to the best-grounded ones
+    rather than the earliest, and a duplicate target keeps its strongest
+    filing. The score itself does not depend on what was inserted earlier,
+    but the tier does: the persisting pass classifies again so a row
+    inserted for a stronger proposal counts as "already watched" for a
+    weaker one on the same site."""
+    summaries: list[dict[str, Any] | None] = [None] * len(proposals)
     direct_left = max(0, ctx.settings.max_direct_adds)
     suggest_left = max(0, ctx.settings.max_suggestions)
     seen_targets: set[str] = set()
+    suggested_by_dept: dict[str, list[WatchlistItem]] = {}
     # Rows inserted earlier in this loop must count as "already watched" for
     # later proposals; work on a copy so the caller's context is untouched.
     live_existing = list(ctx.existing)
     ctx = dataclasses.replace(ctx, existing=live_existing)
 
-    for proposal in proposals:
-        finding = (
-            findings[proposal.finding_index]
-            if proposal.finding_index is not None and 0 <= proposal.finding_index < len(findings)
-            else None
-        )
+    # Pass 1 (file order): link each proposal to its evidence and classify
+    # it against the starting state to fix the order.
+    prepared: list[tuple[tuple[int, int, int], WatchProposal, ResearchFinding | None, bool, str]] = []
+    for index, proposal in enumerate(proposals):
+        proposal, finding, supported, linked_note = _link_evidence(proposal, findings, ctx)
+        first_look = classify(proposal, finding, ctx)
+        key = (_TIER_RANK.get(first_look.tier, len(_TIER_RANK)), -first_look.score, index)
+        prepared.append((key, proposal, finding, supported, linked_note))
+    prepared.sort(key=lambda item: item[0])
+
+    # Pass 2 (strongest first): duplicates, budgets, inserts, audit rows.
+    for (_tier_rank, _neg_score, index), proposal, finding, supported, linked_note in prepared:
         if proposal.normalized_target in seen_targets:
-            summaries.append(_summary(proposal, "rejected", "duplicate target in this run"))
+            summaries[index] = _summary(proposal, "rejected", "duplicate target in this run")
             continue
         seen_targets.add(proposal.normalized_target)
-
         decision = classify(proposal, finding, ctx)
+        if linked_note:
+            decision.reasons.insert(0, linked_note)
         if decision.tier == TIER_DIRECT and direct_left <= 0:
             decision.tier = TIER_SUGGEST
             decision.reasons.append("direct-add budget spent this run")
@@ -669,15 +1205,18 @@ def apply_proposals(
                 f"Research watch rejected: {proposal.slug} — {'; '.join(decision.reasons[-2:])}",
                 actor="executive",
                 details={"slug": proposal.slug, "target": proposal.target,
-                         "signal_type": proposal.signal_type, **_policy_stamp(decision, proposal, finding)},
+                         "signal_type": proposal.signal_type, **_policy_stamp(decision, proposal, finding, supported)},
             )
-            summaries.append(_summary(proposal, "rejected", decision.reasons[-1] if decision.reasons else ""))
+            summaries[index] = _summary(proposal, "rejected", decision.reasons[-1] if decision.reasons else "")
             continue
-
         cadence, floor, trigger = quiet_defaults(proposal, ctx.priority_terms)
         config = dict(proposal.config)
-        config["_policy"] = _policy_stamp(decision, proposal, finding)
+        config["_policy"] = _policy_stamp(decision, proposal, finding, supported)
         is_direct = decision.tier == TIER_DIRECT
+        # A department-grounded watch is the department's: its alerts go to
+        # the head (as of now — the head at insert time; a later head change
+        # does not re-route existing rows) and its suggestion card too.
+        dept_ref = ctx.departments.get(decision.department) if decision.department else None
         try:
             new_id = ms.insert_watchlist_item(
                 slug=proposal.slug,
@@ -689,6 +1228,8 @@ def apply_proposals(
                 severity_floor=floor,
                 severity_ceiling=AlertSeverity.URGENT,
                 route_to_specialist=proposal.route_to_specialist,
+                route_to_department=decision.department if dept_ref else "",
+                route_to_person_id=dept_ref.head_person_id if dept_ref else None,
                 mode=MODE_ACTIVE if is_direct else MODE_DRY_RUN,
                 notes=proposal.rationale[:500],
                 origin=ORIGIN_RESEARCH if is_direct else ORIGIN_RESEARCH_PROPOSED,
@@ -696,7 +1237,7 @@ def apply_proposals(
             )
         except Exception:
             logger.exception("watch_policy: insert failed for %s", proposal.slug)
-            summaries.append(_summary(proposal, "rejected", "insert failed (see server log)"))
+            summaries[index] = _summary(proposal, "rejected", "insert failed (see server log)")
             continue
 
         inserted = ms.get_watchlist_item(new_id, db_path=db_path)
@@ -706,7 +1247,7 @@ def apply_proposals(
             "watchlist_id": new_id, "slug": proposal.slug, "target": proposal.target,
             "signal_type": proposal.signal_type, "rationale": proposal.rationale[:240],
             "cadence": cadence, "severity_floor": floor.value, "trigger": trigger,
-            **_policy_stamp(decision, proposal, finding),
+            **_policy_stamp(decision, proposal, finding, supported),
         }
         if is_direct:
             direct_left -= 1
@@ -715,10 +1256,10 @@ def apply_proposals(
                 f"Started watching {proposal.slug} — {proposal.rationale[:120] or decision.entity}",
                 actor="executive", details=details,
             )
-            summaries.append(_summary(
+            summaries[index] = _summary(
                 proposal, "added",
                 f"added (score {decision.score}; {decision.reasons[0] if decision.reasons else ''})",
-            ))
+            )
         else:
             suggest_left -= 1
             audit_log(
@@ -726,11 +1267,71 @@ def apply_proposals(
                 f"Suggested watching {proposal.slug} — {'; '.join(decision.reasons[-2:])}",
                 actor="executive", details=details,
             )
-            summaries.append(_summary(
+            summaries[index] = _summary(
                 proposal, "suggested",
                 f"suggested for approval (score {decision.score}; {decision.reasons[-1] if decision.reasons else ''})",
-            ))
-    return summaries
+            )
+            if dept_ref is not None and inserted is not None:
+                suggested_by_dept.setdefault(decision.department, []).append(inserted)
+    _notify_department_heads(suggested_by_dept, ctx)
+    # Every proposal was given a summary in one of the passes above.
+    return [s for s in summaries if s is not None]
+
+
+def _notify_department_heads(
+    suggested: dict[str, list[WatchlistItem]], ctx: PolicyContext,
+) -> int:
+    """One "watch suggestions" card per department whose head should
+    review the suggestions this run filed for it — routed to the head, or
+    to the principal when the department has no head. Weekly-keyed and
+    coalesced (see ``propose_via_alert``) so re-runs refresh an open card
+    and never re-mint one the head already handled. Returns cards filed."""
+    if not suggested:
+        return 0
+    from openexecutive.departments.authority import propose_via_alert
+
+    year, week, _ = ctx.now.isocalendar()
+    suffix = f"{year}-W{week:02d}"
+    filed = 0
+    for slug, items in suggested.items():
+        ref = ctx.departments.get(slug)
+        if ref is None:
+            continue
+        person_id = ref.head_person_id
+        if person_id is None:
+            try:
+                from openexecutive.people.registry import get_principal
+
+                principal = get_principal()
+                person_id = int(principal.id) if principal and principal.id is not None else None
+            except Exception:
+                logger.debug("watch_policy: principal lookup failed", exc_info=True)
+        if person_id is None:
+            continue
+        lines = [
+            f"- {i.slug} ({i.signal_type}) — {collapse_whitespace(i.notes or i.target)}"[:200]
+            for i in items[:DEPARTMENT_CARD_MAX_LINES]
+        ]
+        body = (
+            f"The Executive suggested these sources for {ref.title} to monitor and "
+            "is not sure enough to add them on its own. Approve or decline them "
+            "on the Watch list page.\n\n" + "\n".join(lines)
+        )
+        try:
+            alert_id = propose_via_alert(
+                slug, person_id,
+                summary=f"Watch suggestions for {ref.title}",
+                body=body,
+                suggested_action="Review the suggestions on /watchlist",
+                extra_tags=["watchlist"],
+                external_id_suffix=suffix,
+            )
+        except Exception:
+            logger.exception("watch_policy: department card failed for %s", slug)
+            continue
+        if alert_id:
+            filed += 1
+    return filed
 
 
 def _summary(proposal: WatchProposal, outcome: str, detail: str) -> dict[str, Any]:
@@ -893,7 +1494,12 @@ def _auto_disable(now: datetime, db_path: Path | None) -> int:
 
 
 def _nudge_if_piled_up(now: datetime, db_path: Path | None) -> int:
-    pending = ms.list_pending_suggestions(db_path=db_path)
+    # Suggestions routed to a department HEAD were put in front of that head
+    # when they were filed; everything else (the principal's own, and rows
+    # for a department without a head) is the principal's pile.
+    pending = [
+        i for i in ms.list_pending_suggestions(db_path=db_path) if i.route_to_person_id is None
+    ]
     if len(pending) < _NUDGE_MIN_PENDING:
         return 0
     created = _parse(pending[0].created_at)
@@ -950,18 +1556,30 @@ __all__ = [
     "TIER_REJECT",
     "TIER_SUGGEST",
     "STRONG_GROUNDING_KINDS",
+    "DECISION_LIMIT",
+    "DECISION_LOOKBACK_DAYS",
     "Decision",
+    "DepartmentRef",
     "PolicyContext",
     "PolicySettings",
+    "VocabEntry",
     "WatchProposal",
     "apply_proposals",
+    "auto_link_finding",
     "classify",
+    "department_refs",
     "entity_declined",
+    "entity_names",
+    "ticker_symbol",
     "grounding_vocabulary",
+    "load_departments",
     "match_entity",
+    "match_vocab",
+    "named_in_decision",
     "policy_stamp_of",
     "priority_terms",
     "quiet_defaults",
+    "recent_decisions",
     "record_outcome_for",
     "sweep",
 ]

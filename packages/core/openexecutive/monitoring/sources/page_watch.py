@@ -47,7 +47,7 @@ from openexecutive.config import get_settings
 from openexecutive.monitoring import store
 from openexecutive.monitoring.models import (
     PAGE_WATCH_FETCH_KEY,
-    PAGE_WATCH_FETCH_XCRAWL,
+    PAGE_WATCH_FETCH_LEGACY_XCRAWL,
     SOURCE_KIND_PAGE_WATCH,
     Signal,
     WatchlistItem,
@@ -63,9 +63,8 @@ logger = logging.getLogger(__name__)
 # Pages change slowly; 6h is polite and sufficient. Per-row cadence can tighten.
 _DEFAULT_POLL_MINUTES = 360
 
-# The fetch-source sentinel (config_json["fetch"] == "xcrawl") lives in
-# monitoring.models so the insert-time validator and this adapter share one
-# definition; see PAGE_WATCH_FETCH_KEY / PAGE_WATCH_FETCH_XCRAWL.
+# The legacy fetch marker (config_json["fetch"] == "xcrawl") lives in
+# monitoring.models; see PAGE_WATCH_FETCH_KEY / PAGE_WATCH_FETCH_LEGACY_XCRAWL.
 
 # Cap the text we SNAPSHOT (store) and DIFF — NOT what we hash. Detection
 # hashes the full normalized text so a change anywhere on the page registers;
@@ -80,9 +79,11 @@ _SUMMARY_SNIPPET_CHARS = 160
 _ADDED_TEXT_CHARS = 1_000
 
 # <script>/<style>/<noscript> blocks: drop content, not just tags, so inline
-# JS/CSS never counts as "visible text".
-_DROP_BLOCKS_RE = re.compile(r"(?is)<(script|style|noscript)\b.*?</\1>")
-_COMMENT_RE = re.compile(r"(?s)<!--.*?-->")
+# JS/CSS never counts as "visible text". Removed by a linear scan
+# (_strip_blocks), not a lazy `.*?` regex: on a page full of unterminated
+# openers such a regex is quadratic, and a page the server sends is the
+# attacker's to shape.
+_DROP_BLOCK_TAGS = ("script", "style", "noscript")
 _TAG_RE = re.compile(r"(?s)<[^>]+>")
 _WS_RE = re.compile(r"\s+")
 
@@ -105,15 +106,7 @@ class PageWatchSource:
             logger.warning("page_watch: rejecting %r target — %s", item.slug, reason)
             return []
 
-        # Two fetch paths. Default is the keyless httpx fetcher. Rows whose
-        # config_json carries ``{"fetch": "xcrawl"}`` route through xcrawl's
-        # scrape API instead — for pages the keyless fetcher can't read
-        # (JS-only SPAs, soft bot blocks) that publish no RSS feed. xcrawl
-        # returns clean markdown, so it skips the HTML→text reduction.
-        if item.config_json.get(PAGE_WATCH_FETCH_KEY) == PAGE_WATCH_FETCH_XCRAWL:
-            text = await self._fetch_text_xcrawl(item)
-        else:
-            text = await self._fetch_text_httpx(item)
+        text = await self._fetch_text_httpx(item)
         if text is None:
             # Fetch failed (already logged at the fetch site) — drop this tick.
             return []
@@ -130,9 +123,20 @@ class PageWatchSource:
         snapshot = text[:_MAX_TEXT_CHARS]
         prior = store.get_page_watch_state(item.slug, db_path=db_path)
 
-        if prior is None:
+        # A row still tagged with the legacy xcrawl marker has a baseline
+        # captured as scraped markdown, which never hashes equal to the
+        # httpx text of the same page. Re-capture it silently and clear the
+        # marker so the switch of fetcher is not reported as a page change.
+        # Only a stored row can have its marker cleared, so an unsaved item
+        # (no id) is compared normally rather than re-baselined every poll.
+        legacy_baseline = bool(item.id) and (
+            item.config_json.get(PAGE_WATCH_FETCH_KEY) == PAGE_WATCH_FETCH_LEGACY_XCRAWL
+        )
+        if prior is None or legacy_baseline:
             # First observation — record the baseline, do not alert.
             store.upsert_page_watch_state(item.slug, content_hash, snapshot, db_path=db_path)
+            if legacy_baseline:
+                self._clear_legacy_marker(item, db_path=db_path)
             logger.debug("page_watch: %s baseline captured", item.slug)
             return []
 
@@ -191,41 +195,27 @@ class PageWatchSource:
                 "page_watch: %s exceeded byte cap — dropping tick", item.target,
             )
             return None
-        return _html_to_text(body)
+        return html_to_text(body)
 
-    async def _fetch_text_xcrawl(self, item: WatchlistItem) -> str | None:
-        """Fetch via xcrawl scrape (markdown) → normalized text, or ``None``.
-
-        Returns ``None`` when xcrawl is disabled or the scrape failed /
-        returned nothing. xcrawl markdown is already clean text, so we only
-        collapse whitespace (matching ``_html_to_text``'s output) so the
-        content hash is stable across trivial reformatting.
-        """
-        from openexecutive.integrations import xcrawl_client
-
-        markdown = await xcrawl_client.scrape(item.target)
-        if markdown is None:
-            # Disabled xcrawl is an expected config state, not a fault — a
-            # row tagged fetch=xcrawl on a deployment with XCRAWL_ENABLED=false
-            # would otherwise log a WARNING every poll tick. Demote that case
-            # to debug; a genuine scrape failure (xcrawl on, call failed) was
-            # already logged inside xcrawl_client.scrape, so debug here too.
-            if not get_settings().xcrawl_enabled:
-                logger.debug(
-                    "page_watch: %s tagged fetch=xcrawl but xcrawl disabled",
-                    item.slug,
-                )
-            else:
-                logger.debug(
-                    "page_watch: xcrawl scrape yielded nothing for %s (%s)",
-                    item.slug, item.target,
-                )
-            return None
-        # `or None` (not "") so that markdown which normalizes to empty — e.g.
-        # truncated down to a whitespace-only prefix — is treated as "no fetch
-        # this tick" (drop, keep prior baseline), NOT as an empty extraction
-        # that would store a blank baseline and later "change" into content.
-        return _WS_RE.sub(" ", markdown).strip() or None
+    @staticmethod
+    def _clear_legacy_marker(item: WatchlistItem, *, db_path: Path | None) -> None:
+        """Drop the legacy ``fetch: xcrawl`` marker from the row's config so
+        the next poll compares against the freshly captured baseline. The
+        key is removed in place (no read-modify-write of the whole column),
+        so a concurrent edit to another config key is kept. Best-effort: a
+        failed update only means the baseline is re-captured once more."""
+        if not item.id:
+            return
+        try:
+            changed = store.remove_watchlist_config_key(
+                item.id, PAGE_WATCH_FETCH_KEY, db_path=db_path,
+            )
+        except Exception:  # noqa: BLE001 — never let housekeeping sink a poll
+            changed = 0
+        if not changed:
+            logger.warning(
+                "page_watch: could not clear legacy fetch marker on %s", item.slug,
+            )
 
     def matches_trigger(self, signal: Signal, item: WatchlistItem) -> bool:
         """Optional keyword filter — matched against the change summary + added text."""
@@ -245,7 +235,7 @@ class PageWatchSource:
 # --------------------------------------------------------------------- #
 
 
-def _html_to_text(body: bytes) -> str:
+def html_to_text(body: bytes) -> str:
     """Reduce an HTML page to normalized, comparable visible text.
 
     Markup-insensitive on purpose: strips <script>/<style>/<noscript> blocks
@@ -257,14 +247,55 @@ def _html_to_text(body: bytes) -> str:
         markup = body.decode("utf-8", errors="replace")
     except Exception:
         return ""
-    markup = _DROP_BLOCKS_RE.sub(" ", markup)
-    markup = _COMMENT_RE.sub(" ", markup)
+    markup = _strip_blocks(markup)
     markup = _TAG_RE.sub(" ", markup)
     text = html.unescape(markup)
     # Full normalized text — NOT truncated. The fetch is already byte-capped
     # (~2MB), and hashing the whole thing means detection has no blind spot;
     # snapshot/diff length is bounded separately at the call site.
     return _WS_RE.sub(" ", text).strip()
+
+
+def _strip_blocks(markup: str) -> str:
+    """Drop HTML comments and <script>/<style>/<noscript> blocks (content
+    included) in one pass that is linear in the page length. An unterminated
+    comment or block runs to the end of the page: a truncated script is not
+    visible text either."""
+    lower = markup.lower()
+    n = len(markup)
+    out: list[str] = []
+    i = 0
+    while i < n:
+        j = lower.find("<", i)
+        if j == -1:
+            out.append(markup[i:])
+            break
+        out.append(markup[i:j])
+        if lower.startswith("<!--", j):
+            end = lower.find("-->", j + 4)
+            i = n if end == -1 else end + 3
+            out.append(" ")
+            continue
+        tag = next(
+            (
+                t for t in _DROP_BLOCK_TAGS
+                if lower.startswith("<" + t, j)
+                and (j + 1 + len(t) >= n or not (lower[j + 1 + len(t)].isalnum() or lower[j + 1 + len(t)] == "_"))
+            ),
+            None,
+        )
+        if tag is None:
+            out.append("<")
+            i = j + 1
+            continue
+        close = lower.find("</" + tag, j)
+        if close == -1:
+            i = n
+        else:
+            gt = lower.find(">", close)
+            i = n if gt == -1 else gt + 1
+        out.append(" ")
+    return "".join(out)
 
 
 def _diff(old: str, new: str) -> tuple[int, str]:

@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, HTTPException, Response, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from openexecutive.departments import registry, store
 from openexecutive.departments.models import (
@@ -73,6 +73,29 @@ class DepartmentPatch(BaseModel):
     slack_channel_id: str | None = None
     discord_channel_id: str | None = None
     telegram_chat_id: str | None = None
+    # Named external entities the department wants watched (strong grounding
+    # for the research watch policy). Sending `[]` clears the list.
+    watched_entities: list[str] | None = Field(default=None, max_length=50)
+
+    @field_validator("watched_entities")
+    @classmethod
+    def _clean_watched_entities(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for raw in value:
+            name = " ".join(raw.split())
+            if not name:
+                continue
+            if len(name) > 128:
+                raise ValueError("watched entity names must be 128 characters or fewer")
+            key = name.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(name)
+        return cleaned
 
 
 class GoalCreate(BaseModel):
@@ -177,6 +200,7 @@ def patch_department(slug: str, patch: DepartmentPatch) -> DepartmentState:
         slack_channel_id=patch.slack_channel_id if "slack_channel_id" in raw else _UNSET,
         discord_channel_id=patch.discord_channel_id if "discord_channel_id" in raw else _UNSET,
         telegram_chat_id=patch.telegram_chat_id if "telegram_chat_id" in raw else _UNSET,
+        watched_entities=patch.watched_entities,
     )
     registry.invalidate()
     return _must_get(slug)

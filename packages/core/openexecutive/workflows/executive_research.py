@@ -40,11 +40,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
 from pydantic import BaseModel, Field
 
+from openexecutive.audit.usage import UsageRollup, bind_research_run, log_model_usage
 from openexecutive.knowledge.store import ChromaDBStore
 from openexecutive.monitoring.research.dedup import dedup_findings
 from openexecutive.monitoring.research.models import (
@@ -69,6 +71,26 @@ logger = logging.getLogger(__name__)
 RESEARCH_SPECIALISTS: tuple[str, ...] = (
     "cso", "cfo", "cmo", "coo", "chro", "cpo", "gc",
 )
+
+
+def active_research_specialists() -> tuple[str, ...]:
+    """The specialists this run fans out to: ``RESEARCH_SPECIALISTS``
+    filtered by the ``RESEARCH_SPECIALISTS`` setting when it is set.
+    Unknown slugs are logged and dropped; an empty or all-unknown setting
+    means every specialist, so a typo cannot silently run nothing."""
+    from openexecutive.config import get_settings
+
+    wanted = [s.strip().lower() for s in get_settings().research_specialists if s.strip()]
+    if not wanted:
+        return RESEARCH_SPECIALISTS
+    unknown = [s for s in wanted if s not in RESEARCH_SPECIALISTS]
+    if unknown:
+        logger.warning(
+            "research: RESEARCH_SPECIALISTS names unknown specialist(s) %s — ignored",
+            ", ".join(unknown),
+        )
+    chosen = tuple(s for s in RESEARCH_SPECIALISTS if s in wanted)
+    return chosen or RESEARCH_SPECIALISTS
 
 # Synthesis loop budget. A real routing run needs at least three turns:
 # (1) look recipients up (lookup_person), (2) fire the resolved DMs /
@@ -242,7 +264,8 @@ def _build_watchlist_system(max_direct: int, max_suggest: int) -> str:
         "## WHAT BELONGS ON THE WATCHLIST\n\n"
         "An ongoing, externally-observable source tied to a NAMED company "
         "entity — a competitor, vendor, ticker or initiative from the company "
-        "context — that we'd want flagged when it next changes: a public "
+        "context, or an entity a department watches or a recent decision "
+        "names — that we'd want flagged when it next changes: a public "
         "competitor's ticker or filings, a vendor's status page, a competitor's "
         "own blog / changelog feed. A one-off event already fully known is NOT "
         "watchlist material; the *ongoing source* behind it might be. "
@@ -257,6 +280,9 @@ def _build_watchlist_system(max_direct: int, max_suggest: int) -> str:
         "  - `target` MUST be concrete and real: a ticker symbol, or a URL "
         "taken from a finding's `urls` list — do NOT invent feed URLs. If you "
         "cannot give a real target, do not propose.\n"
+        "  - `finding_index` is REQUIRED: the #N of the finding whose urls or "
+        "text this source comes from. A proposal with no finding behind it is "
+        "rejected as having no evidence, however well grounded.\n"
         "  - `certainty` = 'confident' ONLY when the entity is in the company "
         "context AND the target is the entity's own source (its ticker, its "
         "site, its status page). Otherwise 'unsure'.\n"
@@ -281,6 +307,14 @@ class ExecutiveResearchInput(BaseModel):
             "Optional one-line note added to the research context — "
             "useful for narrowing the run (e.g. 'focus on Series-B "
             "competitor signals')."
+        ),
+    )
+    run_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional id the caller already recorded for this run (the "
+            "periodic scheduler's workflow_runs id). Every model-usage row "
+            "the run writes carries it; generated when omitted."
         ),
     )
 
@@ -332,16 +366,6 @@ class ExecutiveResearchWorkflow(Workflow):
                 ),
             ),
             WorkflowStepDef(
-                id="verify",
-                title="Verify findings against sources",
-                description=(
-                    "Scrape each surviving finding's cited URL and confirm "
-                    "the page supports the claim; demote / drop findings "
-                    "whose source is dead or doesn't back them. No-op unless "
-                    "xcrawl + verification are enabled."
-                ),
-            ),
-            WorkflowStepDef(
                 id="executive_synthesis",
                 title="Executive routes findings",
                 description=(
@@ -367,7 +391,42 @@ class ExecutiveResearchWorkflow(Workflow):
         store: ChromaDBStore,
     ) -> AsyncIterator[WorkflowEvent]:
         assert isinstance(inputs, ExecutiveResearchInput)
+        run_id = inputs.run_id or f"research-{uuid.uuid4().hex[:12]}"
+        # Every model call the run makes (specialists, synthesis, watchlist
+        # pass) records a cache_event row tagged with the run id and summed
+        # into a rollup the result event reports as `usage`. The body runs in
+        # its own task so the binding lives in that task's context: set
+        # inside this generator it would land in the consumer's context and
+        # outlive an abandoned run.
+        queue: asyncio.Queue[WorkflowEvent | None] = asyncio.Queue()
 
+        async def _produce() -> None:
+            try:
+                with bind_research_run(run_id) as rollup:
+                    async for event in self._run_events(inputs, store, rollup, run_id):
+                        queue.put_nowait(event)
+            finally:
+                queue.put_nowait(None)
+
+        producer = asyncio.create_task(_produce())
+        try:
+            while True:
+                event = await queue.get()
+                if event is None:
+                    break
+                yield event
+            await producer  # surface a crash inside the run to the consumer
+        finally:
+            if not producer.done():
+                producer.cancel()
+
+    async def _run_events(
+        self,
+        inputs: ExecutiveResearchInput,
+        store: ChromaDBStore,
+        rollup: UsageRollup,
+        run_id: str,
+    ) -> AsyncIterator[WorkflowEvent]:
         # ------------------------------------------------------------------
         # Step 1: gather_context
         # ------------------------------------------------------------------
@@ -402,11 +461,24 @@ class ExecutiveResearchWorkflow(Workflow):
             logger.exception("research: list_watchlist failed")
             existing_watchlist = []
 
+        # Departments (watched entities, scope, goals) and recent decisions
+        # are current company intent the static profile lacks; both feed
+        # the watch policy's grounding and routing.
+        from openexecutive.monitoring.research.watch_policy import (
+            load_departments,
+            recent_decisions,
+        )
+
+        departments = load_departments()
+        decisions = recent_decisions()
+
         research_context = _render_research_context(
             profile=profile,
             initiatives=initiatives,
             existing_watchlist=existing_watchlist,
             note=inputs.note,
+            decisions=decisions,
+            departments=departments,
         )
 
         yield WorkflowEvent(
@@ -415,7 +487,8 @@ class ExecutiveResearchWorkflow(Workflow):
             summary=(
                 f"profile_loaded={profile is not None and not profile.is_empty()} "
                 f"initiatives={len(initiatives)} "
-                f"existing_watchlist={len(existing_watchlist)}"
+                f"existing_watchlist={len(existing_watchlist)} "
+                f"departments={len(departments)} decisions={len(decisions)}"
             ),
         )
 
@@ -446,8 +519,9 @@ class ExecutiveResearchWorkflow(Workflow):
                 )
                 return slug, [], str(exc)[:200]
 
+        specialists = active_research_specialists()
         results = await asyncio.gather(
-            *(_run_one(s) for s in RESEARCH_SPECIALISTS),
+            *(_run_one(s) for s in specialists),
             return_exceptions=True,
         )
 
@@ -456,8 +530,8 @@ class ExecutiveResearchWorkflow(Workflow):
         for idx, item in enumerate(results):
             if isinstance(item, BaseException):
                 fallback_slug = (
-                    RESEARCH_SPECIALISTS[idx]
-                    if idx < len(RESEARCH_SPECIALISTS)
+                    specialists[idx]
+                    if idx < len(specialists)
                     else f"unknown-{idx}"
                 )
                 findings_by_specialist[fallback_slug] = []
@@ -493,33 +567,7 @@ class ExecutiveResearchWorkflow(Workflow):
 
         deduped_all: list[ResearchFinding] = dedup_findings(findings_by_specialist)
 
-        yield WorkflowEvent(
-            type="step_done",
-            step_id="dedup",
-            summary=f"after_dedup={len(deduped_all)}",
-        )
-
-        # ------------------------------------------------------------------
-        # Step 3b: verify findings against their cited source
-        # ------------------------------------------------------------------
-        # Runs BEFORE the low-confidence filter so a finding whose source is
-        # dead or doesn't support it is demoted (often to 'low' → dropped)
-        # here, instead of being routed to a human on snippet-level trust.
-        # No-op unless xcrawl + verification are enabled; best-effort (a
-        # verify failure leaves the finding unchanged).
-        yield WorkflowEvent(
-            type="step_start",
-            step_id="verify",
-            step_title="Verify findings against sources",
-        )
-        from openexecutive.monitoring.research.verification import (
-            verify_findings,
-        )
-
-        deduped_all = await verify_findings(deduped_all)
-        verified = [f for f in deduped_all if f.verification is not None]
-
-        # Pre-synthesis quality filter — now reflects verify demotions.
+        # Pre-synthesis quality filter.
         # Low-confidence findings are dropped before the Executive ever sees
         # them — the round_2 post-mortem showed they make up most of the
         # noise, and the synthesis prompt cannot be trusted to ignore them
@@ -531,21 +579,15 @@ class ExecutiveResearchWorkflow(Workflow):
         low_conf_dropped = len(deduped_all) - len(deduped)
         if low_conf_dropped:
             logger.info(
-                "research: dropped %d low-confidence finding(s) pre-synthesis "
-                "(after verify)",
+                "research: dropped %d low-confidence finding(s) pre-synthesis",
                 low_conf_dropped,
             )
 
-        # step_done carries the full post-verify accounting (the dedup step
-        # now only reports after_dedup), so the low_conf_dropped / to_synthesis
-        # signals observers relied on are preserved here.
         yield WorkflowEvent(
             type="step_done",
-            step_id="verify",
+            step_id="dedup",
             summary=(
-                f"verified={len(verified)} "
-                f"confirmed={sum(1 for f in verified if f.verification == 'confirmed')} "
-                f"demoted={sum(1 for f in verified if f.verification in ('contradicted', 'unsupported', 'source_unreachable'))} "
+                f"after_dedup={len(deduped_all)} "
                 f"low_conf_dropped={low_conf_dropped} "
                 f"to_synthesis={len(deduped)}"
             ),
@@ -556,7 +598,10 @@ class ExecutiveResearchWorkflow(Workflow):
         if not deduped:
             yield WorkflowEvent(
                 type="result",
-                data={"findings": [], "tool_calls": [], "narrative": ""},
+                data={
+                    "findings": [], "tool_calls": [], "narrative": "",
+                    "usage": {"run_id": run_id, **rollup.as_dict()},
+                },
             )
             yield WorkflowEvent(
                 type="artifact",
@@ -591,6 +636,7 @@ class ExecutiveResearchWorkflow(Workflow):
             watchlist_calls = await _watchlist_analysis_loop(
                 deduped, existing_watchlist,
                 profile=profile, initiatives=initiatives,
+                departments=departments, decisions=decisions,
             )
         except Exception:
             logger.exception("research: watchlist-analysis pass failed")
@@ -680,6 +726,7 @@ class ExecutiveResearchWorkflow(Workflow):
                 ],
                 "tool_calls": tool_calls,
                 "narrative": narrative,
+                "usage": {"run_id": run_id, **rollup.as_dict()},
             },
         )
         yield WorkflowEvent(type="artifact", content=artifact)
@@ -798,6 +845,9 @@ async def _executive_synthesis_loop(
                     iteration,
                 )
                 break
+            log_model_usage(
+                response, model=model, actor="research_synthesis", iteration=iteration,
+            )
 
             ok_so_far = _routing_ok(tool_calls)
             budget_remaining = max(0, _MAX_ROUTING_TOOLS_PER_RUN - ok_so_far)
@@ -897,6 +947,8 @@ async def _watchlist_analysis_loop(
     *,
     profile: Any = None,
     initiatives: list[Any] | None = None,
+    departments: list[Any] | None = None,
+    decisions: list[Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Dedicated forward-looking pass: the model PROPOSES sources to monitor
     via ``propose_watch``; ``watch_policy.apply_proposals`` then decides,
@@ -951,6 +1003,7 @@ async def _watchlist_analysis_loop(
                 findings, existing_watchlist,
                 declines=declines, outcome_counts=outcome_counts,
                 specialist_counts=specialist_counts,
+                departments=departments,
             ),
         },
     ]
@@ -971,6 +1024,9 @@ async def _watchlist_analysis_loop(
         except Exception:
             logger.exception("research.watchlist: provider call failed")
             break
+        log_model_usage(
+            response, model=model, actor="research_watchlist", iteration=_iteration,
+        )
 
         budget_remaining = max(0, _MAX_WATCHLIST_PROPOSALS_PER_RUN - len(proposals))
         iter_calls = await execute_tool_calls(
@@ -1035,12 +1091,14 @@ async def _watchlist_analysis_loop(
 
     ctx = watch_policy.PolicyContext(
         vocabulary=watch_policy.grounding_vocabulary(
-            profile, list(initiatives or []), list(existing_watchlist),
+            profile, list(initiatives or []), list(existing_watchlist), list(departments or []),
         ),
         priority_terms=watch_policy.priority_terms(profile),
         existing=list(existing_watchlist),
         outcome_counts=outcome_counts,
         settings=policy_settings,
+        departments=watch_policy.department_refs(departments),
+        recent_decisions=list(decisions or []),
     )
     decided = watch_policy.apply_proposals(proposals, findings, ctx)
     return refused + decided
@@ -1056,6 +1114,10 @@ async def _watchlist_analysis_loop(
 #    misfiring run blasting noise to the entire team.
 _SYNTHESIS_EXCLUDED_TOOLS = frozenset({
     "run_executive_research",
+    # Starting another workflow from inside the routing pass is the same
+    # recursion risk in a different coat: a finding can suggest a workflow
+    # (suggest_workflow) for a human to start, never start one itself.
+    "run_workflow",
     "send_company_broadcast",
     # Watchlist writes are withheld from the routing pass: every watch the
     # research run creates must go through the dedicated watchlist pass and
@@ -1088,6 +1150,8 @@ def _render_research_context(
     initiatives: list[Any],
     existing_watchlist: list[Any],
     note: str,
+    decisions: list[Any] | None = None,
+    departments: list[Any] | None = None,
 ) -> str:
     """Build the user-turn block passed to every specialist call."""
     from datetime import UTC, datetime, timedelta
@@ -1146,6 +1210,37 @@ def _render_research_context(
                 parts.append(f"- {slug} [{signal_type}] target={target}")
         parts.append("")
 
+    if decisions:
+        # What the company recently decided is the freshest statement of
+        # what matters; the static profile lags it by design.
+        parts.append("RECENT DECISIONS:")
+        for d in decisions[:10]:
+            # One line per decision: the summary is free text written by
+            # the chat memory extractor, so an embedded newline must not be
+            # able to forge another labelled line of this turn.
+            summary = " ".join(str(getattr(d, "summary", "") or "").split())
+            if not summary:
+                continue
+            when = str(getattr(d, "timestamp", "") or "")[:10]
+            dept = str(getattr(d, "department", "") or "")
+            line = f"- {when}" if when else "-"
+            if dept:
+                line += f" [{dept}]"
+            parts.append(f"{line}: {summary[:160]}")
+        parts.append("")
+
+    interest_lines = _render_department_interests(departments)
+    if interest_lines:
+        # What a department head asked to have watched is company intent
+        # the profile does not carry; without it a specialist's grounding
+        # rule drops findings about exactly those entities.
+        parts.append(
+            "DEPARTMENT WATCH INTERESTS (entities a department head asked "
+            "to have watched — a finding may be grounded in one of these):"
+        )
+        parts.extend(interest_lines)
+        parts.append("")
+
     parts.append(
         "Research within your domain and emit findings via the "
         "`emit_research_findings` tool. Use web_search to FIND and "
@@ -1156,6 +1251,31 @@ def _render_research_context(
         "finding."
     )
     return "\n".join(parts)
+
+
+# Bounds on the DEPARTMENT WATCH INTERESTS block: departments listed and
+# entities named per department. Generous for any real org chart; they only
+# stop a runaway list from crowding the specialist turn.
+_MAX_INTEREST_DEPARTMENTS = 20
+_MAX_INTEREST_ENTITIES = 20
+
+
+def _render_department_interests(departments: list[Any] | None) -> list[str]:
+    """One ``- <slug>: <entities>`` line per department with watched
+    entities. Shared by the specialist context and the watchlist turn so
+    both name the same interests."""
+    lines: list[str] = []
+    for state in departments or []:
+        config = getattr(state, "config", None)
+        slug = getattr(config, "slug", "")
+        entities = [
+            " ".join(str(e).split())
+            for e in (getattr(config, "watched_entities", None) or [])
+            if str(e).strip()
+        ]
+        if slug and entities:
+            lines.append(f"- {slug}: {', '.join(entities[:_MAX_INTEREST_ENTITIES])}")
+    return lines[:_MAX_INTEREST_DEPARTMENTS]
 
 
 def _render_team_roster(people: list[Any]) -> str:
@@ -1237,15 +1357,16 @@ def _render_watchlist_turn(
     declines: list[Any] | None = None,
     outcome_counts: dict[tuple[str, str], dict[str, int]] | None = None,
     specialist_counts: dict[str, dict[str, int]] | None = None,
+    departments: list[Any] | None = None,
 ) -> str:
     """User-turn for the watchlist-analysis pass: the findings (with URLs),
     the current watchlist with its trust record, targets the principal
-    declined, and how the policy's past guesses turned out."""
+    declined, what each department has asked to watch, and how the
+    policy's past guesses turned out."""
     parts: list[str] = ["FINDINGS FROM THIS RESEARCH RUN:\n"]
     for i, f in enumerate(findings, start=1):
         block = (
-            f"#{i} [{f.severity_hint.value} | {f.confidence}"
-            f"{' | verified' if f.verification == 'confirmed' else ''}] "
+            f"#{i} [{f.severity_hint.value} | {f.confidence}] "
             f"({f.source_specialist}) {f.title}\n"
             f"  {f.summary}\n"
         )
@@ -1311,6 +1432,14 @@ def _render_watchlist_turn(
     if history_lines:
         parts.append("\nHOW PAST PROPOSALS TURNED OUT:")
         parts.extend(history_lines[:12])
+
+    interest_lines = _render_department_interests(departments)
+    if interest_lines:
+        parts.append(
+            "\nDEPARTMENT WATCH INTERESTS (entities a department asked to have "
+            "watched — ground a proposal about one in that entity):"
+        )
+        parts.extend(interest_lines)
 
     parts.append(
         "\nDecide which ongoing sources are worth monitoring and call "

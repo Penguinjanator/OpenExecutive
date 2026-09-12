@@ -10,6 +10,7 @@ from openexecutive.alerts.models import (
     AlertSeverity,
     TriageDecision,
 )
+from openexecutive.audit.usage import log_model_usage
 from openexecutive.providers import get_provider
 
 if TYPE_CHECKING:
@@ -250,6 +251,7 @@ class TriageAgent(BaseAgent):
                 dedup_key=f"fallback-{event.source}-{event.external_id}",
                 reason_if_suppressed="triage_error",
             )
+        log_model_usage(message, model=self.effective_model(), actor="triage")
 
         for block in message.content:
             if block.type == "tool_use" and block.name == "emit_alert_decision":
