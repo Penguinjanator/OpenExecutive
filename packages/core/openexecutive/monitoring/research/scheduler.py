@@ -13,7 +13,7 @@ immediately; quiet days are free.
 That fingerprint only sees *internal* state, so a static profile would
 otherwise let the council sit blind to purely-external change (a
 competitor move, a regulation shift) indefinitely. A staleness floor
-(``watchlist_research_max_staleness_hours``, default 24) bounds that:
+(``watchlist_research_max_staleness_hours``, default 168) bounds that:
 once the floor has elapsed since the last successful run, the next tick
 runs even when the fingerprint is unchanged. Set the floor <= 0 to
 disable it and rely solely on skip-if-unchanged.
@@ -76,8 +76,13 @@ def compute_research_state_hash(db_path: Path | None = None) -> str:
 
     The inputs are: the company profile's prompt-form text, the
     titles + statuses of every active initiative, and the slug+target
-    list of every enabled watchlist row. A change to any of these
+    list of every enabled, ACTIVE watchlist row. A change to any of these
     invalidates the prior research; everything else is irrelevant.
+
+    Dry-run rows are excluded on purpose: the research pass files its own
+    suggestions as dry-run rows, and the principal approving or declining
+    one must not read as "state changed" and trigger another full
+    7-specialist run within the hour.
 
     Failure on any source is logged + returns a sentinel hash that
     differs from every real run — so a transient profile-load error
@@ -125,12 +130,15 @@ def compute_research_state_hash(db_path: Path | None = None) -> str:
 
     try:
         from openexecutive.monitoring import store as monitoring_store
+        from openexecutive.monitoring.models import MODE_ACTIVE
 
         parts.append("WATCHLIST:")
         for item in sorted(
-            monitoring_store.list_watchlist(db_path=db_path),
+            monitoring_store.list_watchlist(enabled_only=True, db_path=db_path),
             key=lambda x: x.slug,
         ):
+            if item.mode != MODE_ACTIVE:
+                continue
             parts.append(f"{item.slug}::{item.signal_type}::{item.target}")
     except Exception:
         logger.exception("research.scheduler: watchlist load failed")

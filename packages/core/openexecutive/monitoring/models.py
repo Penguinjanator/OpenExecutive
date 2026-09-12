@@ -49,6 +49,45 @@ MODE_ACTIVE = "active"
 MODE_DRY_RUN = "dry_run"
 _VALID_MODES = frozenset({MODE_ACTIVE, MODE_DRY_RUN})
 
+# Who put a row on the watchlist. ``manual`` = the principal (UI / API);
+# ``executive`` = the chat tool acting on a request; ``research`` = the
+# research pass auto-added it (grounded in company data); and
+# ``research_proposed`` = the research pass was unsure, so the row sits in
+# ``dry_run`` as a SUGGESTION until the principal approves or declines it.
+ORIGIN_MANUAL = "manual"
+ORIGIN_EXECUTIVE = "executive"
+ORIGIN_RESEARCH = "research"
+ORIGIN_RESEARCH_PROPOSED = "research_proposed"
+_VALID_ORIGINS = frozenset({
+    ORIGIN_MANUAL, ORIGIN_EXECUTIVE, ORIGIN_RESEARCH, ORIGIN_RESEARCH_PROPOSED,
+})
+# Rows the research policy owns: subject to auto-disable and to the declines
+# memory when removed.
+RESEARCH_ORIGINS = frozenset({ORIGIN_RESEARCH, ORIGIN_RESEARCH_PROPOSED})
+
+# Declines memory (``watchlist_declines``). ``declined_explicit`` is
+# permanent: the principal said no. ``expired_unreviewed`` means a suggestion
+# aged out without anyone looking; it may be re-proposed once after
+# DECLINE_EXPIRED_RETRY_DAYS so a timer never blacklists a good source.
+DECLINE_KIND_EXPLICIT = "declined_explicit"
+DECLINE_KIND_EXPIRED = "expired_unreviewed"
+DECLINE_EXPIRED_RETRY_DAYS = 90
+# Why the principal declined — each maps to a different remedy in the
+# research policy (see monitoring.research.watch_policy).
+DECLINE_REASON_NOT_RELEVANT = "not_relevant"   # blacklist the entity
+DECLINE_REASON_TOO_NOISY = "too_noisy"         # keep, but quieter
+DECLINE_REASON_WRONG_SOURCE = "wrong_source"   # blacklist this target only
+DECLINE_REASON_EXPIRED = "expired"             # aged out unreviewed
+VALID_DECLINE_REASONS = frozenset({
+    DECLINE_REASON_NOT_RELEVANT, DECLINE_REASON_TOO_NOISY,
+    DECLINE_REASON_WRONG_SOURCE, DECLINE_REASON_EXPIRED,
+})
+# The reasons a principal (or a tool acting for one) may give; `expired` is
+# only ever written by the sweep.
+EXPLICIT_DECLINE_REASONS = frozenset({
+    DECLINE_REASON_NOT_RELEVANT, DECLINE_REASON_TOO_NOISY, DECLINE_REASON_WRONG_SOURCE,
+})
+
 # Watchlist row "cadence" hints — used by the briefing/digest layer in
 # PR-C to decide whether a signal surfaces real-time vs in a digest.
 # Kept as opaque strings here; pipeline ignores them in PR-A.
@@ -98,10 +137,29 @@ class WatchlistItem(BaseModel):
     dismiss_count: int = 0
     trust_score: float = 1.0  # 0..1, decays on dismiss; full trust at creation
     notes: str = ""
+    origin: str = ORIGIN_MANUAL
+
+
+class WatchlistDecline(BaseModel):
+    """A target the principal declined (or a suggestion that aged out)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    normalized_target: str
+    entity: str = ""
+    signal_type: str = ""
+    slug: str = ""
+    kind: str = DECLINE_KIND_EXPLICIT
+    reason: str = ""
+    declined_at: str = ""
 
 
 def is_valid_mode(mode: str) -> bool:
     return mode in _VALID_MODES
+
+
+def is_valid_origin(origin: str) -> bool:
+    return origin in _VALID_ORIGINS
 
 
 def is_valid_cadence(cadence: str) -> bool:

@@ -30,6 +30,7 @@ from openexecutive.workflows.executive_research import (
     _SYNTHESIS_EXCLUDED_TOOLS,
     ExecutiveResearchInput,
     ExecutiveResearchWorkflow,
+    _build_synthesis_system,
     _render_research_context,
     _render_synthesis_turn,
     _render_team_roster,
@@ -211,7 +212,7 @@ async def test_workflow_runs_end_to_end_with_stubbed_specialists(
         "openexecutive.workflows.executive_research.research_one_specialist",
         fake_research_one,
     )
-    async def fake_watchlist(findings, existing_watchlist):
+    async def fake_watchlist(findings, existing_watchlist, **_kw):
         return []
 
     monkeypatch.setattr(
@@ -330,7 +331,7 @@ async def test_workflow_drops_low_confidence_pre_synthesis(
         "openexecutive.workflows.executive_research.research_one_specialist",
         fake_research_one,
     )
-    async def fake_watchlist(findings, existing_watchlist):
+    async def fake_watchlist(findings, existing_watchlist, **_kw):
         return []
 
     monkeypatch.setattr(
@@ -460,3 +461,15 @@ def test_synthesis_turn_with_no_people_steers_to_lookup():
     turn = _render_synthesis_turn(findings, [])
     assert "YOUR TEAM" not in turn
     assert "lookup_person" in turn  # fallback path when roster absent
+
+
+def test_routing_pass_has_no_watchlist_write_tools() -> None:
+    """Every watch the research run creates must go through the watchlist
+    pass and its policy; the routing pass must not be able to add, tune or
+    remove watches (an unfiltered add, a self-approved suggestion, a decline
+    written in the principal's name)."""
+    from openexecutive.orchestrator.executive import _ALL_SKILL_TOOLS
+
+    tools = {t["name"] for t in _ALL_SKILL_TOOLS if t["name"] not in _SYNTHESIS_EXCLUDED_TOOLS}
+    assert not tools & {"add_watchlist_entry", "tune_watchlist_entry", "remove_watchlist_entry"}
+    assert "add_watchlist_entry" not in _build_synthesis_system({"slack"})

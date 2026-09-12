@@ -139,6 +139,7 @@ def render_briefing_context(
     activity: list[dict[str, Any]],
     since: datetime | None = None,
     handled: list[dict[str, Any]] | None = None,
+    pending_watch_suggestions: int = 0,
 ) -> str:
     """Pack the structured /today + activity inputs into a single user-turn block.
 
@@ -196,6 +197,14 @@ def render_briefing_context(
             parts.append("HANDLED OVERNIGHT BY THE EXECUTIVE (already done — report, don't ask):")
             for h in handled[:15]:
                 parts.append(f"- [{str(h.get('at', ''))[:10]}] {h.get('kind', '')}: {str(h.get('summary', ''))[:140]}")
+            parts.append("")
+        if pending_watch_suggestions > 0:
+            n = pending_watch_suggestions
+            parts.append(
+                f"WATCH SUGGESTIONS WAITING: {n} source{'s' if n != 1 else ''} the Executive "
+                "would like to monitor but is not sure about — approve or decline on /watchlist "
+                "(mention in one line, never list them)"
+            )
             parts.append("")
 
     people = today_data.get("people", [])
@@ -255,6 +264,7 @@ async def synthesize_briefing_narrative(
     standalone: bool = False,
     since: datetime | None = None,
     handled: list[dict[str, Any]] | None = None,
+    pending_watch_suggestions: int = 0,
 ) -> str:
     """Synthesize the briefing narrative. Returns Markdown, or "" when empty.
 
@@ -283,6 +293,7 @@ async def synthesize_briefing_narrative(
     user_content = render_briefing_context(
         period_label=period_label, today_data=today_data, activity=activity,
         since=since, handled=handled,
+        pending_watch_suggestions=pending_watch_suggestions,
     )
     model = get_fast_model()
     response = await get_provider(model).messages_create(

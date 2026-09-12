@@ -21,7 +21,14 @@ from openexecutive.alerts.models import AlertSeverity
 from openexecutive.audit import log_event as audit_log
 from openexecutive.monitoring import store as ms
 from openexecutive.monitoring.models import (
+    DECLINE_KIND_EXPLICIT,
+    DECLINE_REASON_NOT_RELEVANT,
+    DECLINE_REASON_TOO_NOISY,
+    EXPLICIT_DECLINE_REASONS,
     MODE_ACTIVE,
+    MODE_DRY_RUN,
+    ORIGIN_RESEARCH_PROPOSED,
+    RESEARCH_ORIGINS,
     WatchlistItem,
     is_valid_cadence,
     is_valid_mode,
@@ -34,6 +41,7 @@ from openexecutive.monitoring.target_validation import (
 from openexecutive.monitoring.validation import (
     VALID_SEVERITY_VALUES,
     is_valid_watchlist_slug,
+    normalize_target,
 )
 
 logger = logging.getLogger(__name__)
@@ -86,6 +94,23 @@ class WatchlistPatch(BaseModel):
     severity_ceiling: str | None = None
     trigger: dict[str, Any] | None = None
     notes: str | None = Field(default=None, max_length=500)
+
+
+class DeclineBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # not_relevant → the entity is blacklisted; too_noisy → the watch goes
+    # live anyway but quieter (high floor); wrong_source → only this target
+    # is blacklisted. See monitoring.research.watch_policy.
+    reason: str = DECLINE_REASON_NOT_RELEVANT
+
+
+class DeclineResponse(BaseModel):
+    slug: str
+    reason: str
+    # "removed" (declined + deleted) or "kept_high_floor" (too_noisy: goes
+    # live as a research watch that only surfaces high-severity signals).
+    result: str
 
 
 class SignalRow(BaseModel):
@@ -353,12 +378,30 @@ def patch_watchlist_entry(slug: str, body: WatchlistPatch) -> WatchlistItem:
     return updated
 
 
+def _record_decline(item: WatchlistItem, reason: str) -> None:
+    """Remember that the principal said no to this research source, so the
+    research pass never re-proposes it under a new slug."""
+    from openexecutive.monitoring.research import watch_policy
+
+    ms.insert_decline(
+        normalized_target=normalize_target(item.signal_type, item.target),
+        kind=DECLINE_KIND_EXPLICIT,
+        reason=reason,
+        entity=str(watch_policy.policy_stamp_of(item).get("entity", "")),
+        signal_type=item.signal_type,
+        slug=item.slug,
+    )
+    watch_policy.record_outcome_for(item, watch_policy.OUTCOME_DECLINED)
+
+
 @router.delete("/watchlist/{slug}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_watchlist_entry(slug: str) -> Response:
+def delete_watchlist_entry(slug: str, reason: str | None = None) -> Response:
     item = ms.get_watchlist_item_by_slug(slug)
     if item is None:
         raise HTTPException(status_code=404, detail=f"Watchlist entry {slug!r} not found")
     assert item.id is not None
+    if reason is not None and reason not in EXPLICIT_DECLINE_REASONS:
+        raise HTTPException(status_code=400, detail=f"unknown reason {reason!r}")
     try:
         removed = ms.delete_watchlist_item(item.id)
     except Exception as exc:
@@ -370,9 +413,97 @@ def delete_watchlist_entry(slug: str) -> Response:
         logger.exception("watchlist.delete: failed slug=%s", slug)
         raise HTTPException(status_code=500, detail="delete failed") from exc
 
+    if removed and item.origin in RESEARCH_ORIGINS:
+        # "Stop watching" a research-added source is feedback.
+        try:
+            _record_decline(item, reason or DECLINE_REASON_NOT_RELEVANT)
+        except Exception:
+            logger.exception("watchlist.delete: decline record failed slug=%s", slug)
+
     _audit(
         "watchlist.delete", removed,
         f"watchlist.delete: {slug} ({'deleted' if removed else 'no-op'})",
-        {"slug": slug, "watchlist_id": item.id, "removed": removed},
+        {"slug": slug, "watchlist_id": item.id, "removed": removed, "reason": reason},
     )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# --------------------------------------------------------------------------- #
+# Research suggestions: approve / decline
+# --------------------------------------------------------------------------- #
+
+
+def _pending_suggestion_or_409(slug: str) -> WatchlistItem:
+    item = ms.get_watchlist_item_by_slug(slug)
+    if item is None:
+        raise HTTPException(status_code=404, detail=f"Watchlist entry {slug!r} not found")
+    if item.origin != ORIGIN_RESEARCH_PROPOSED or item.mode != MODE_DRY_RUN:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{slug!r} is not a pending research suggestion",
+        )
+    return item
+
+
+@router.post("/watchlist/{slug}/approve", response_model=WatchlistItem)
+def approve_watchlist_suggestion(slug: str) -> WatchlistItem:
+    """Turn a research suggestion into a live watch (origin=research)."""
+    from openexecutive.monitoring.research import watch_policy
+
+    item = _pending_suggestion_or_409(slug)
+    assert item.id is not None
+    if not ms.approve_suggestion(item.id):
+        raise HTTPException(status_code=409, detail=f"{slug!r} is not a pending research suggestion")
+    watch_policy.record_outcome_for(item, watch_policy.OUTCOME_APPROVED)
+    audit_log(
+        watch_policy.EVENT_SUGGESTION_APPROVED,
+        f"Approved watching {slug} — {item.notes[:120] or item.target}",
+        actor=_API_ACTOR,
+        details={"slug": slug, "watchlist_id": item.id, "target": item.target,
+                 "signal_type": item.signal_type},
+    )
+    updated = ms.get_watchlist_item(item.id)
+    if updated is None:
+        raise HTTPException(status_code=500, detail="watchlist entry vanished after approve")
+    return updated
+
+
+@router.post("/watchlist/{slug}/decline", response_model=DeclineResponse)
+def decline_watchlist_suggestion(slug: str, body: DeclineBody | None = None) -> DeclineResponse:
+    """Decline a research suggestion. The reason picks the remedy:
+    not_relevant / wrong_source remove it and blacklist (entity / target);
+    too_noisy keeps the source, live, but only high-severity signals ever
+    surface — the one way a suggestion goes live without an approve."""
+    from openexecutive.monitoring.research import watch_policy
+
+    reason = (body.reason if body else DECLINE_REASON_NOT_RELEVANT)
+    if reason not in EXPLICIT_DECLINE_REASONS:
+        raise HTTPException(status_code=400, detail=f"unknown reason {reason!r}")
+    item = _pending_suggestion_or_409(slug)
+    assert item.id is not None
+
+    # Both remedies are compare-and-act on "still pending", so a concurrent
+    # approve (or the sweep) cannot be undone by this decline.
+    if reason == DECLINE_REASON_TOO_NOISY:
+        if not ms.quiet_pending_suggestion(item.id):
+            raise HTTPException(status_code=409, detail=f"{slug!r} is not a pending research suggestion")
+        # The principal kept the source but objected to the shape of the
+        # guess — that is a decline for calibration, not an approval.
+        watch_policy.record_outcome_for(item, watch_policy.OUTCOME_DECLINED)
+        result = "kept_high_floor"
+    else:
+        if not ms.delete_pending_suggestion(item.id):
+            raise HTTPException(status_code=409, detail=f"{slug!r} is not a pending research suggestion")
+        try:
+            _record_decline(item, reason)
+        except Exception:
+            logger.exception("watchlist.decline: decline record failed slug=%s", slug)
+        result = "removed"
+    audit_log(
+        watch_policy.EVENT_SUGGESTION_DECLINED,
+        f"Declined watching {slug} ({reason}) — {result}",
+        actor=_API_ACTOR,
+        details={"slug": slug, "watchlist_id": item.id, "target": item.target,
+                 "signal_type": item.signal_type, "reason": reason, "result": result},
+    )
+    return DeclineResponse(slug=slug, reason=reason, result=result)

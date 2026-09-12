@@ -1152,7 +1152,7 @@ scheduler:
     - "principal_brief_eod — same shape as morning_brief, fires once per day at `PRINCIPAL_BRIEF_EOD_TIME` (default 18:00 UTC). Runs `end_of_day_digest` workflow. Both brief kinds bypass the per-channel anti-spam guards because the principal is by definition deliverable (channel_ref=`principal`, channel=`__internal__` triggers the workflow run rather than a direct send)."
     - "executive_reflection — Shift 5 recurring row. Seeded alongside the principal briefs (idempotent via `_has_pending_brief`), default 07:30 UTC, override via `PRINCIPAL_REFLECTION_TIME`. The scheduler runs `_run_executive_reflection`: invokes the `executive_reflection` workflow, stores the artifact via `complete_run`, audits the outcome, then chains the next occurrence — same crash-survival pattern as principal briefs. Unlike the briefs, the artifact is NOT delivered to the principal — the morning brief that fires 30 minutes later surfaces what reflection decided via the existing /today/activity rail."
     - "external_monitor_scan — heartbeat owned by the external-condition monitoring layer. Default every 5 min via EXTERNAL_MONITOR_SCAN_INTERVAL_MINUTES. The runner calls `monitoring.pipeline.run_external_monitor_scan()` which walks enabled watchlist rows whose `last_polled_at` is stale enough, fires the matching adapter (vendor_status, rss, stock, the billed standing-query `query` adapter, the `edgar` SEC-filings adapter, and the stateful `page_watch` change-detector), enriches promotable signals with capture-time relevance, writes `external_signals` rows, and promotes qualifying signals into the alerts pipeline. Bypasses outbound dispatch (channel=`__internal__`, channel_ref=`external_monitor`). Chains the next tick via `enqueue_next_external_monitor_scan` after firing — same idempotent / crash-resilient pattern as `nudge_scan`."
-    - "watchlist_research_scan — periodic cron for the executive_research workflow (default every 120 min via WATCHLIST_RESEARCH_INTERVAL_MINUTES). The handler short-circuits when the company profile / initiatives / watchlist haven't changed since the last successful run, so quiet days cost zero tokens — except that a staleness floor (WATCHLIST_RESEARCH_MAX_STALENESS_HOURS, default 168 — weekly; a daily forced run re-derived the same findings from unchanged state and re-filed them as fresh alerts every morning) forces a run once that long has elapsed since the last successful run, so a static internal state can't keep the council blind to external change indefinitely. Does NOT write its own Alert — the workflow's Executive synthesis step routes findings directly via DMs / send_department_message / create_alert / add_watchlist_entry, so a separate cron Alert would duplicate the briefing. After routing, a DEDICATED watchlist-analysis pass (its own budget, separate from the routing budget) explicitly decides which findings are ongoing monitorable conditions and calls add_watchlist_entry for each; the run's markdown artifact is also persisted into the separate `recent_research` knowledge collection (keep-latest) so future runs + chat can recall it. The cron's only side-effects on success are the audit row (`watchlist_research_periodic_ran`) and whatever routing tools the synthesis fired. The scheduled-action kind keeps the legacy `watchlist_research_scan` name (matched by the env var WATCHLIST_RESEARCH_INTERVAL_MINUTES + the three audit event_types) even though the workflow itself is registered as `executive_research` — naming is mixed intentionally to avoid a migration on already-pending heartbeat rows. Bypasses outbound dispatch (channel=`__internal__`, channel_ref=`watchlist_research`)."
+    - "watchlist_research_scan — periodic cron for the executive_research workflow (default every 120 min via WATCHLIST_RESEARCH_INTERVAL_MINUTES). The handler short-circuits when the company profile / initiatives / watchlist haven't changed since the last successful run, so quiet days cost zero tokens — except that a staleness floor (WATCHLIST_RESEARCH_MAX_STALENESS_HOURS, default 168 — weekly; a daily forced run re-derived the same findings from unchanged state and re-filed them as fresh alerts every morning) forces a run once that long has elapsed since the last successful run, so a static internal state can't keep the council blind to external change indefinitely. Does NOT write its own Alert — the workflow's Executive synthesis step routes findings directly via DMs / send_department_message / create_alert / add_watchlist_entry, so a separate cron Alert would duplicate the briefing. After routing, a DEDICATED watchlist-analysis pass (its own budget, separate from the routing budget) PROPOSES ongoing monitors via `propose_watch`; deterministic policy (`monitoring.research.watch_policy`, see external_monitoring) adds a proposal on its own only when it is grounded in company data and corroborated, files the rest as dry-run suggestions the principal approves on /watchlist, and refuses declined targets; the run's markdown artifact is also persisted into the separate `recent_research` knowledge collection (keep-latest) so future runs + chat can recall it. The cron's only side-effects on success are the audit row (`watchlist_research_periodic_ran`) and whatever routing tools the synthesis fired. The scheduled-action kind keeps the legacy `watchlist_research_scan` name (matched by the env var WATCHLIST_RESEARCH_INTERVAL_MINUTES + the three audit event_types) even though the workflow itself is registered as `executive_research` — naming is mixed intentionally to avoid a migration on already-pending heartbeat rows. Bypasses outbound dispatch (channel=`__internal__`, channel_ref=`watchlist_research`)."
     - "notion_sync_scan — optional heartbeat (NOTION_SYNC_ENABLED, default off) that incrementally re-indexes Notion pages shared with an internal integration into the isolated `notion_wiki` collection (NOT COMPANY — synced pages are multi-writer and unreviewed). Interval NOTION_SYNC_INTERVAL_MINUTES (default 60). Caps ingest per tick via NOTION_MAX_PAGES_PER_SCAN; overflow is retried and the watermark does not advance past failed or uningested pages. Each tick reconciles: un-shared/deleted pages have files + chunks purged. Bypasses outbound dispatch (channel=`__internal__`, channel_ref=`notion_sync`). Chains the next tick via enqueue_next_notion_sync_scan. See knowledge.collections NOTION_WIKI."
   channel_routing: |
     The delivery channel is stored ON the scheduled_actions row itself
@@ -1332,6 +1332,9 @@ audit:
     - watchlist_research_periodic_ran — emitted by the periodic cron whenever the workflow actually fires. Carries `state_hash` (the input fingerprint at run time), `trigger` (`cold_start`, `state_changed`, or `staleness_floor`), `findings` count, `tool_calls` count, `ok_tool_calls`, `run_id`. The next tick reads the most recent row to decide skip-or-run (its `state_hash` for the fingerprint compare, its `ts` for the staleness floor). These three research run-history rows are the ONLY audit_log rows a fixture load/unload clears (via `monitoring.research.scheduler.clear_research_run_history`, called from `cli.fixture_loader._apply_state_from_source`): load wipes the profile/initiatives/watchlist that feed the fingerprint but otherwise preserves audit_log, so without this reset a same-fixture reload within the staleness floor would make the freshly-seeded scan skip itself and surface zero findings. A full reset still wipes all of audit_log.
     - watchlist_research_periodic_skipped — emitted when the state_hash matches the last `_ran` row. Carries `state_hash`. Visible cost-saving signal in the audit log.
     - watchlist_research_periodic_failed — emitted on workflow timeout / crash. Carries `state_hash` + `error` or `reason`.
+    - watchlist_research_added / watchlist_research_suggested / watchlist_research_rejected — one row per `propose_watch` the research watch policy decided (`monitoring.research.watch_policy`). Carries `slug`, `target`, `signal_type`, `rationale`, `entity`, `grounding_kind`, `score`, `reasons`, and for adds the quiet defaults applied (`cadence`, `severity_floor`, `trigger`). `_added` also renders in the brief's HANDLED block as `watching`.
+    - watchlist_suggestion_approved / watchlist_suggestion_declined / watchlist_suggestion_expired — the principal's verdict on a research suggestion (`POST /watchlist/{slug}/approve|decline`, reason on decline) or the sweep removing one unreviewed after WATCHLIST_PROPOSAL_TTL_DAYS. Each also writes a `watchlist_policy_outcomes` row so the policy calibrates.
+    - watchlist_auto_disabled — the sweep disabled a research-origin watch (`reason`: dismissed N of M alerts with low trust; no signals in 30 days; 3 consecutive poll failures). Renders in the HANDLED block as `stopped_watching`; re-enable from /watchlist.
     - auth_login / auth_logout — admin auth events
   turn_id: Set per Executive turn (`f"t-{uuid12}"`) and propagated automatically to retriever / specialist / tool / cache / committee emits via `openexecutive.audit.context` ContextVars. Groups every row in one user-assistant exchange under the same `turn_id`; the session view derives causal edges from this.
   writer: openexecutive.audit.AuditLogger — synchronous SQLite writer; uses WAL + 5s busy_timeout so concurrent webhook/scheduler/poller threads don't see "database is locked".
@@ -1358,6 +1361,95 @@ external_monitoring:
     + stock adapters and the chat tools (add_watchlist_entry, ...). PR-C
     extends executive_reflection to include external signals in its
     context and the briefing UI to badge external:* topic_tags.
+  research_watch_policy: |
+    The executive_research watchlist pass only PROPOSES (tool `propose_watch`:
+    slug, signal_type, target, grounding_entity, rationale, certainty,
+    finding_index). `monitoring.research.watch_policy` decides deterministically:
+    - grounding vocabulary = company name + competitive_landscape.primary_competitors
+      + profile.vendors + profile.tickers + active initiative titles +
+      strategic_priorities.current_year (+ existing watch labels, which only
+      corroborate). The entity MUST match a company-data term for a direct add.
+    - vocabulary precedence when a term appears in several sources:
+      company > competitor > vendor > ticker > initiative > priority > watch.
+      Partial (token) matching ignores stopwords and tokens < 4 chars.
+    - score ledger: +2 entity in company data (mandatory), +1 entity already
+      watched under another source, +1 target is the entity's own source (for
+      stock/edgar the grounding entity IS the ticker / a URL whose SITE LABEL —
+      "acme" in status.acme.com, acme.co.uk; never a subdomain or TLD — is the
+      entity's / a primary-source host: sec.gov, federalregister.gov,
+      eur-lex), +1 finding confidence high, +1 verification confirmed, +1
+      cross-specialist consensus, ±1 policy history for (signal_type,
+      grounding_kind) at >= 5 samples (>= 0.7 / <= 0.3 approval rate).
+    - finding points (high / verified / consensus) count only when the cited
+      finding concerns THIS source: a URL target shares its site with a cited
+      URL; a ticker/query target appears in the finding text or is the named
+      entity. A strong finding cannot be borrowed for an unrelated page.
+    - direct add at score >= 4 with the mandatory match AND the entity's OWN
+      source AND a strong kind (company / competitor / vendor / ticker —
+      initiative- or priority-grounded proposals are suggestions at most); model
+      `certainty` can only downgrade; `query` never direct; a suggestion needs
+      a linked finding and score >= 1 (SUGGEST_THRESHOLD) — nothing vouching
+      for it is rejected; at or above WATCHLIST_MAX_ENABLED (40) enabled rows
+      EVERY proposal is rejected (suggestions poll too, so the ceiling must
+      stop them or it latches); WATCHLIST_RESEARCH_MAX_DIRECT_ADDS (2) and
+      WATCHLIST_RESEARCH_MAX_PROPOSALS (2) per run (a direct add past its
+      budget is filed as a suggestion and charged to that budget).
+    - quiet defaults on every research row (model cannot loosen): cadence
+      daily (vendor_status hourly; page_watch/query weekly), severity_floor
+      medium, keyword trigger (rss/query only — a page_watch summary is
+      "page changed" and would never match) = material-event words +
+      priority terms (NEVER the entity name: feed summaries carry the feed
+      label, so it would match every entry), stock abs_change_pct_gte=5.
+      Vocabulary: URL targets contribute their site label only; short
+      whole-term names (IBM, AWS) still match in longer forms; the policy
+      stamp keeps the model's entity string when nothing matched, so a
+      not_relevant decline on an ungrounded suggestion still blacklists it.
+    - direct → mode=active, origin=research; suggestion → mode=dry_run,
+      origin=research_proposed; rationale in `notes`; policy stamp (entity,
+      grounding_kind, specialist, score, reasons, source_url) in
+      config_json._policy. Reject: invalid target, same site + signal_type
+      already watched, declined target, spent budget.
+    - declines (`watchlist_declines`, keyed by normalized target — https
+      forced, www. dropped, host/path lower-cased, query/fragment/trailing
+      slash removed): explicit (Decline button, "Stop watching…",
+      remove_watchlist_entry / DELETE on a research-origin row) is permanent;
+      expired_unreviewed (sweep expiry, and auto-disable) retries once after
+      90 days. Enforced in the propose_watch handler BEFORE any fetch — by
+      target, and by entity for not_relevant declines (token match) —
+      and rendered to the model as DECLINED. Decline reasons: not_relevant
+      (blacklist entity), wrong_source (blacklist target), too_noisy (keep
+      live at floor=high; response result=kept_high_floor; recorded as a
+      DECLINED outcome for calibration). Tool-supplied reasons outside the
+      explicit set fall back to not_relevant.
+    - isolation: the routing/synthesis pass has NO watchlist write tools
+      (add/tune/remove are in _SYNTHESIS_EXCLUDED_TOOLS), so every watch a
+      research run creates goes through the policy; tune_watchlist_entry
+      accepts only notes on a pending suggestion (approve/decline move it;
+      its quiet defaults cannot be loosened while it waits); URL-typed
+      targets pass validate_target_url at insert time; approve / decline /
+      expiry are compare-and-act on "still pending" (the guarded delete runs
+      under BEGIN IMMEDIATE). Normalized URL keys also fold percent-encoding,
+      dot segments and a trailing host dot.
+    - outcomes (`watchlist_policy_outcomes`: approved / declined / expired /
+      auto_disabled by signal_type, grounding_kind, specialist) feed the
+      history term and are rendered to the model as HOW PAST PROPOSALS TURNED OUT.
+    - sweep (watch_policy.sweep, on the scheduler's 15-min alert sweep):
+      expire suggestions older than WATCHLIST_PROPOSAL_TTL_DAYS (14)
+      (compare-and-delete: an approve in flight wins); auto-disable
+      research-origin watches (fired >= 5 & dismissed >= 2 & trust <= 0.5;
+      3 consecutive failed polls — silence is NOT a rule, an unchanged page
+      or a healthy vendor is a working watch) and record the target as a
+      90-day decline; one `watchlist_suggestions` nudge alert when >= 3
+      suggestions have waited >= 7 days — dedup_key watchlist_suggestions:pending
+      (an open card is coalesced in place), external_id per ISO week (a
+      dismissed card is not re-minted until next week), so acting on one
+      suggestion never spawns another nudge.
+    - the research state fingerprint hashes only enabled + active rows, so
+      approving / declining a suggestion never triggers a fresh research run.
+    - surfaces: /watchlist "Suggested by the Executive" (Approve / Decline…
+      with reason), "Added by the Executive · rationale" on research cards
+      with "Stop watching…", the morning brief's HANDLED block (watching /
+      stopped_watching) and a one-line WATCH SUGGESTIONS WAITING count.
   data_model:
     watchlist (in episodic_memory.db): |
       One row per condition the user wants monitored. Mutable per-row
@@ -1368,7 +1460,15 @@ external_monitoring:
       cadence, severity_floor, severity_ceiling, route_to_specialist,
       route_to_department, route_to_person_id, mode ('active' | 'dry_run'),
       enabled, created_at, last_polled_at, baselined_at, last_fired_at,
-      fired_count, dismiss_count, trust_score, notes.
+      fired_count, dismiss_count, trust_score, notes, origin ('manual' |
+      'executive' | 'research' | 'research_proposed'; additive ALTER,
+      default 'manual').
+    watchlist_declines / watchlist_policy_outcomes (in episodic_memory.db): |
+      Research watch policy memory — see research_watch_policy above.
+      watchlist_declines(normalized_target PK, entity, signal_type, slug,
+      kind 'declined_explicit' | 'expired_unreviewed', reason, declined_at);
+      watchlist_policy_outcomes(id, signal_type, grounding_kind, specialist,
+      outcome 'approved' | 'declined' | 'expired' | 'auto_disabled', at).
       baselined_at (nullable, additive ALTER; backfilled from
       last_polled_at for rows that were already being polled when the
       column landed) is set once a seeding source's first poll that
@@ -1777,7 +1877,7 @@ external_monitoring:
     triggers:
       - "Manual chat — the principal asks 'what should we look into?'; the Executive calls the `run_executive_research` chat tool. The tool runs the workflow, which both researches AND routes; the chat tool returns the structured summary so the Executive can describe to the principal what it researched and what it did with each finding."
       - "Onboarding completion — when the wizard finishes (build_and_save_profile fires), `api/routes/onboarding._fire_post_onboarding_research` schedules the workflow as a background task. The workflow's synthesis step fires whatever routing tools it deems necessary (DMs to heads, briefing alert, watchlist additions) — the wrapper just runs the workflow with a wall-clock ceiling and creates / completes the workflow_run row."
-      - "Periodic cron — `watchlist_research_scan` scheduled-action kind (default every 120 min via `WATCHLIST_RESEARCH_INTERVAL_MINUTES`). Each tick computes a state fingerprint (company profile + active initiatives + watchlist slugs/targets) and SKIPS the run when nothing has changed since the last successful periodic research. Quiet days cost zero tokens; first tick after any material profile / initiative / watchlist change fires immediately. A staleness floor (`WATCHLIST_RESEARCH_MAX_STALENESS_HOURS`, default 168, i.e. weekly) overrides the skip once that many hours have elapsed since the last successful run, so a static internal state cannot keep the council blind to purely-external change forever (set <= 0 to disable). The cron does NOT write its own Alert — the workflow's synthesis step already routes findings directly. After routing, a dedicated watchlist-analysis pass (separate budget) explicitly adds ongoing monitors via add_watchlist_entry, and the run artifact is persisted into the separate `recent_research` knowledge collection (keep-latest). Cron's only side-effects on success are the `watchlist_research_periodic_ran` audit row + whatever the workflow's Executive synthesis + watchlist pass fired."
+      - "Periodic cron — `watchlist_research_scan` scheduled-action kind (default every 120 min via `WATCHLIST_RESEARCH_INTERVAL_MINUTES`). Each tick computes a state fingerprint (company profile + active initiatives + watchlist slugs/targets) and SKIPS the run when nothing has changed since the last successful periodic research. Quiet days cost zero tokens; first tick after any material profile / initiative / watchlist change fires immediately. A staleness floor (`WATCHLIST_RESEARCH_MAX_STALENESS_HOURS`, default 168, i.e. weekly) overrides the skip once that many hours have elapsed since the last successful run, so a static internal state cannot keep the council blind to purely-external change forever (set <= 0 to disable). The cron does NOT write its own Alert — the workflow's synthesis step already routes findings directly. After routing, a dedicated watchlist-analysis pass (separate budget) proposes ongoing monitors via `propose_watch`; `monitoring.research.watch_policy` decides per proposal — direct add (grounded in company data: competitor / vendor / ticker / initiative / priority, score >= 4 on a fixed ledger, quiet defaults) vs dry-run suggestion for the principal vs reject — and the run artifact is persisted into the separate `recent_research` knowledge collection (keep-latest). Cron's only side-effects on success are the `watchlist_research_periodic_ran` audit row + whatever the workflow's Executive synthesis + watchlist pass fired."
     skip_if_unchanged: |
       The periodic cron handler (`monitoring.research.scheduler.run_watchlist_research_scan`)
       computes a sha256 over (`CompanyProfile.to_prompt_block()`,
@@ -1793,7 +1893,7 @@ external_monitoring:
 
       The `state_hash` stored on a successful run is recomputed *after*
       the workflow finishes, NOT the pre-run hash used for the skip
-      decision. The workflow's watchlist pass calls `add_watchlist_entry`,
+      decision. The workflow's watchlist pass adds watches (via the watch policy),
       mutating a fingerprint input; storing the pre-run hash would leave
       every later tick seeing a "changed" state and re-running a full
       research pass each interval. Capturing the post-run state as the

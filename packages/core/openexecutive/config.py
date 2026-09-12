@@ -748,6 +748,22 @@ class Settings(BaseSettings):
     watchlist_research_max_staleness_hours: int = Field(
         168, alias="WATCHLIST_RESEARCH_MAX_STALENESS_HOURS"
     )
+    # Research watchlist policy (monitoring/research/watch_policy.py). The
+    # research pass only PROPOSES watches; deterministic policy adds a watch
+    # on its own when it is grounded in company data and corroborated
+    # (max_direct_adds per run), and otherwise files it as a dry-run
+    # SUGGESTION the principal approves or declines on /watchlist
+    # (max_proposals per run). Above max_enabled enabled watches every add
+    # becomes a suggestion; a suggestion nobody reviews within
+    # proposal_ttl_days is removed (re-proposable after 90 days).
+    watchlist_research_max_direct_adds: int = Field(
+        2, alias="WATCHLIST_RESEARCH_MAX_DIRECT_ADDS"
+    )
+    watchlist_research_max_proposals: int = Field(
+        2, alias="WATCHLIST_RESEARCH_MAX_PROPOSALS"
+    )
+    watchlist_max_enabled: int = Field(40, alias="WATCHLIST_MAX_ENABLED")
+    watchlist_proposal_ttl_days: int = Field(14, alias="WATCHLIST_PROPOSAL_TTL_DAYS")
 
     # Notion → isolated wiki-collection sync. OFF by default. When on, a
     # scheduler heartbeat incrementally re-indexes pages shared with the

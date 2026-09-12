@@ -52,7 +52,7 @@ const NUM_FIELDS = new Set([
 const LIST_FIELDS = new Set([
   "pain_points", "primary_competitors", "competitive_advantages",
   "priorities", "culture_values", "operating_principles",
-  "departments", "leadership_team",
+  "departments", "leadership_team", "vendors", "tickers",
 ]);
 
 /** Flat snapshot of the SAVED profile — feeds both the Ask OE form
@@ -71,6 +71,8 @@ function snapshotProfile(profile: CompanyProfile): Record<string, unknown> {
     pain_points: profile.target_customer.pain_points,
     primary_competitors: profile.competitive_landscape.primary_competitors,
     competitive_advantages: profile.competitive_landscape.competitive_advantages,
+    vendors: profile.vendors ?? [],
+    tickers: profile.tickers ?? [],
     priorities: profile.strategic_priorities.current_year,
     north_star_metric: profile.strategic_priorities.north_star_metric,
     culture_values: profile.culture.values,
@@ -398,6 +400,9 @@ export default function CompanyProfilePage() {
                 {/* Competitive Landscape */}
                 <CompetitiveSection profile={profile} saving={saving} onSave={save} pending={pending} />
 
+                {/* External Dependencies (vendors + tickers the research policy may watch on its own) */}
+                <ExternalDependenciesSection profile={profile} saving={saving} onSave={save} pending={pending} />
+
                 {/* Strategic Priorities */}
                 <PrioritiesSection profile={profile} saving={saving} onSave={save} pending={pending} />
 
@@ -580,6 +585,47 @@ function CompetitiveSection({ profile, saving, onSave, pending }: SectionCompone
         <div className="space-y-3">
           <div><FieldLabel>Competitors (one per line)</FieldLabel><Textarea value={competitors} onChange={setCompetitors} rows={3} placeholder={"Salesforce\nHubSpot"} /></div>
           <div><FieldLabel>Our Advantages (one per line)</FieldLabel><Textarea value={advantages} onChange={setAdvantages} rows={3} placeholder={"10x faster onboarding\nOpen source"} /></div>
+        </div>
+      }
+    />
+  );
+}
+
+function ExternalDependenciesSection({ profile, saving, onSave, pending }: SectionComponentProps) {
+  const [vendors, setVendors] = useState(listToText(profile.vendors ?? []));
+  const [tickers, setTickers] = useState(listToText(profile.tickers ?? []));
+  useEffect(() => {
+    setVendors(listToText(profile.vendors ?? []));
+    setTickers(listToText(profile.tickers ?? []));
+  }, [profile]);
+
+  const [editing, setEditing] = usePendingSection(pending, {
+    vendors: (v) => setVendors(listToText(v as string[])),
+    tickers: (v) => setTickers(listToText(v as string[])),
+  });
+
+  return (
+    <Section
+      title="External Dependencies"
+      editing={editing}
+      onEditingChange={setEditing}
+      saving={saving}
+      onSave={() => onSave({ vendors: textToList(vendors), tickers: textToList(tickers) })}
+      viewContent={
+        <div className="space-y-4">
+          <p className="text-xs text-fg-subtle">
+            Named here, a vendor or ticker counts as company data: the Executive
+            will start watching its status page or filings on its own instead of
+            asking you first.
+          </p>
+          <div><FieldLabel>Vendors &amp; dependencies</FieldLabel><Pills items={profile.vendors ?? []} /></div>
+          <div><FieldLabel>Tracked tickers</FieldLabel><Pills items={profile.tickers ?? []} /></div>
+        </div>
+      }
+      editContent={
+        <div className="space-y-3">
+          <div><FieldLabel>Vendors (one per line)</FieldLabel><Textarea value={vendors} onChange={setVendors} rows={3} placeholder={"Stripe\nAWS"} /></div>
+          <div><FieldLabel>Tickers (one per line — yours and competitors&apos;)</FieldLabel><Textarea value={tickers} onChange={setTickers} rows={3} placeholder={"CRM\nHUBS"} /></div>
         </div>
       }
     />
