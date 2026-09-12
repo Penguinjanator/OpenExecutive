@@ -32,14 +32,14 @@ SOURCE_KIND_EDGAR = "edgar"
 # (pricing, careers, leadership). Stateful (see monitoring.store page_watch_state).
 SOURCE_KIND_PAGE_WATCH = "page_watch"
 
-# page_watch fetch-source contract: a row whose ``config_json[FETCH_KEY] ==
-# FETCH_XCRAWL`` is fetched via xcrawl's scrape API instead of the keyless
-# httpx fetcher (for JS-rendered / bot-blocked pages with no usable feed).
-# Single source of truth so the page_watch adapter (which reads it) and the
-# insert-time validator (which writes it when converting a non-feed rss row)
-# can't drift.
+# page_watch fetch-source marker. Every page_watch row is now fetched with the
+# keyless httpx fetcher; rows written before the xcrawl scrape path was removed
+# still carry ``config_json["fetch"] == "xcrawl"`` and a baseline captured as
+# xcrawl markdown. The adapter treats that marker as "baseline is stale":
+# it re-captures the baseline on the next poll without emitting a signal and
+# clears the marker, so no phantom change is reported for the switch.
 PAGE_WATCH_FETCH_KEY = "fetch"
-PAGE_WATCH_FETCH_XCRAWL = "xcrawl"
+PAGE_WATCH_FETCH_LEGACY_XCRAWL = "xcrawl"
 
 # Watchlist row "mode" values. v1 default is ``active`` per the user's
 # instruction — dry-run is wired but opt-in (an entry created with

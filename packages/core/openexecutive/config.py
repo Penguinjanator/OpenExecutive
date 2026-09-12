@@ -466,66 +466,6 @@ class Settings(BaseSettings):
         default_factory=list, alias="WEB_SEARCH_BLOCKED_DOMAINS"
     )
 
-    # ── xcrawl (external scrape / SERP API) ───────────────────────────────
-    # Off by default. xcrawl's scrape API reads JS-rendered / bot-blocked
-    # pages the keyless RSS adapter cannot, so the watchlist can monitor
-    # sources that have NO usable RSS feed (modern marketing / news SPAs)
-    # via scrape-backed change detection, and validate / repair a feed
-    # target at insert time so dead rows never reach the scan loop.
-    #
-    # No "required when enabled" validator: a flag set without a key
-    # degrades to disabled in the client rather than crash-looping boot.
-    xcrawl_enabled: bool = Field(False, alias="XCRAWL_ENABLED")
-    xcrawl_api_key: str | None = Field(None, alias="XCRAWL_API_KEY")
-    xcrawl_base_url: str = Field(
-        "https://run.xcrawl.com/v1", alias="XCRAWL_BASE_URL"
-    )
-    xcrawl_timeout_s: float = Field(30.0, alias="XCRAWL_TIMEOUT_S")
-
-    # ── research finding verification (xcrawl scrape deep-read) ───────────
-    # When on (also requires xcrawl_enabled), the executive_research workflow
-    # runs a post-dedup pass that scrapes each surviving finding's cited URL
-    # and asks a cheap model whether the page actually supports the claim —
-    # demoting / dropping findings whose source is dead or doesn't back them,
-    # before the Executive routes anything. web_search gives specialists
-    # discovery (snippets); this gives them the deep-read the finding contract
-    # already assumes. Off by default; a no-op when xcrawl is disabled.
-    external_research_verify_enabled: bool = Field(
-        False, alias="EXTERNAL_RESEARCH_VERIFY_ENABLED"
-    )
-    # Cheap model for the per-finding verify call (read scraped page → verdict).
-    research_verify_model: str = Field(
-        "claude-haiku-4-5", alias="RESEARCH_VERIFY_MODEL"
-    )
-    # Hard cap on findings verified per research run (each = 1 scrape + 1 cheap
-    # LLM call). Bounds added cost; verified in severity order.
-    research_verify_max_findings: int = Field(
-        8, alias="RESEARCH_VERIFY_MAX_FINDINGS"
-    )
-
-    # ── agentic research (read-before-cite scrape loop) ───────────────────
-    # When on (also requires xcrawl_enabled), each executive_research
-    # specialist runs a bounded search→scrape_url→emit tool-use loop: it
-    # reads the FULL article behind its best web_search hits (xcrawl scrape)
-    # and grounds claims in real content, instead of the single-shot
-    # snippet-only call that produced findings whose cited sources didn't
-    # back them. Off by default (single-shot path unchanged); the verify
-    # pass remains the safety net.
-    research_agentic_scrape_enabled: bool = Field(
-        False, alias="RESEARCH_AGENTIC_SCRAPE_ENABLED"
-    )
-    # Max scrape_url calls a specialist may make per run (each = 1 xcrawl
-    # scrape + the page's tokens). Past this the tool refuses and tells the
-    # model to emit. Bounds per-run cost across the 7-specialist fan-out.
-    research_scrape_max_per_specialist: int = Field(
-        3, alias="RESEARCH_SCRAPE_MAX_PER_SPECIALIST"
-    )
-    # Hard ceiling on tool-use turns per specialist loop (search/scrape/emit).
-    # Guards against a specialist that never emits.
-    research_loop_max_iterations: int = Field(
-        5, alias="RESEARCH_LOOP_MAX_ITERATIONS"
-    )
-
     @field_validator(
         "web_search_allowed_domains", "web_search_blocked_domains", mode="before"
     )

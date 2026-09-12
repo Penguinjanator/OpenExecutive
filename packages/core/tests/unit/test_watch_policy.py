@@ -215,15 +215,15 @@ def _initech_finding(**kw: Any) -> ResearchFinding:
 
 def test_entity_not_in_company_data_is_never_direct() -> None:
     p = _proposal(grounding_entity="Initech", target="https://initech.com/feed.xml")
-    d = wp.classify(p, _initech_finding(verification="confirmed", source_specialist="cso,cfo"), _ctx())
+    d = wp.classify(p, _initech_finding(source_specialist="cso,cfo"), _ctx())
     assert d.tier == wp.TIER_SUGGEST
-    assert d.score == 3  # own-source +1 needs an entity; high +1, verified +1, consensus +1
+    assert d.score == 2  # own-source +1 needs an entity; high +1, consensus +1
 
 
 def test_medium_confidence_grounded_needs_more_corroboration() -> None:
     d = wp.classify(_proposal(), _finding(confidence="medium"), _ctx())
     assert d.tier == wp.TIER_SUGGEST and d.score == 3
-    d2 = wp.classify(_proposal(), _finding(confidence="medium", verification="confirmed"), _ctx())
+    d2 = wp.classify(_proposal(), _finding(confidence="medium", source_specialist="cso,cfo"), _ctx())
     assert d2.tier == wp.TIER_DIRECT and d2.score == 4
 
 
@@ -237,7 +237,7 @@ def test_unsure_only_downgrades() -> None:
 
 def test_query_is_always_a_suggestion() -> None:
     p = _proposal(slug="q-acme", signal_type="query", target="Acme Corp pricing", grounding_entity="Acme Corp")
-    d = wp.classify(p, _finding(verification="confirmed"), _ctx())
+    d = wp.classify(p, _finding(source_specialist="cso,cfo"), _ctx())
     assert d.tier == wp.TIER_SUGGEST and "standing web queries" in d.reasons[-1]
 
 
@@ -568,7 +568,7 @@ def test_direct_add_needs_a_finding_that_cites_the_source() -> None:
 def test_finding_points_need_a_finding_about_this_source() -> None:
     # A strong finding about Acme lends nothing to an unrelated attacker URL.
     p = _proposal(target="https://totally-unrelated.attacker.net/feed", grounding_entity="Acme Corp")
-    d = wp.classify(p, _finding(verification="confirmed", source_specialist="cso,cfo"), _ctx())
+    d = wp.classify(p, _finding(source_specialist="cso,cfo"), _ctx())
     assert d.score == 2 and d.tier == wp.TIER_SUGGEST
     assert "does not mention this source" in " ".join(d.reasons)
     # A finding that names the ticker does support a ticker watch on it.
@@ -580,7 +580,7 @@ def test_direct_add_requires_the_entitys_own_source() -> None:
     # A well-corroborated third-party page about a competitor is the
     # principal's call, never a direct add.
     p = _proposal(target="https://news.example.com/acme-feed.xml", grounding_entity="Acme Corp")
-    f = _finding(verification="confirmed", source_specialist="cso,cfo",
+    f = _finding(source_specialist="cso,cfo",
                  relevant_urls=["https://news.example.com/acme-pricing"])
     d = wp.classify(p, f, _ctx())
     assert d.score >= wp.DIRECT_THRESHOLD and d.tier == wp.TIER_SUGGEST
@@ -590,7 +590,7 @@ def test_direct_add_requires_the_entitys_own_source() -> None:
 def test_initiative_or_priority_grounding_is_never_direct() -> None:
     p = _proposal(slug="rss-helios", target="https://helios.com/feed.xml", grounding_entity="Helios API")
     f = _finding(title="Helios API launch", summary="Launch Helios API shipped.",
-                 verification="confirmed", relevant_urls=["https://helios.com/launch"])
+                 relevant_urls=["https://helios.com/launch"])
     d = wp.classify(p, f, _ctx())
     assert d.grounding_kind == wp.KIND_INITIATIVE and d.score >= wp.DIRECT_THRESHOLD
     assert d.tier == wp.TIER_SUGGEST and "needs a named competitor" in d.reasons[-1]
@@ -769,7 +769,7 @@ def test_department_scope_grounding_is_suggestion_only(db: Path) -> None:
     p = _proposal(slug="rss-expense", signal_type="rss", target="https://expensecards.example/feed",
                   grounding_entity="Expense card programs")
     f = _finding(title="Expense card programs shift", summary="New expense card programs launched.",
-                 relevant_urls=["https://expensecards.example/feed"], verification="confirmed",
+                 relevant_urls=["https://expensecards.example/feed"],
                  source_specialist="cfo,coo")
     d = wp.classify(p, f, _dept_ctx())
     assert d.tier == wp.TIER_SUGGEST and d.department == "finance"
@@ -778,7 +778,7 @@ def test_department_scope_grounding_is_suggestion_only(db: Path) -> None:
     own = _proposal(slug="rss-programs", signal_type="rss", target="https://expense.example/feed",
                     grounding_entity="Expense card programs")
     own_f = _finding(title="programs", summary="s", relevant_urls=["https://expense.example/feed"],
-                     verification="confirmed", source_specialist="cfo,coo")
+                     source_specialist="cfo,coo")
     own_d = wp.classify(own, own_f, _dept_ctx())
     assert own_d.tier == wp.TIER_SUGGEST and any("grounded only in a department_scope" in r for r in own_d.reasons)
     out = wp.apply_proposals([p], [f], _dept_ctx(), db_path=db)
@@ -1097,7 +1097,7 @@ def test_auto_link_prefers_the_finding_that_cites_the_source() -> None:
     ctx = _ctx()
     findings = [
         _finding(title="Globex beats, Acme called a laggard", summary="Acme lags Globex; Initech too.",
-                 relevant_urls=["https://globex.com/ir/q3"], verification="confirmed",
+                 relevant_urls=["https://globex.com/ir/q3"],
                  source_specialist="cfo,cso"),
         _finding(title="Acme Q3", summary="ACME reported Q3.", relevant_urls=["https://acme.com/ir/q3"],
                  confidence="medium"),
@@ -1115,7 +1115,7 @@ def test_auto_link_prefers_the_finding_that_cites_the_source() -> None:
         _finding(title="GM recall", summary="GM recalled the Blazer EV.", relevant_urls=["https://news.gm.com/x"],
                  confidence="medium"),
         _finding(title="GM news", summary="GM slashes prices.", relevant_urls=["https://gm.co.ke/news"],
-                 verification="confirmed", source_specialist="cso,cfo"),
+                 source_specialist="cso,cfo"),
     ]
     gm = _proposal(slug="stock-gm", signal_type="stock", target="GM", grounding_entity="GM", finding_index=None)
     assert wp.auto_link_finding(gm, gm_findings, pctx) == 0

@@ -543,6 +543,24 @@ def update_watchlist_fields(
         return int(cursor.rowcount)
 
 
+def remove_watchlist_config_key(
+    item_id: int, key: str, *, db_path: Path | None = None
+) -> int:
+    """Remove one top-level key from a watchlist row's ``config_json`` in
+    place (SQLite ``json_remove``), so a concurrent write to another key is
+    never overwritten by a read-modify-write of a stale snapshot. ``key``
+    is validated as a bare identifier because it is spliced into the JSON
+    path. Returns the rowcount."""
+    if not key.isidentifier():
+        raise ValueError(f"Cannot remove config key {key!r}")
+    with _get_conn(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE watchlist SET config_json = json_remove(config_json, ?) WHERE id = ?",
+            (f"$.{key}", item_id),
+        )
+        return int(cursor.rowcount)
+
+
 def delete_watchlist_item(item_id: int, db_path: Path | None = None) -> bool:
     """Hard-delete a watchlist row and its ``external_signals`` history.
     Returns True iff a row was removed.
@@ -1057,6 +1075,7 @@ __all__ = [
     "mark_polled",
     "get_page_watch_state",
     "mark_signal_processed",
+    "remove_watchlist_config_key",
     "set_enabled",
     "update_signal_enrichment",
     "update_watchlist_fields",

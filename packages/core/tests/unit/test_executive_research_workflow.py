@@ -238,11 +238,10 @@ async def test_workflow_runs_end_to_end_with_stubbed_specialists(
             result_data = event.data
 
     step_starts = [e for e in events if e.type == "step_start"]
-    # gather_context, research_specialists, dedup, verify, executive_synthesis,
-    # emit_artifact. The verify step always emits (its work is a gated no-op
-    # when xcrawl/verification are disabled, as here).
-    assert len(step_starts) == 6
-    assert {"verify"} <= {e.step_id for e in step_starts}
+    # gather_context, research_specialists, dedup, executive_synthesis,
+    # emit_artifact.
+    assert len(step_starts) == 5
+    assert "verify" not in {e.step_id for e in step_starts}
     assert artifact, "workflow produced no artifact"
     assert "Acme raised $50M" in artifact
     assert "send_slack_dm" in artifact

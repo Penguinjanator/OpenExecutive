@@ -848,7 +848,6 @@ def classify(
     +1 entity is already watched under another source (corroboration)
     +1 target is the entity's own source (its ticker / its domain / a primary host)
     +1 finding confidence is high
-    +1 finding verification is 'confirmed'
     +1 cross-specialist consensus on the finding
     +1 the entity is named in a recent episodic decision
     ±1 policy history for (signal_type, grounding kind) at >=5 samples
@@ -912,9 +911,6 @@ def classify(
         if finding.confidence == "high":
             score += 1
             reasons.append("finding confidence high")
-        if finding.verification == "confirmed":
-            score += 1
-            reasons.append("source verified")
         if "," in (finding.source_specialist or ""):
             score += 1
             reasons.append("cross-specialist consensus")
@@ -1054,8 +1050,7 @@ def auto_link_finding(
     with the entity term :func:`classify` would use), so the link can never
     lend a proposal a finding the score would not honour. Among candidates,
     one that cites the target's site or names the ticker outranks one that
-    only names the entity, then higher confidence, then verification, then
-    the earlier finding — so the evidence URL stamped on the row is the
+    only names the entity, then higher confidence, then the earlier finding — so the evidence URL stamped on the row is the
     source's own, not an unrelated company's."""
     match = match_vocab(proposal.grounding_entity, ctx.vocabulary)
     entity_term = match[0] if match else ""
@@ -1064,7 +1059,7 @@ def auto_link_finding(
     entity_labels = set(_name_tokens(entity_term, ctx.vocabulary)) | {target_phrase.replace(" ", "")}
     entry_value = ctx.vocabulary.get(entity_term) if entity_term else None
     pinned = _entry(entry_value).domains if entry_value is not None else ()
-    best: tuple[tuple[int, int, int, int, int], int] | None = None
+    best: tuple[tuple[int, int, int, int], int] | None = None
     for index, finding in enumerate(findings):
         if not _finding_supports(proposal, finding, entity_term, ctx.vocabulary):
             continue
@@ -1085,7 +1080,6 @@ def auto_link_finding(
             cites_source,
             cites_entity_site,
             _CONFIDENCE_RANK.get(finding.confidence, 0),
-            int(finding.verification == "confirmed"),
             -index,
         )
         if best is None or key > best[0]:

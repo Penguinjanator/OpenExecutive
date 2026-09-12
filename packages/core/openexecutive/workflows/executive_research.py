@@ -336,16 +336,6 @@ class ExecutiveResearchWorkflow(Workflow):
                 ),
             ),
             WorkflowStepDef(
-                id="verify",
-                title="Verify findings against sources",
-                description=(
-                    "Scrape each surviving finding's cited URL and confirm "
-                    "the page supports the claim; demote / drop findings "
-                    "whose source is dead or doesn't back them. No-op unless "
-                    "xcrawl + verification are enabled."
-                ),
-            ),
-            WorkflowStepDef(
                 id="executive_synthesis",
                 title="Executive routes findings",
                 description=(
@@ -510,33 +500,7 @@ class ExecutiveResearchWorkflow(Workflow):
 
         deduped_all: list[ResearchFinding] = dedup_findings(findings_by_specialist)
 
-        yield WorkflowEvent(
-            type="step_done",
-            step_id="dedup",
-            summary=f"after_dedup={len(deduped_all)}",
-        )
-
-        # ------------------------------------------------------------------
-        # Step 3b: verify findings against their cited source
-        # ------------------------------------------------------------------
-        # Runs BEFORE the low-confidence filter so a finding whose source is
-        # dead or doesn't support it is demoted (often to 'low' → dropped)
-        # here, instead of being routed to a human on snippet-level trust.
-        # No-op unless xcrawl + verification are enabled; best-effort (a
-        # verify failure leaves the finding unchanged).
-        yield WorkflowEvent(
-            type="step_start",
-            step_id="verify",
-            step_title="Verify findings against sources",
-        )
-        from openexecutive.monitoring.research.verification import (
-            verify_findings,
-        )
-
-        deduped_all = await verify_findings(deduped_all)
-        verified = [f for f in deduped_all if f.verification is not None]
-
-        # Pre-synthesis quality filter — now reflects verify demotions.
+        # Pre-synthesis quality filter.
         # Low-confidence findings are dropped before the Executive ever sees
         # them — the round_2 post-mortem showed they make up most of the
         # noise, and the synthesis prompt cannot be trusted to ignore them
@@ -548,21 +512,15 @@ class ExecutiveResearchWorkflow(Workflow):
         low_conf_dropped = len(deduped_all) - len(deduped)
         if low_conf_dropped:
             logger.info(
-                "research: dropped %d low-confidence finding(s) pre-synthesis "
-                "(after verify)",
+                "research: dropped %d low-confidence finding(s) pre-synthesis",
                 low_conf_dropped,
             )
 
-        # step_done carries the full post-verify accounting (the dedup step
-        # now only reports after_dedup), so the low_conf_dropped / to_synthesis
-        # signals observers relied on are preserved here.
         yield WorkflowEvent(
             type="step_done",
-            step_id="verify",
+            step_id="dedup",
             summary=(
-                f"verified={len(verified)} "
-                f"confirmed={sum(1 for f in verified if f.verification == 'confirmed')} "
-                f"demoted={sum(1 for f in verified if f.verification in ('contradicted', 'unsupported', 'source_unreachable'))} "
+                f"after_dedup={len(deduped_all)} "
                 f"low_conf_dropped={low_conf_dropped} "
                 f"to_synthesis={len(deduped)}"
             ),
@@ -1289,8 +1247,7 @@ def _render_watchlist_turn(
     parts: list[str] = ["FINDINGS FROM THIS RESEARCH RUN:\n"]
     for i, f in enumerate(findings, start=1):
         block = (
-            f"#{i} [{f.severity_hint.value} | {f.confidence}"
-            f"{' | verified' if f.verification == 'confirmed' else ''}] "
+            f"#{i} [{f.severity_hint.value} | {f.confidence}] "
             f"({f.source_specialist}) {f.title}\n"
             f"  {f.summary}\n"
         )

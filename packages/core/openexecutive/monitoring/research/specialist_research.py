@@ -11,7 +11,6 @@ import logging
 from typing import Any
 
 from openexecutive.agents.base import BaseAgent
-from openexecutive.config import get_settings
 from openexecutive.monitoring.research.models import ResearchFinding
 from openexecutive.monitoring.research.prompts import research_addendum_for
 from openexecutive.monitoring.research.tools import (
@@ -38,19 +37,6 @@ async def research_one_specialist(
     asyncio.gather doesn't abort on one specialist's crash. The
     workflow records per-specialist outcomes separately for the artifact.
     """
-    settings = get_settings()
-    if settings.research_agentic_scrape_enabled and settings.xcrawl_enabled:
-        # Read-before-cite: the specialist runs a search→scrape_url→emit
-        # loop so it grounds claims in full sources it actually read. Local
-        # import avoids a module-load cycle (agentic imports _extract_findings
-        # from here). Single-shot path below is unchanged when disabled.
-        from openexecutive.monitoring.research.agentic import (
-            run_specialist_agentic,
-        )
-        return await run_specialist_agentic(
-            specialist_slug, agent, research_context,
-        )
-
     from openexecutive.agents.research_council import (
         get_research_model,
         get_research_use_deep_reasoning,

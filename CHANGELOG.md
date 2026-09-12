@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   policy (`monitoring.research.watch_policy`) decides from company data. A
   proposal tied to a named competitor, vendor, ticker, initiative or
   priority (the profile gains `vendors` and `tickers` for this) and
-  corroborated (own source, high-confidence / verified finding, consensus,
+  corroborated (own source, high-confidence finding, consensus,
   the policy's own track record) is added on its own — quietly: daily
   cadence, medium severity floor, a keyword trigger for feeds, 5 % for
   stocks — and shows up in the brief's "handled overnight" block as
@@ -102,6 +102,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dismissing a watch-sourced alert lowers that watch's `trust_score` (and
   bumps `dismiss_count`); approving recovers it. Trust now discounts the
   ranking and is shown to the review as evidence.
+
+### Removed
+- **The xcrawl scrape service and everything that depended on it.** The
+  research run no longer has a post-dedup verify pass or an optional
+  read-before-cite scrape loop, and the watch policy no longer scores a
+  "verified" point; the `XCRAWL_*`, `EXTERNAL_RESEARCH_VERIFY_*`,
+  `RESEARCH_AGENTIC_*`, `RESEARCH_SCRAPE_*` and `RESEARCH_LOOP_*` settings
+  are gone (a deployment that still sets them is unaffected). Every
+  watchlist fetch is the keyless, SSRF-guarded httpx fetcher: a page watch
+  written under the old `fetch: xcrawl` marker re-captures its baseline on
+  the next poll without reporting a change, and an `rss` target that is not
+  a feed becomes a `page_watch` when the page already fetched by the feed
+  check has readable text (otherwise it is rejected, as before).
 
 ### Changed
 - The research routing pass no longer carries the watchlist write tools

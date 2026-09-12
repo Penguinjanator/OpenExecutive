@@ -171,7 +171,7 @@ providers:
     ``claude-haiku-4-5`` and legacy ``claude-3-5-haiku-…`` orderings; scoped
     to Claude names so an unrelated slug containing "haiku" is unaffected)
     and the agent call paths (BaseAgent.analyze,
-    analyze_with_tools, monitoring.research.agentic) skip the thinking fields
+    analyze_with_tools) skip the thinking fields
     for it; the Council UI disables the checkbox for the same models, clears
     it when the model is switched to Haiku, masks a stale stored
     deep_reasoning=true on load (so the next Save corrects the row), and
@@ -194,12 +194,10 @@ providers:
     carried as a synthetic ``openrouter_reasoning`` content block (always
     LAST in ``content`` so ``content[0].text`` readers are unaffected) and
     replayed verbatim as ``reasoning_details`` on the assistant message by
-    the request translator. The one tool loop that runs with deep reasoning
-    on — monitoring.research.agentic._assistant_turn — echoes the block, so
-    it keeps reasoning continuity (the OpenRouter-path equivalent of echoing
-    Anthropic thinking blocks). The Executive / executive_research /
+    the request translator. The Executive / executive_research /
     executive_reflection loops never enable thinking and drop the block
-    harmlessly; wire the echo in if deep reasoning is ever added to them.
+    harmlessly (each consults `reasoning_replay_block`, so the echo is
+    already wired should deep reasoning ever be added to them).
     The Anthropic
     server-side web_search tool (no input_schema) cannot be executed by
     OpenRouter, so its intent is translated into OpenRouter's
@@ -1444,10 +1442,10 @@ external_monitoring:
       entity's NAME: its leading distinctive word or all its words run
       together, never a generic trailing word ("Acme Payments" is not
       payments.io) / a primary-source host: sec.gov, federalregister.gov,
-      eur-lex), +1 finding confidence high, +1 verification confirmed, +1
+      eur-lex), +1 finding confidence high, +1
       cross-specialist consensus, ±1 policy history for (signal_type,
       grounding_kind) at >= 5 samples (>= 0.7 / <= 0.3 approval rate).
-    - finding points (high / verified / consensus) count only when the cited
+    - finding points (high / consensus) count only when the cited
       finding concerns THIS source: a URL target shares its site with a cited
       URL; a ticker/query target appears in the finding text (as a phrase —
       "1211.HK" is two words once normalized) or is the named entity. A strong
@@ -1459,7 +1457,7 @@ external_monitoring:
       concerns the source by the same test the score uses
       (watch_policy.auto_link_finding: with the entity term classify would
       use; ranked by citing the target's site / naming the ticker, then
-      citing the entity's own site, confidence, verification, order) and
+      citing the entity's own site, confidence, order) and
       records "linked to finding #N, which concerns this source" as the
       first reason. The caller's proposal is not mutated. A proposal nothing
       cites is still rejected as having no evidence.
@@ -1701,7 +1699,7 @@ external_monitoring:
       - "stock — Yahoo Finance Chart endpoint (the same endpoint yfinance scrapes, used directly via httpx to avoid pandas/numpy). Watchlist `target` is the ticker; signals fire when |intraday vs previous close| ≥ `trigger.abs_change_pct_gte` (default 5%). Severity hint scales with the magnitude of the move (≥10% URGENT, ≥5% HIGH, ≥2% MEDIUM, else LOW). v2 candidate: swap behind the same Source interface for a paid Alpha Vantage / Finnhub feed if Yahoo brittleness bites."
       - "query — standing web-search query. Watchlist `target` is a natural-language query (e.g. 'Acme Corp layoffs OR restructuring OR funding'); each poll runs it through `BaseAgent.analyze_with_tools` with the web_search tool (model pinned to `get_research_model()`, honouring an OpenRouter Council override — the provider layer translates native web_search into OpenRouter's `plugins:[{id:web}]`, see providers/translator). The model reports distinct results via the `emit_query_results` tool; each result with a valid clickable URL becomes a Signal (the adapter emits a flat severity hint LOW because it can't judge materiality per-hit — the pipeline regrades this from the capture-time relevance read BEFORE the floor gate via `_grade_query_severity`, so a material hit clears a medium/high floor instead of being suppressed; dedup key `query:` + first 32 hex chars of sha256(slug + NUL + canonical_url); URL-less results dropped to uphold the provenance invariant). UNLIKE the keyless feed adapters this source is BILLED (one LLM call + web searches per poll), so it polls slowly (default 360 min), is bounded by `web_search_max_uses` + per-row `config.max_results` (default 5, ceiling 10), and has its own kill switch `EXTERNAL_MONITOR_QUERY_ENABLED`. Optional `trigger.keywords` filters like rss; `config.allowed_domains`/`blocked_domains` are best-effort prompt hints only (NOT enforced, and not honoured by the OpenRouter web plugin). This is the 'watch arbitrary conditions' primitive that no feed publishes."
       - "edgar — SEC EDGAR filings. Watchlist `target` is a ticker (e.g. 'AAPL') or CIK; polls SEC's browse-edgar Atom feed (`/cgi-bin/browse-edgar?action=getcompany&CIK=…&output=atom`, whose CIK param resolves a ticker server-side, so no ticker→CIK table is shipped), parsed with feedparser. Emits one Signal per new filing whose form is in the filter (`trigger.forms`, default {8-K, 10-K, 10-Q}; amendments like 8-K/A match their base form). Dedup on the filing's accession number (globally unique — the cleanest natural key of any source). Provenance is the filing-index URL. Severity hint: 8-K HIGH (material-event report), 10-K/10-Q MEDIUM, else LOW. Keyless, but SEC's fair-access policy requires a descriptive User-Agent with a contact — sent via the EDGAR_USER_AGENT setting (operators should override the default with a real contact). Reuses fetch_bounded (now with a per-call user_agent override), validate_target_url, and the standard dedup/Signal pattern. The entry's <updated> lands on Signal.published_at and the adapter declares `seed_on_first_poll`, so a new watch baselines past filings instead of replaying them and filings older than EXTERNAL_MONITOR_MAX_SIGNAL_AGE_DAYS are `suppressed_stale`."
-      - "page_watch — generic web-page change detection for feed-less pages (pricing, careers, leadership, ToS). Watchlist `target` is the page URL. STATEFUL (the first stateful adapter): each poll fetches the page (bounded, SSRF-guarded), reduces it to normalized visible text (drops script/style/comments/tags, unescapes entities, collapses whitespace — so markup/layout churn doesn't register), hashes the FULL normalized text (so a change anywhere registers — no length blind spot), and compares to the last-seen hash in `page_watch_state`. First observation stores a baseline and emits NOTHING; an unchanged page emits nothing; a changed page emits ONE Signal carrying a difflib-based change summary (~N% differs + the added text; the diff/snapshot are length-capped but detection is not) and updates the baseline. Severity hint LOW (page diffs are noisy — enrichment + severity_floor filter). Dedup key folds slug + UTC date + content hash (mirrors stock — a state seen again on a later day re-alerts; same-day repeats dedup). Optional `trigger.keywords` only surfaces a change when the change itself (summary + added text) matches. Reads/writes its state via the db_path threaded through Source.poll. Optional `config.fetch = \"xcrawl\"` routes the fetch through xcrawl's scrape API (clean markdown) instead of the keyless httpx fetcher — so JS-rendered / bot-blocked feed-less pages (most modern news/marketing sites) are monitorable; off by default, a no-op when xcrawl is disabled, and the scraped markdown is size-capped to mirror the httpx byte cap."
+      - "page_watch — generic web-page change detection for feed-less pages (pricing, careers, leadership, ToS). Watchlist `target` is the page URL. STATEFUL (the first stateful adapter): each poll fetches the page (bounded, SSRF-guarded), reduces it to normalized visible text (drops script/style/comments/tags, unescapes entities, collapses whitespace — so markup/layout churn doesn't register), hashes the FULL normalized text (so a change anywhere registers — no length blind spot), and compares to the last-seen hash in `page_watch_state`. First observation stores a baseline and emits NOTHING; an unchanged page emits nothing; a changed page emits ONE Signal carrying a difflib-based change summary (~N% differs + the added text; the diff/snapshot are length-capped but detection is not) and updates the baseline. Severity hint LOW (page diffs are noisy — enrichment + severity_floor filter). Dedup key folds slug + UTC date + content hash (mirrors stock — a state seen again on a later day re-alerts; same-day repeats dedup). Optional `trigger.keywords` only surfaces a change when the change itself (summary + added text) matches. Reads/writes its state via the db_path threaded through Source.poll. The keyless httpx fetcher is the only fetch path. A row written before the xcrawl scrape path was removed still carries `config.fetch = \"xcrawl\"` (PAGE_WATCH_FETCH_LEGACY_XCRAWL) and a baseline hashed from scraped markdown; the adapter treats that marker as a stale baseline — the next poll re-captures the baseline from the plain fetch WITHOUT emitting a signal and clears the marker in place (store.remove_watchlist_config_key, a SQL json_remove so a concurrent edit to another config key is kept), so the change of fetcher is never reported as a page change. An unsaved item (no id) cannot have its marker cleared and is compared normally."
   insert_validation: |
     monitoring.target_validation.validate_and_normalize_target — runs at
     insert time on BOTH watchlist surfaces (POST /watchlist and the
@@ -1711,30 +1709,32 @@ external_monitoring:
       - recognized as a feed (parsed.version set, incl. an empty/new feed)
         → kept as rss;
       - a public server answered but it is not a feed → CONVERTED to a
-        scrape-backed page_watch (config.fetch=xcrawl) when xcrawl.scrape
-        returns content, else REJECTED (WatchlistTargetError → HTTP 422 /
-        tool error);
+        page_watch when the body the feed check already fetched reduces to
+        readable text (page_watch.html_to_text — same SSRF guard and byte
+        cap the adapter itself uses; no second fetch, no fetch marker
+        written), else REJECTED (WatchlistTargetError → HTTP 422 / tool
+        error). An oversized body or an HTTP error status has no body to
+        inspect and is rejected;
       - SSRF-rejected / unparseable URL → 'blocked' → rejected outright,
-        never handed to xcrawl (so xcrawl can't be used to reach a target
-        the on-box SSRF guard refused);
+        never fetched;
       - transient fetch failure → inserted unverified (don't penalize a
         feed that's merely down right now; the scan loop retries).
     Exists because executive_research proposes feed URLs the model never
     verified — historically the great majority were dead, which is what
     left the briefing's monitoring section empty.
-  xcrawl_integration: |
-    integrations.xcrawl_client — async client over the xcrawl web-data API
-    (search / scrape). The watchlist uses scrape to read pages the keyless
-    httpx fetcher cannot (JS-rendered / bot-blocked, no RSS). Settings-gated
-    (XCRAWL_ENABLED + XCRAWL_API_KEY, OFF by default), timeout-bounded,
-    graceful-degradation (every failure returns []/None, never raises into
-    the scan loop), one `xcrawl` audit row per call. No 'required when
-    enabled' validator — a flag set without a key degrades to disabled
-    rather than crash-looping boot. NOTE: web SEARCH for the research
-    council is NOT this client — that runs through the provider web_search
-    path (Anthropic native / OpenRouter web plugin), which already works;
-    xcrawl is the watchlist's fetch-and-validate layer, not a research
-    grounding layer.
+  no_external_fetch_service: |
+    There is no third-party scrape / render service. The xcrawl client, the
+    read-before-cite scrape loop (`monitoring/research/agentic.py`), the
+    post-dedup verify pass (`monitoring/research/verification.py`) and the
+    `XCRAWL_*`, `EXTERNAL_RESEARCH_VERIFY_*`, `RESEARCH_AGENTIC_*`,
+    `RESEARCH_SCRAPE_*` and `RESEARCH_LOOP_*` settings were removed: the
+    service had been failing on every call for weeks with nothing noticing
+    (every failure degraded silently to "unverified"), and it was the only
+    outbound fetch that bypassed the on-box SSRF guard. Every watchlist
+    fetch is now the keyless, SSRF-guarded, byte-capped httpx fetcher, and
+    research grounding is the provider web_search path (Anthropic native /
+    OpenRouter web plugin). A deployment that still sets the removed
+    variables is unaffected (unknown env vars are ignored).
   pipeline: |
     openexecutive.monitoring.pipeline — `run_external_monitor_scan(now)`
     is the per-tick entry point. It walks
@@ -1916,51 +1916,17 @@ external_monitoring:
          specialist (agent_overrides.research_focus, see
          per_specialist_research_focus); the shared contract is fixed code.
          Specialists DO NOT route — they surface what their domain
-         turned up.
-         READ-BEFORE-CITE (gated): when `RESEARCH_AGENTIC_SCRAPE_ENABLED`
-         (+ `XCRAWL_ENABLED`), `research_one_specialist` instead runs a
-         bounded tool-use LOOP (`monitoring/research/agentic.py`): web_search
-         to find candidates → `scrape_url` (xcrawl) to READ the full article
-         behind the best 1-3 hits → ground claims in real content →
-         emit_research_findings. Built because the single-shot snippet-only
-         turn produced findings whose cited sources didn't back them (the
-         verify pass measured ~all demoted). Scraping is MANDATORY, not
-         advisory: the model emitted on turn 1 from web_search snippets and
-         skipped the optional scrape (an A/B showed 0 research-phase scrapes,
-         loop OFF==ON), so the loop now REJECTS an `emit_research_findings`
-         that arrives with `scrapes_used == 0` — it returns a tool_result on
-         the emit ("scrape_url at least one source first") and forces another
-         turn. The reject only fires while a read is still possible
-         (`max_scrapes > 0` AND iterations remain); on the last iteration, or
-         when scraping is disabled, a 0-scrape emit is accepted as the safety
-         valve. Server web_search blocks are
-         echoed forward; only the client `scrape_url` tool is executed
-         (mirrors the Executive's main loop). Bounded by
-         `RESEARCH_SCRAPE_MAX_PER_SPECIALIST` (default 3) +
-         `RESEARCH_LOOP_MAX_ITERATIONS` (default 5); best-effort (provider/
-         scrape failure → empty, never sinks the run). Off by default →
-         the single-shot path above is unchanged. The step 3b verify pass
-         remains the safety net.
+         turned up. The specialist turn is single-shot: there is no
+         scrape loop and no separate verify pass any more (see
+         no_external_fetch_service); the finding contract's "cite a dated
+         source you retrieved" rule is enforced by the prompt and the
+         low-confidence filter below.
       3. dedup — light cross-specialist collapse on
          (lowercased title, summary[:80]). Consensus boosts severity +
          confidence; source_specialist becomes a comma-joined attribution.
-      3b. verify (gated, `research.verification.verify_findings`) — runs
-         BEFORE the low-confidence filter. For each surviving finding it
-         scrapes the first cited URL via xcrawl and asks a cheap model
-         (RESEARCH_VERIFY_MODEL, default haiku) whether the page supports the
-         claim: confirmed → keep; contradicted → confidence=low; unsupported /
-         source_unreachable (dead URL) → demote one notch. So a finding whose
-         source is dead or doesn't back it is dropped by the existing
-         low-confidence filter instead of routed to a human. Rationale:
-         web_search gives specialists DISCOVERY (snippets — thin under the
-         OpenRouter web plugin), but the finding contract demands verifying
-         numbers/dates against a retrieved source; this is the deep-read it
-         assumes. Gated by `XCRAWL_ENABLED AND EXTERNAL_RESEARCH_VERIFY_ENABLED`
-         (no-op + zero network otherwise); best-effort (a scrape/LLM failure
-         leaves the finding unchanged); bounded to RESEARCH_VERIFY_MAX_FINDINGS
-         per run (default 8), highest-severity first. The verdict is stamped on
-         `ResearchFinding.verification`. The low-confidence filter
-         (drop confidence=='low') runs AFTER this pass.
+         The low-confidence filter (drop confidence=='low') runs here; the
+         step's summary reports after_dedup / low_conf_dropped /
+         to_synthesis.
       4. executive_synthesis — Executive's tool-use loop (mirror of
          executive_reflection._run_executive_reflection):
          system prompt built per-run by `_build_synthesis_system`,

@@ -364,17 +364,6 @@ def test_reasoning_block_is_replayed_as_reasoning_details_on_assistant_turn() ->
     assert assistant["content"] is None
 
 
-def test_research_loop_echoes_reasoning_block_into_history() -> None:
-    from openexecutive.monitoring.research.agentic import _assistant_turn
-
-    block = SimpleNamespace(type=OPENROUTER_REASONING_BLOCK, reasoning_details=_DETAILS)
-    tool = SimpleNamespace(type="tool_use", id="c1", name="scrape_url", input={"url": "u"})
-    history, scrapes = _assistant_turn([block, tool])
-    assert history[0] == {"type": OPENROUTER_REASONING_BLOCK, "reasoning_details": _DETAILS}
-    assert history[1]["type"] == "tool_use"
-    assert scrapes == [{"id": "c1", "input": {"url": "u"}}]
-
-
 # --------------------------------------------------------------------------
 # 5. Remote catalog data: capability flags need a real list
 # --------------------------------------------------------------------------
@@ -480,9 +469,8 @@ def test_every_tool_loop_replays_reasoning() -> None:
     helper, so continuity isn't a research-loop-only property."""
     import inspect
 
-    from openexecutive.monitoring.research import agentic
     from openexecutive.orchestrator import executive
     from openexecutive.workflows import executive_reflection, executive_research
 
-    for mod in (agentic, executive, executive_research, executive_reflection):
+    for mod in (executive, executive_research, executive_reflection):
         assert "reasoning_replay_block(block)" in inspect.getsource(mod), mod.__name__
