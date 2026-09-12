@@ -11,6 +11,7 @@ import logging
 from typing import Any
 
 from openexecutive.agents.base import BaseAgent
+from openexecutive.config import get_settings
 from openexecutive.monitoring.research.models import ResearchFinding
 from openexecutive.monitoring.research.prompts import (
     PER_SPECIALIST_FINDING_CAP,
@@ -46,7 +47,11 @@ async def research_one_specialist(
     )
 
     tools: list[dict[str, Any]] = [EMIT_RESEARCH_FINDINGS_TOOL]
-    web_search = build_web_search_tool()
+    # The research fan-out has its own search cap: the shared chat knob is
+    # multiplied by the number of specialists here.
+    web_search = build_web_search_tool(
+        max_uses=get_settings().research_web_search_max_uses,
+    )
     if web_search is not None:
         tools.append(web_search)
 

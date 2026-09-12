@@ -459,6 +459,19 @@ class Settings(BaseSettings):
     # bulk of the value at a fraction of the search spend. Raise via
     # WEB_SEARCH_MAX_USES for deeper digs.
     web_search_max_uses: int = Field(2, alias="WEB_SEARCH_MAX_USES")
+    # Searches per specialist in the executive_research fan-out. Separate
+    # from the chat knob above because the fan-out multiplies it by the
+    # number of specialists (seven by default), and every search adds
+    # results that each later pass re-reads.
+    research_web_search_max_uses: int = Field(
+        3, alias="RESEARCH_WEB_SEARCH_MAX_USES"
+    )
+    # Which specialists the research fan-out runs (comma-separated slugs
+    # from cso, cfo, cmo, coo, chro, cpo, gc). Empty = all seven. Unknown
+    # slugs are logged and skipped.
+    research_specialists: Annotated[list[str], NoDecode] = Field(
+        default_factory=list, alias="RESEARCH_SPECIALISTS"
+    )
     web_search_allowed_domains: Annotated[list[str], NoDecode] = Field(
         default_factory=list, alias="WEB_SEARCH_ALLOWED_DOMAINS"
     )
@@ -467,7 +480,8 @@ class Settings(BaseSettings):
     )
 
     @field_validator(
-        "web_search_allowed_domains", "web_search_blocked_domains", mode="before"
+        "web_search_allowed_domains", "web_search_blocked_domains",
+        "research_specialists", mode="before",
     )
     @classmethod
     def _parse_domain_list(cls, v: Any) -> list[str]:
@@ -485,6 +499,8 @@ class Settings(BaseSettings):
             )
         if self.web_search_max_uses < 1:
             raise ValueError("WEB_SEARCH_MAX_USES must be >= 1")
+        if self.research_web_search_max_uses < 1:
+            raise ValueError("RESEARCH_WEB_SEARCH_MAX_USES must be >= 1")
         return self
 
     # Base URL of the UI, used when the Executive composes deep links
@@ -675,7 +691,7 @@ class Settings(BaseSettings):
         True, alias="WATCHLIST_RESEARCH_ENABLED"
     )
     watchlist_research_interval_minutes: int = Field(
-        120, alias="WATCHLIST_RESEARCH_INTERVAL_MINUTES"
+        360, alias="WATCHLIST_RESEARCH_INTERVAL_MINUTES"
     )
     # Staleness floor: even when the skip-if-unchanged fingerprint matches,
     # force a fresh research run once this many hours have elapsed since the

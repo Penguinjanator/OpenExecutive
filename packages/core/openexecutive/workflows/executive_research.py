@@ -70,6 +70,26 @@ RESEARCH_SPECIALISTS: tuple[str, ...] = (
     "cso", "cfo", "cmo", "coo", "chro", "cpo", "gc",
 )
 
+
+def active_research_specialists() -> tuple[str, ...]:
+    """The specialists this run fans out to: ``RESEARCH_SPECIALISTS``
+    filtered by the ``RESEARCH_SPECIALISTS`` setting when it is set.
+    Unknown slugs are logged and dropped; an empty or all-unknown setting
+    means every specialist, so a typo cannot silently run nothing."""
+    from openexecutive.config import get_settings
+
+    wanted = [s.strip().lower() for s in get_settings().research_specialists if s.strip()]
+    if not wanted:
+        return RESEARCH_SPECIALISTS
+    unknown = [s for s in wanted if s not in RESEARCH_SPECIALISTS]
+    if unknown:
+        logger.warning(
+            "research: RESEARCH_SPECIALISTS names unknown specialist(s) %s — ignored",
+            ", ".join(unknown),
+        )
+    chosen = tuple(s for s in RESEARCH_SPECIALISTS if s in wanted)
+    return chosen or RESEARCH_SPECIALISTS
+
 # Synthesis loop budget. A real routing run needs at least three turns:
 # (1) look recipients up (lookup_person), (2) fire the resolved DMs /
 # alerts, (3) emit the wrap-up summary. Two iterations starved that
@@ -454,8 +474,9 @@ class ExecutiveResearchWorkflow(Workflow):
                 )
                 return slug, [], str(exc)[:200]
 
+        specialists = active_research_specialists()
         results = await asyncio.gather(
-            *(_run_one(s) for s in RESEARCH_SPECIALISTS),
+            *(_run_one(s) for s in specialists),
             return_exceptions=True,
         )
 
@@ -464,8 +485,8 @@ class ExecutiveResearchWorkflow(Workflow):
         for idx, item in enumerate(results):
             if isinstance(item, BaseException):
                 fallback_slug = (
-                    RESEARCH_SPECIALISTS[idx]
-                    if idx < len(RESEARCH_SPECIALISTS)
+                    specialists[idx]
+                    if idx < len(specialists)
                     else f"unknown-{idx}"
                 )
                 findings_by_specialist[fallback_slug] = []
@@ -1038,6 +1059,10 @@ async def _watchlist_analysis_loop(
 #    misfiring run blasting noise to the entire team.
 _SYNTHESIS_EXCLUDED_TOOLS = frozenset({
     "run_executive_research",
+    # Starting another workflow from inside the routing pass is the same
+    # recursion risk in a different coat: a finding can suggest a workflow
+    # (suggest_workflow) for a human to start, never start one itself.
+    "run_workflow",
     "send_company_broadcast",
     # Watchlist writes are withheld from the routing pass: every watch the
     # research run creates must go through the dedicated watchlist pass and

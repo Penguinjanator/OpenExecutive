@@ -2,7 +2,7 @@
 
 PR-D wired the workflow to two triggers (manual chat tool, onboarding
 completion). PR-E adds a third: a cron tick that re-runs the workflow
-every ``watchlist_research_interval_minutes`` (default 120). The cost
+every ``watchlist_research_interval_minutes`` (default 360). The cost
 shape of a research run is real — 7 LLM calls × web_search — so each
 tick first computes a fingerprint of the inputs the workflow reads
 (company profile, active initiatives, existing watchlist slugs) and

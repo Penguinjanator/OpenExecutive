@@ -112,6 +112,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   specialists were never told and their grounding rule dropped them. The
   per-specialist finding cap is enforced in the tool schema and the
   parser, not only in prompt text.
+- **The research run has its own controls.** `RESEARCH_WEB_SEARCH_MAX_USES`
+  (default 3) caps searches per specialist independently of the chat knob;
+  `RESEARCH_SPECIALISTS` picks which of the seven specialists run; the
+  routing pass can no longer start a workflow (`run_workflow` is withheld,
+  `suggest_workflow` remains); the periodic run's default interval moves
+  from 120 to 360 minutes.
 
 ### Removed
 - **The xcrawl scrape service and everything that depended on it.** The
