@@ -305,13 +305,19 @@ def _norm(term: str) -> str:
 # hyphen only when spaced, so "Mercedes-Benz" and "T-Mobile" survive.
 _ENTRY_SPLIT_RE = re.compile(r"\s*[—–]\s*| - |[:;]")
 _PAREN_RE = re.compile(r"\(([^()]*)\)")
-_TICKER_RE = re.compile(r"^(?:[A-Z]{2,5}(?:\.[A-Z]{1,3})?|\d{3,6}\.[A-Z]{2,3})$")
+_TICKER_RE = re.compile(r"^(?:[A-Z]{1,5}(?:\.[A-Z]{1,3})?|\d{3,6}\.[A-Z]{2,3})$")
 _DOMAIN_RE = re.compile(r"^(?:[a-z0-9-]+\.)+[a-z]{2,}$")
 _URL_RE = re.compile(r"^(?:https?://)?((?:[a-z0-9-]+\.)+[a-z]{2,})(?:[/?#].*)?$", re.IGNORECASE)
 # Upper-case words that appear in parentheses in ordinary profile prose and
 # are not tickers. A parenthesised token is a ticker only when it is alone
 # in its group and not one of these; the profile's own `tickers` list is
 # taken as-is.
+# An ALL-CAPS dotted token ending in one of these is a host someone typed
+# in capitals ("GM.COM"), not an exchange ticker ("1211.HK", "MBG.DE").
+_TLD_NOT_EXCHANGE: frozenset[str] = frozenset({
+    "COM", "NET", "ORG", "IO", "CO", "AI", "DEV", "APP", "EDU", "GOV", "INFO", "BIZ", "US", "UK",
+    "CA", "EU", "IN", "AU",
+})
 _NOT_TICKERS: frozenset[str] = frozenset({
     "US", "USA", "EU", "UK", "EV", "EVS", "AI", "ML", "IT", "HR", "PR", "IR", "IP", "ALL", "NOW",
     "NEW", "OEM", "OEMS", "LFP", "NMC", "EMEA", "APAC", "LATAM", "CEO", "CFO", "COO", "CTO", "CMO",
@@ -342,20 +348,68 @@ def _strip_parens(text: str) -> tuple[str, list[str]]:
     return text, groups
 
 
+def _entry_head(text: str) -> str:
+    """The name part of an entry: everything before the first separator
+    that is not inside parentheses."""
+    depth = 0
+    masked = []
+    for ch in text:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        masked.append(" " if depth and ch not in "()" else ch)
+    cut = _ENTRY_SPLIT_RE.search("".join(masked))
+    return text[: cut.start()] if cut else text
+
+
+def _host_under(host: str, pinned: tuple[str, ...]) -> bool:
+    """``host`` is one of the pinned hosts or a subdomain of one
+    (news.gm.com under gm.com; never gm.com.evil.com)."""
+    host = host.lower().rstrip(".")
+    return bool(host) and any(host == d or host.endswith("." + d) for d in pinned)
+
+
+def _url_host(url: str) -> str:
+    try:
+        from urllib.parse import urlsplit
+
+        return (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _ticker_in_group(parts: list[str]) -> str | None:
+    """The one ticker in a parenthesised group: an ALL-CAPS ticker-shaped
+    token ("TSLA", "F", "1211.HK") that is not an ordinary abbreviation, when
+    it is the only such token and every other part is a host."""
+    candidates = [
+        part for part in parts
+        if part == part.upper() and _TICKER_RE.match(part) and part not in _NOT_TICKERS
+    ]
+    others = [part for part in parts if part not in candidates]
+    if len(candidates) == 1 and all(_DOMAIN_RE.match(o.lower()) for o in others):
+        return candidates[0]
+    return None
+
+
 def entity_names(raw: str) -> ParsedEntity:
     """``(names, tickers, domains)`` parsed from one profile / department entry.
 
     "Tesla (TSLA) — Model Y is the benchmark" → names ["Tesla"], tickers
     ["TSLA"]; "GM / Chevrolet (Equinox EV, Blazer EV) — direct competitor" →
     names ["GM", "Chevrolet"]; "Brex (brex.com, status.brex.com)" → names
-    ["Brex"], domains ["brex.com", "status.brex.com"]; a bare URL or host
+    ["Brex"], domains ["brex.com", "status.brex.com"]; "Acme (ACME,
+    acme.com)" → ticker and domain; a bare URL or host
     ("https://status.stripe.com") → names ["stripe"], domains
     ["status.stripe.com"]; "Stripe" → ["Stripe"].
 
-    A parenthesised group counts as a ticker only when it is a single
-    ticker-shaped token (2–5 letters, or a numeric exchange code) that is not
-    an ordinary abbreviation ("US", "EV", "IT") — a list of product names in
-    parentheses is never a ticker. Domains are any dotted host in a group.
+    Only parentheses in the NAME part (before the dash / colon) are read;
+    anything in the description is prose. A group yields a ticker only for
+    a single ALL-CAPS ticker-shaped token that is not an ordinary
+    abbreviation ("US", "EV", "IT") — a capitalised brand ("(Waymo)") or a
+    product list is never a ticker; type tickers in capitals. Lower-case
+    dotted tokens are hosts, which pin the entity's own domains.
     Parenthesised brand names ("Alphabet (Google)") are NOT aliases: list
     them as entries of their own."""
     text = " ".join(str(raw or "").split())[:_MAX_ENTRY_CHARS]
@@ -368,29 +422,29 @@ def entity_names(raw: str) -> ParsedEntity:
         host = url.group(1).lower()
         label = _site_label(host)
         return ParsedEntity([label] if label else [], [], [host])
-    bare, groups = _strip_parens(text)
-    head = _ENTRY_SPLIT_RE.split(bare, maxsplit=1)[0]
+    head, groups = _strip_parens(_entry_head(text))
     tickers: list[str] = []
     domains: list[str] = []
     for group in groups:
-        parts = [part.strip() for part in re.split(r"[,/;]", group) if part.strip()]
+        parts = [part.strip().rstrip(".") for part in re.split(r"[,/;]", group) if part.strip(". ")]
         for part in parts:
-            # A dotted token with lower-case letters is a host; an
-            # upper-case one ("1211.HK", "MBG.DE") is an exchange ticker.
-            if part != part.upper() and _DOMAIN_RE.match(part.lower()) and part.lower() not in domains:
+            typed_host = part != part.upper() or part.rsplit(".", 1)[-1] in _TLD_NOT_EXCHANGE
+            if typed_host and _DOMAIN_RE.match(part.lower()) and part.lower() not in domains:
                 domains.append(part.lower())
-        if len(parts) == 1:
-            candidate = parts[0].upper()
-            if (
-                (parts[0] == parts[0].upper() or "." not in parts[0])
-                and _TICKER_RE.match(candidate)
-                and candidate not in _NOT_TICKERS
-                and candidate not in tickers
-            ):
-                tickers.append(candidate)
+        ticker = _ticker_in_group([p for p in parts if p.lower() not in domains])
+        if ticker and ticker not in tickers:
+            tickers.append(ticker)
     names = [n.strip(" ,") for n in head.split("/")]
     names = [n for n in names if len(_norm(n)) >= 2]
     return ParsedEntity(names, tickers, domains)
+
+
+def ticker_symbol(raw: str) -> str:
+    """The symbol in a profile `tickers` entry as typed, minus any trailing
+    note: "NVDA — our supplier" → "NVDA", "1211.HK (BYD)" → "1211.HK"."""
+    text = " ".join(str(raw or "").split())[:_MAX_ENTRY_CHARS]
+    head, _groups = _strip_parens(_entry_head(text))
+    return head.strip(" ,").upper()
 
 
 def grounding_vocabulary(
@@ -416,7 +470,9 @@ def grounding_vocabulary(
 
     def add(term: str, kind: str, department: str = "", domains: tuple[str, ...] = ()) -> None:
         n = _norm(term)
-        if len(n) < 2:
+        # One-letter tickers (F, V, T) are real symbols; anything else that
+        # short is noise.
+        if len(n) < 2 and not (kind == KIND_TICKER and len(n) == 1):
             return
         current = vocab.get(n)
         if current is None:
@@ -454,8 +510,7 @@ def grounding_vocabulary(
         for p in list(getattr(getattr(profile, "strategic_priorities", None), "current_year", []) or []):
             add(str(p), KIND_PRIORITY)
         for t in list(getattr(profile, "tickers", []) or []):
-            # The tickers list is symbols as typed; nothing to parse.
-            add(str(t).strip().upper(), KIND_TICKER)
+            add(ticker_symbol(str(t)), KIND_TICKER)
         for v in list(getattr(profile, "vendors", []) or []):
             add_entity(str(v), KIND_VENDOR)
         for c in list(getattr(getattr(profile, "competitive_landscape", None), "primary_competitors", []) or []):
@@ -578,12 +633,12 @@ def match_vocab(entity: str, vocabulary: dict[str, Any]) -> tuple[str, VocabEntr
     """``(term, VocabEntry)`` for the vocabulary term the entity names, else
     None — :func:`match_entity` with the department kept."""
     n = _norm(entity)
-    if len(n) < 2:
-        return None
-    exact_value = vocabulary.get(n)
+    exact_value = vocabulary.get(n) if n else None
     exact = _entry(exact_value) if exact_value is not None else None
     if exact is not None and exact.kind != KIND_WATCH:
         return n, exact
+    if len(n) < 2:
+        return None
     # Partial matching only on distinctive tokens: no stopwords, nothing
     # shorter than _MIN_PARTIAL_TOKEN unless the token is itself a whole
     # vocabulary term ("IBM Corp" still matches competitor "IBM"), so
@@ -597,9 +652,10 @@ def match_vocab(entity: str, vocabulary: dict[str, Any]) -> tuple[str, VocabEntr
         return best
     for term, value in vocabulary.items():
         entry = _entry(value)
-        if entry.kind == KIND_TICKER and term != n:
+        if entry.kind == KIND_TICKER:
             # A ticker symbol grounds only when it IS the entity ("US" is
-            # not "US Foods", "IT" is not "IT Brew").
+            # not "US Foods", "IT" is not "IT Brew"); the exact case was
+            # handled above.
             continue
         term_tokens = _distinctive_tokens(term, vocabulary)
         if not term_tokens or not (term_tokens <= tokens or tokens <= term_tokens):
@@ -689,10 +745,7 @@ def _is_own_source(proposal: WatchProposal, entity_term: str, vocabulary: dict[s
     entry_value = vocabulary.get(entity_term)
     pinned = _entry(entry_value).domains if entry_value is not None else ()
     if pinned:
-        return any(
-            host == registrable_domain("https://" + d) or host == d
-            for d in pinned
-        )
+        return _host_under(host, pinned)
     # Only the site's own label counts ("acme" in status.acme.com / acme.co.uk);
     # subdomain labels and the TLD never do, so "api" or ".cloud" cannot
     # make an unrelated host look like the entity's. And the label must be
@@ -968,7 +1021,12 @@ def _safe_source_url(finding: ResearchFinding | None) -> str:
     return ""
 
 
-def _policy_stamp(decision: Decision, proposal: WatchProposal, finding: ResearchFinding | None) -> dict[str, Any]:
+def _policy_stamp(
+    decision: Decision,
+    proposal: WatchProposal,
+    finding: ResearchFinding | None,
+    supported: bool = True,
+) -> dict[str, Any]:
     return {
         # The matched company-data term, else the model's own entity string,
         # so a not_relevant decline on an ungrounded suggestion still
@@ -978,8 +1036,8 @@ def _policy_stamp(decision: Decision, proposal: WatchProposal, finding: Research
         "department": decision.department,
         "specialist": (finding.source_specialist if finding else ""),
         "score": decision.score,
-        "reasons": decision.reasons[:6],
-        "source_url": _safe_source_url(finding),
+        "reasons": decision.reasons[:8],
+        "source_url": _safe_source_url(finding) if supported else "",
     }
 
 
@@ -1004,6 +1062,8 @@ def auto_link_finding(
     target_phrase = _norm(proposal.target)
     host = registrable_domain(proposal.target)
     entity_labels = set(_name_tokens(entity_term, ctx.vocabulary)) | {target_phrase.replace(" ", "")}
+    entry_value = ctx.vocabulary.get(entity_term) if entity_term else None
+    pinned = _entry(entry_value).domains if entry_value is not None else ()
     best: tuple[tuple[int, int, int, int, int], int] | None = None
     for index, finding in enumerate(findings):
         if not _finding_supports(proposal, finding, entity_term, ctx.vocabulary):
@@ -1017,7 +1077,9 @@ def auto_link_finding(
         # for ACME) outranks one that names it from a rival's page, so the
         # evidence link stamped on the row is the entity's, not a stranger's.
         cites_entity_site = int(any(
-            _site_label(registrable_domain(u)) in entity_labels for u in finding.relevant_urls
+            _host_under(_url_host(u), pinned) if pinned
+            else _site_label(registrable_domain(u)) in entity_labels
+            for u in finding.relevant_urls
         ))
         key = (
             cites_source,
@@ -1069,21 +1131,30 @@ def apply_proposals(
 
         linked_note = ""
         cited_term = match_vocab(proposal.grounding_entity, ctx.vocabulary)
+        given = proposal.finding_index
+        given_valid = given is not None and 0 <= given < len(findings)
         if finding is None or not _finding_supports(
             proposal, finding, cited_term[0] if cited_term else "", ctx.vocabulary,
         ):
             # The model routinely omits finding_index, or guesses one that
             # does not concern this source; the finding that does is still
             # the evidence, so link it (a copy: the caller's proposal is
-            # left as filed).
+            # left as filed). A cited finding that does not concern the
+            # source is never kept as evidence.
+            cited_note = ""
+            if given is not None:
+                cited_note = f" (the cited #{given + 1} did not)" if given_valid else " (the cited index was invalid)"
             auto_index = auto_link_finding(proposal, findings, ctx)
             if auto_index is not None:
-                given = proposal.finding_index
                 finding = findings[auto_index]
                 proposal = dataclasses.replace(proposal, finding_index=auto_index)
-                linked_note = f"linked to finding #{auto_index + 1}, which concerns this source"
-                if given is not None:
-                    linked_note += f" (the cited #{given + 1} did not)"
+                linked_note = f"linked to finding #{auto_index + 1}, which concerns this source" + cited_note
+        # A cited finding that does not concern the source still marks the
+        # proposal as research-derived (it may be a suggestion) but is never
+        # the evidence link shown beside Approve.
+        supported = finding is not None and _finding_supports(
+            proposal, finding, cited_term[0] if cited_term else "", ctx.vocabulary,
+        )
 
         decision = classify(proposal, finding, ctx)
         if linked_note:
@@ -1101,14 +1172,14 @@ def apply_proposals(
                 f"Research watch rejected: {proposal.slug} — {'; '.join(decision.reasons[-2:])}",
                 actor="executive",
                 details={"slug": proposal.slug, "target": proposal.target,
-                         "signal_type": proposal.signal_type, **_policy_stamp(decision, proposal, finding)},
+                         "signal_type": proposal.signal_type, **_policy_stamp(decision, proposal, finding, supported)},
             )
             summaries.append(_summary(proposal, "rejected", decision.reasons[-1] if decision.reasons else ""))
             continue
 
         cadence, floor, trigger = quiet_defaults(proposal, ctx.priority_terms)
         config = dict(proposal.config)
-        config["_policy"] = _policy_stamp(decision, proposal, finding)
+        config["_policy"] = _policy_stamp(decision, proposal, finding, supported)
         is_direct = decision.tier == TIER_DIRECT
         # A department-grounded watch is the department's: its alerts go to
         # the head (as of now — the head at insert time; a later head change
@@ -1144,7 +1215,7 @@ def apply_proposals(
             "watchlist_id": new_id, "slug": proposal.slug, "target": proposal.target,
             "signal_type": proposal.signal_type, "rationale": proposal.rationale[:240],
             "cadence": cadence, "severity_floor": floor.value, "trigger": trigger,
-            **_policy_stamp(decision, proposal, finding),
+            **_policy_stamp(decision, proposal, finding, supported),
         }
         if is_direct:
             direct_left -= 1
@@ -1466,6 +1537,7 @@ __all__ = [
     "department_refs",
     "entity_declined",
     "entity_names",
+    "ticker_symbol",
     "grounding_vocabulary",
     "load_departments",
     "match_entity",

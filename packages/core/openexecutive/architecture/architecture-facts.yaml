@@ -1397,10 +1397,21 @@ external_monitoring:
       Short names (BYD, GM, Kia, AWS) match as whole words because a
       vocabulary term of any length is a distinctive token; a TICKER term
       grounds only when it IS the entity ("US" never grounds "US Foods").
-      Own source with pinned domains: only those sites (a look-alike such as
-      gm.co.ke, which carries the same site label, no longer qualifies);
-      without pinned domains the site label must be the entity's leading
-      name, as before — pin domains for any short-named entity.
+      Only parentheses in the NAME part are read: description text can
+      neither pin a domain nor mint a ticker, and a capitalised brand
+      ("(Waymo)", "(Siri)") is never a ticker — tickers are typed in
+      capitals ("(TSLA)", "(F)", "(1211.HK)"); an all-caps host ("(GM.COM)")
+      is a host. profile.tickers entries keep their symbol and drop any
+      trailing note ("NVDA — our supplier"). Own source with pinned domains:
+      those hosts and their subdomains only (a look-alike such as gm.co.ke,
+      which carries the same site label, no longer qualifies; primary-source
+      hosts such as sec.gov still count for every entity); without pinned
+      domains the site label must be the entity's leading name, as before —
+      pin domains for any short-named entity. The auto-link ranking honours
+      pinned domains too, so a planted page cannot win the evidence slot.
+      A cited finding that does not concern the source still marks the
+      proposal as research-derived (a suggestion at most) but is never the
+      row's source_url.
       (kind department_entity, strong) + each department's charter scope
       phrases and goal key results (kind department_scope, suggestion-only)
       (+ existing watch labels, which only corroborate). The entity MUST

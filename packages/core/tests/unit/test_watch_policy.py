@@ -940,7 +940,26 @@ def test_entity_names_parse_profile_entries() -> None:
     assert wp.entity_names("Tesla (TSLA)—Model Y is the volume benchmark") == (["Tesla"], ["TSLA"], [])
     assert wp.entity_names("Stripe (US, EU) — payments").tickers == []
     assert wp.entity_names("Gartner (IT) — research").tickers == []
-    assert wp.entity_names("Tesla (tsla)") == (["Tesla"], ["TSLA"], [])
+    assert wp.entity_names("Tesla (tsla)") == (["Tesla"], [], [])  # tickers are typed in capitals
+    # Only the name part's parentheses are read: description text can
+    # neither pin a domain nor mint a ticker; a capitalised brand or a
+    # product name is never a ticker; one-letter tickers and a ticker
+    # beside a host both work; text after a ticker symbol is a note.
+    assert wp.entity_names("BYD — cost leader (byd-watch.com)") == (["BYD"], [], [])
+    assert wp.entity_names("Tesla — the (BEV) leader").tickers == []
+    assert wp.entity_names("Alphabet (Waymo) — self-driving") == (["Alphabet"], [], [])
+    assert wp.entity_names("Ford (F) — legacy OEM") == (["Ford"], ["F"], [])
+    assert wp.entity_names("Acme Corp (ACME, acme.com)") == (["Acme Corp"], ["ACME"], ["acme.com"])
+    assert wp.entity_names("GM (GM.COM)") == (["GM"], [], ["gm.com"])  # a host typed in capitals
+    assert wp.entity_names("GM (gm.com.)") == (["GM"], [], ["gm.com"])
+    assert wp.entity_names("Apple (Siri) — assistant") == (["Apple"], [], [])
+    assert wp.entity_names("Acme (Mach-E) - EVs") == (["Acme"], [], [])
+    assert wp.ticker_symbol("NVDA — our supplier") == "NVDA"
+    assert wp.ticker_symbol("1211.HK (BYD)") == "1211.HK"
+    profile = CompanyProfile.model_validate({"name": "X", "tickers": ["NVDA — our supplier", "f"]})
+    tick_vocab = wp.grounding_vocabulary(profile, [], [])
+    assert wp.match_entity("NVDA", tick_vocab) == ("nvda", wp.KIND_TICKER)
+    assert wp.match_entity("F", tick_vocab) == ("f", wp.KIND_TICKER)
     assert wp.entity_names("https://status.stripe.com") == (["stripe"], [], ["status.stripe.com"])
     assert wp.entity_names("GM (Chevrolet (EV) brand)") == (["GM"], [], [])
     assert wp.entity_names("Stripe (stripe.com/blog; payments)").names == ["Stripe"]
@@ -1001,6 +1020,12 @@ def test_short_names_get_own_source_and_finding_support() -> None:
     fake_d = wp.classify(look_alike, fake_f, pinned_ctx)
     assert fake_d.tier == wp.TIER_SUGGEST and "target is the entity's own source" not in fake_d.reasons
     assert wp.classify(p, f, pinned_ctx).tier == wp.TIER_DIRECT
+    # A subdomain of a pinned host is the entity's; a host that merely ends
+    # in the pinned name is not.
+    sub = _proposal(slug="rss-byd-news", target="https://news.byd.com/feed", grounding_entity="BYD")
+    assert wp._is_own_source(sub, "byd", pinned_ctx.vocabulary)
+    evil = _proposal(slug="rss-byd-evil", target="https://byd.com.evil.example/feed", grounding_entity="BYD")
+    assert not wp._is_own_source(evil, "byd", pinned_ctx.vocabulary)
     # A dotted ticker: own source when grounded as the ticker, and named in
     # text as a phrase.
     f2 = _finding(title="BYD (1211.HK) slides", summary="1211.HK fell 6% on 2026-09-05.", relevant_urls=[])
@@ -1058,6 +1083,14 @@ def test_proposal_without_finding_index_is_linked_to_the_citing_finding(db: Path
     assert repaired[0]["outcome"] == "added"
     row2 = ms.get_watchlist_item_by_slug("rss-acme-2", db_path=db)
     assert row2 is not None and wp.policy_stamp_of(row2)["reasons"][0].endswith("(the cited #1 did not)")
+    # A cited finding that does not concern the source, with nothing better
+    # to link, still makes the proposal a suggestion (it came from research)
+    # but is never the evidence link shown beside Approve.
+    stray = wp.apply_proposals([_proposal(slug="rss-stray", target="https://elsewhere.com/feed",
+                                          grounding_entity="Acme Corp", finding_index=0)], findings, ctx, db_path=db)
+    assert stray[0]["outcome"] == "suggested"
+    stray_row = ms.get_watchlist_item_by_slug("rss-stray", db_path=db)
+    assert stray_row is not None and wp.policy_stamp_of(stray_row)["source_url"] == ""
 
 
 def test_auto_link_prefers_the_finding_that_cites_the_source() -> None:
@@ -1072,6 +1105,20 @@ def test_auto_link_prefers_the_finding_that_cites_the_source() -> None:
     stock = _proposal(slug="stock-acme", signal_type="stock", target="ACME", grounding_entity="ACME",
                       finding_index=None)
     assert wp.auto_link_finding(stock, findings, ctx) == 1  # names the ticker, not just the entity
+    # With the entity's domains pinned, only a finding citing those sites
+    # counts as "the entity's site" — a look-alike page cannot shop for the
+    # evidence slot.
+    pinned = CompanyProfile.model_validate({"name": "X", "competitive_landscape": {
+        "primary_competitors": ["GM (gm.com)"]}})
+    pctx = wp.PolicyContext(vocabulary=wp.grounding_vocabulary(pinned, [], []), priority_terms=[], existing=[])
+    gm_findings = [
+        _finding(title="GM recall", summary="GM recalled the Blazer EV.", relevant_urls=["https://news.gm.com/x"],
+                 confidence="medium"),
+        _finding(title="GM news", summary="GM slashes prices.", relevant_urls=["https://gm.co.ke/news"],
+                 verification="confirmed", source_specialist="cso,cfo"),
+    ]
+    gm = _proposal(slug="stock-gm", signal_type="stock", target="GM", grounding_entity="GM", finding_index=None)
+    assert wp.auto_link_finding(gm, gm_findings, pctx) == 0
     feed = _proposal(slug="rss-acme-ir", target="https://acme.com/ir/feed", grounding_entity="Acme Corp",
                      finding_index=None)
     assert wp.auto_link_finding(feed, findings, ctx) == 1  # cites the site
