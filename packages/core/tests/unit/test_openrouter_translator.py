@@ -337,9 +337,17 @@ def test_response_reports_search_count_and_skips_server_tool_calls() -> None:
                  "function": {"name": "emit_research_findings", "arguments": "{\"findings\": []}"}},
             ],
         }}],
-        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "web_search_requests": 3},
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2,
+                  "server_tool_use_details": {"web_search_requests": 3, "tool_calls_executed": 3}},
     })
     assert msg.usage.server_tool_use.web_search_requests == 3
+    # The flat shape the docs show is accepted as well.
+    flat = from_openai_response({
+        "id": "f", "model": "m",
+        "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "web_search_requests": 2},
+    })
+    assert flat.usage.server_tool_use.web_search_requests == 2
     assert [b.name for b in msg.content if b.type == "tool_use"] == ["emit_research_findings"]
     assert msg.stop_reason == "tool_use"  # a client tool call remains
 
@@ -1057,7 +1065,8 @@ def test_stream_accumulator_reports_search_count() -> None:
     acc = StreamAccumulator()
     acc.feed({"id": "s", "model": "m", "choices": [{"delta": {"content": "hi"}, "finish_reason": None}]})
     acc.feed({"id": "s", "model": "m", "choices": [{"delta": {}, "finish_reason": "stop"}],
-              "usage": {"prompt_tokens": 5, "completion_tokens": 1, "web_search_requests": 2}})
+              "usage": {"prompt_tokens": 5, "completion_tokens": 1,
+                        "server_tool_use_details": {"web_search_requests": 2}}})
     msg = acc.finalize()
     assert msg.usage.server_tool_use.web_search_requests == 2
 

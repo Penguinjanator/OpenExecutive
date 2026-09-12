@@ -685,10 +685,19 @@ def from_openai_response(body: dict[str, Any]) -> SimpleNamespace:
 
 
 def _server_tool_usage(usage: dict[str, Any]) -> SimpleNamespace:
-    """Anthropic-shape ``usage.server_tool_use`` from OpenRouter's flat
-    ``usage.web_search_requests`` (present when the request carried the
-    ``openrouter:web_search`` server tool; 0 otherwise)."""
-    raw = usage.get("web_search_requests", 0)
+    """Anthropic-shape ``usage.server_tool_use`` from OpenRouter's usage.
+
+    On the wire the count sits under ``usage.server_tool_use_details``
+    (``{"web_search_requests": N, "tool_calls_requested": N,
+    "tool_calls_executed": N}``, observed on the chat-completions endpoint);
+    a flat ``usage.web_search_requests`` (the shape the docs show) is
+    accepted too. 0 when neither is present."""
+    details = usage.get("server_tool_use_details")
+    raw = (
+        details.get("web_search_requests", 0)
+        if isinstance(details, dict)
+        else usage.get("web_search_requests", 0)
+    )
     try:
         count = int(raw or 0)
     except (TypeError, ValueError, OverflowError):

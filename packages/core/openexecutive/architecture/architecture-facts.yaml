@@ -139,9 +139,13 @@ caching:
     thing on both deployment types; on either path a multi-step chat turn
     gets the cap afresh on each step),
     WEB_SEARCH_ALLOWED_DOMAINS / BLOCKED_DOMAINS map to allowed_domains /
-    excluded_domains, and the response's ``usage.web_search_requests`` is
+    excluded_domains, and the response's search count
+    (``usage.server_tool_use_details.web_search_requests`` on the wire; the
+    flat ``usage.web_search_requests`` the docs show is accepted too) is
     surfaced as ``server_tool_use`` so the usage rows record searches on
-    this path too. The engine is left on OpenRouter's ``auto`` (native
+    this path too. The searches themselves never appear as ``tool_calls``;
+    their results come back as ``annotations`` (url_citation) on the
+    message. The engine is left on OpenRouter's ``auto`` (native
     provider search for Claude / GPT / Gemini / Grok, Exa otherwise).
     OpenRouter search's ``<cite>`` markup is stripped from tool-call
     arguments before they are parsed, so a citation inside an
