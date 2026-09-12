@@ -71,16 +71,27 @@ def _maybe_sweep_alerts(now: datetime) -> int:
     ):
         return 0
     _last_alert_sweep_at = now
+    expired = 0
     try:
         from openexecutive.alerts.lifecycle import expire_stale_alerts
 
         expired = expire_stale_alerts(now)
         if expired:
             logger.info("scheduler: expired %d stale alert(s)", expired)
-        return expired
     except Exception:
         logger.exception("scheduler: alert expiry sweep failed")
-        return 0
+    # Research watchlist housekeeping rides the same throttle: expire
+    # unreviewed suggestions, auto-disable research watches that proved noisy
+    # or dead, nudge when suggestions pile up. watch_policy.sweep never raises.
+    try:
+        from openexecutive.monitoring.research.watch_policy import sweep as sweep_watchlist
+
+        counts = sweep_watchlist(now)
+        if any(counts.values()):
+            logger.info("scheduler: watchlist sweep %s", counts)
+    except Exception:
+        logger.exception("scheduler: watchlist sweep failed")
+    return expired
 
 
 async def run_scheduler(

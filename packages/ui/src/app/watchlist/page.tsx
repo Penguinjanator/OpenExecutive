@@ -4,14 +4,37 @@ import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
+  approveWatchSuggestion,
   createWatchlistItem,
+  declineWatchSuggestion,
+  deleteWatchlistItem,
   listWatchlist,
   patchWatchlistItem,
+  type WatchDeclineReason,
   type WatchlistCadence,
   type WatchlistItem,
   type WatchlistSeverity,
   type WatchlistSignalType,
 } from "@/lib/api";
+
+// A research suggestion: the Executive wanted to watch this but was not sure
+// enough to add it on its own. Sits in dry_run (polls, never alerts) until
+// approved or declined here.
+function isSuggestion(item: WatchlistItem): boolean {
+  return item.origin === "research_proposed" && item.mode === "dry_run";
+}
+
+const DECLINE_REASONS: { value: WatchDeclineReason; label: string; hint: string }[] = [
+  { value: "not_relevant", label: "Not relevant", hint: "Never suggest this company/topic again" },
+  { value: "too_noisy", label: "Too noisy", hint: "Keep it, but only high-severity signals" },
+  { value: "wrong_source", label: "Wrong source", hint: "Right topic, drop only this feed/page" },
+];
+
+// Rationale + provenance stamp the research policy left on the row.
+function policyStamp(item: WatchlistItem): { entity?: string; score?: number; source_url?: string } {
+  const raw = (item.config_json as Record<string, unknown> | undefined)?._policy;
+  return raw && typeof raw === "object" ? (raw as { entity?: string; score?: number; source_url?: string }) : {};
+}
 
 const CADENCES: WatchlistCadence[] = ["real_time", "15min", "hourly", "daily", "weekly"];
 const SEVERITIES: WatchlistSeverity[] = ["low", "medium", "high", "urgent"];
@@ -79,15 +102,116 @@ function ModePill({ mode }: { mode: string }) {
   );
 }
 
+function DeclineMenu({
+  slug,
+  busy,
+  onPick,
+  label,
+}: {
+  slug: string;
+  busy: boolean;
+  onPick: (slug: string, reason: WatchDeclineReason) => void;
+  label: string;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        disabled={busy}
+        onClick={() => setOpen((o) => !o)}
+        className="px-3 py-1.5 text-xs rounded-lg border border-line hover:bg-surface-overlay disabled:opacity-50"
+      >
+        {label}
+      </button>
+      {open && (
+        <div className="absolute right-0 z-20 mt-1 w-56 rounded-lg border border-line bg-surface-elevated shadow-lg p-1">
+          {DECLINE_REASONS.map((r) => (
+            <button
+              key={r.value}
+              type="button"
+              onClick={() => {
+                setOpen(false);
+                onPick(slug, r.value);
+              }}
+              className="w-full text-left px-2 py-1.5 rounded hover:bg-surface-overlay"
+            >
+              <div className="text-xs text-fg">{r.label}</div>
+              <div className="text-[10px] text-fg-subtle">{r.hint}</div>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SuggestionCard({
+  item,
+  busy,
+  onApprove,
+  onDecline,
+}: {
+  item: WatchlistItem;
+  busy: boolean;
+  onApprove: (slug: string) => void;
+  onDecline: (slug: string, reason: WatchDeclineReason) => void;
+}) {
+  const stamp = policyStamp(item);
+  return (
+    <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-4">
+      <div className="flex items-start justify-between gap-2 mb-1">
+        <div className="min-w-0">
+          <div className="text-sm font-semibold text-fg truncate" title={item.slug}>
+            {humanizeSlug(item.slug)}
+          </div>
+          <div className="text-xs text-fg-muted truncate" title={item.target}>
+            {item.signal_type} · {item.target}
+          </div>
+        </div>
+        <span className="flex-shrink-0 inline-block px-1.5 py-0.5 rounded border text-[10px] font-medium bg-amber-500/20 text-amber-200 border-amber-500/30">
+          suggested
+        </span>
+      </div>
+      {item.notes && <p className="text-xs text-fg mt-2">{item.notes}</p>}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-fg-muted mt-2">
+        {stamp.entity && <span>about: {stamp.entity}</span>}
+        <span>suggested {formatRelTime(item.created_at)} ago</span>
+        <span>seen in shadow: {item.fired_count} signal{item.fired_count === 1 ? "" : "s"}</span>
+        {stamp.source_url && (
+          <a href={stamp.source_url} target="_blank" rel="noreferrer" className="text-indigo-300 hover:text-indigo-200">
+            source ↗
+          </a>
+        )}
+      </div>
+      <div className="flex items-center justify-end gap-2 mt-3 pt-2 border-t border-line">
+        <DeclineMenu slug={item.slug} busy={busy} onPick={onDecline} label="Decline…" />
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => onApprove(item.slug)}
+          className="px-3 py-1.5 text-xs rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-medium disabled:opacity-50"
+        >
+          {busy ? "…" : "Approve"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function WatchCard({
   item,
   onToggle,
   toggleBusy,
+  onStopWatching,
 }: {
   item: WatchlistItem;
   onToggle: (slug: string, enabled: boolean) => void;
   toggleBusy: boolean;
+  onStopWatching?: (slug: string, reason: WatchDeclineReason) => void;
 }) {
+  const isResearch = item.origin === "research";
+  const stamp = policyStamp(item);
   return (
     <div className="rounded-xl border border-line bg-surface-elevated hover:bg-surface-overlay transition-colors p-4 group">
       <div className="flex items-start justify-between gap-2 mb-2">
@@ -106,10 +230,18 @@ function WatchCard({
           <ModePill mode={item.mode} />
         </div>
       </div>
+      {isResearch && (
+        <p className="text-[11px] text-fg-muted mb-2">
+          <span className="text-indigo-300">Added by the Executive</span>
+          {stamp.entity ? ` · about ${stamp.entity}` : ""}
+          {item.notes ? ` · ${item.notes}` : ""}
+        </p>
+      )}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-fg-muted mb-2">
         <span>cadence: {item.cadence}</span>
         <span>severity: {item.severity_floor}→{item.severity_ceiling}</span>
         <span>fired: {item.fired_count}</span>
+        {item.dismiss_count > 0 && <span>dismissed: {item.dismiss_count}</span>}
         <span>last: {formatRelTime(item.last_fired_at)}</span>
       </div>
       <div className="flex items-center justify-between gap-2 pt-2 border-t border-line">
@@ -123,12 +255,17 @@ function WatchCard({
           />
           enabled
         </label>
-        <Link
-          href={`/watchlist/${encodeURIComponent(item.slug)}`}
-          className="text-xs text-indigo-300 hover:text-indigo-200"
-        >
-          inspect →
-        </Link>
+        <div className="flex items-center gap-2">
+          {isResearch && onStopWatching && (
+            <DeclineMenu slug={item.slug} busy={toggleBusy} onPick={onStopWatching} label="Stop watching…" />
+          )}
+          <Link
+            href={`/watchlist/${encodeURIComponent(item.slug)}`}
+            className="text-xs text-indigo-300 hover:text-indigo-200"
+          >
+            inspect →
+          </Link>
+        </div>
       </div>
     </div>
   );
@@ -372,9 +509,12 @@ export default function WatchlistPage() {
   // Group monitors by signal type, mirroring the artifacts/runs collapsible
   // groups. Known types render in SIGNAL_TYPES order; any unknown type sorts
   // last (alphabetically) so a new backend adapter never silently vanishes.
+  const suggestions = useMemo(() => items.filter(isSuggestion), [items]);
+
   const groups = useMemo(() => {
     const map = new Map<string, WatchlistItem[]>();
     for (const it of items) {
+      if (isSuggestion(it)) continue;
       const bucket = map.get(it.signal_type);
       if (bucket) bucket.push(it);
       else map.set(it.signal_type, [it]);
@@ -405,6 +545,55 @@ export default function WatchlistPage() {
   useEffect(() => {
     refresh();
   }, []);
+
+  function markBusy(slug: string, busy: boolean) {
+    setBusySlugs((prev) => {
+      const next = new Set(prev);
+      if (busy) next.add(slug);
+      else next.delete(slug);
+      return next;
+    });
+  }
+
+  async function approve(slug: string) {
+    markBusy(slug, true);
+    try {
+      const updated = await approveWatchSuggestion(slug);
+      setItems((prev) => prev.map((it) => (it.slug === slug ? updated : it)));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Approve failed");
+    } finally {
+      markBusy(slug, false);
+    }
+  }
+
+  async function decline(slug: string, reason: WatchDeclineReason) {
+    markBusy(slug, true);
+    try {
+      const res = await declineWatchSuggestion(slug, reason);
+      if (res.result === "kept_quiet") {
+        refresh();
+      } else {
+        setItems((prev) => prev.filter((it) => it.slug !== slug));
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Decline failed");
+    } finally {
+      markBusy(slug, false);
+    }
+  }
+
+  async function stopWatching(slug: string, reason: WatchDeclineReason) {
+    markBusy(slug, true);
+    try {
+      await deleteWatchlistItem(slug, reason);
+      setItems((prev) => prev.filter((it) => it.slug !== slug));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Remove failed");
+    } finally {
+      markBusy(slug, false);
+    }
+  }
 
   async function toggle(slug: string, enabled: boolean) {
     // Optimistic. The disabled prop on the input prevents a second
@@ -484,6 +673,33 @@ export default function WatchlistPage() {
             </div>
           )}
 
+          {suggestions.length > 0 && (
+            <div className="mb-8">
+              <div className="flex items-baseline gap-2 mb-1">
+                <span className="text-sm font-semibold text-fg">Suggested by the Executive</span>
+                <span className="text-xs text-fg-muted">
+                  {suggestions.length} waiting for you
+                </span>
+              </div>
+              <p className="text-xs text-fg-subtle mb-3">
+                Sources the research council thought worth monitoring but couldn&apos;t tie
+                firmly enough to your company data to add on its own. They poll in
+                shadow mode and never alert until you approve. Declines are remembered.
+              </p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {suggestions.map((item) => (
+                  <SuggestionCard
+                    key={item.id}
+                    item={item}
+                    busy={busySlugs.has(item.slug)}
+                    onApprove={approve}
+                    onDecline={decline}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
+
           <div className="space-y-6">
             {groups.map((group) => {
               const isCollapsed = !!collapsed[group.key];
@@ -517,6 +733,7 @@ export default function WatchlistPage() {
                           item={item}
                           onToggle={toggle}
                           toggleBusy={busySlugs.has(item.slug)}
+                          onStopWatching={stopWatching}
                         />
                       ))}
                     </div>

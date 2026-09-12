@@ -9,8 +9,10 @@ decides per finding whether to:
     from ``lookup_person``; the server resolves their real channel id)
   - Message a department channel via ``send_department_message``
   - Surface as a briefing card via ``create_alert``
-  - Add to the external monitor via ``add_watchlist_entry`` (only when
-    the finding is a "watch this going forward" signal — most aren't)
+  - Propose an ongoing source to monitor via ``propose_watch`` (a dedicated
+    pass after routing; deterministic policy in
+    ``monitoring.research.watch_policy`` decides whether a proposal is added
+    on its own or shown to the principal as a suggestion)
   - Schedule a follow-up via ``schedule_followup``
   - Propose a deeper workflow via ``suggest_workflow``
   - Ignore (passive — no tool call)
@@ -113,10 +115,12 @@ def _routing_ok(calls: list[dict[str, Any]]) -> int:
 
 
 # Dedicated watchlist-analysis pass (runs AFTER routing). Its own budget,
-# separate from the routing budget above, so adding monitors never competes
-# with urgent DMs/alerts — the routing pass treats watchlist adds as rare,
-# this pass treats them as the whole point.
-_MAX_WATCHLIST_ADDS_PER_RUN = 4
+# separate from the routing budget above, so proposing monitors never
+# competes with urgent DMs/alerts. The pass only PROPOSES: the model may
+# queue up to _MAX_WATCHLIST_PROPOSALS_PER_RUN candidates per run and
+# `watch_policy.apply_proposals` decides add / suggest / reject under the
+# settings-driven per-run budgets (direct adds + suggestions).
+_MAX_WATCHLIST_PROPOSALS_PER_RUN = 6
 _MAX_WATCHLIST_ITERATIONS = 2
 
 
@@ -202,7 +206,7 @@ def _build_synthesis_system(configured: set[str], has_roster: bool = True) -> st
         "  (d) **Add to the watchlist** via add_watchlist_entry — ONLY "
         "for ongoing-monitor signals (a new competitor ticker, a vendor "
         "status page not yet watched). Most findings are NOT watchlist "
-        "material.\n"
+        "material; a dedicated pass after this one proposes monitors.\n"
         "  (e) **Schedule a follow-up** via schedule_followup for "
         "time-shifted chases.\n"
         "  (f) **Suggest a deeper workflow** via suggest_workflow only "
@@ -224,32 +228,48 @@ def _build_synthesis_system(configured: set[str], has_roster: bool = True) -> st
     )
 
 
-_WATCHLIST_SYSTEM = (
-    "You are the user's Executive deciding what the company should "
-    "MONITOR going forward, based on this run's research findings.\n\n"
-    "This is a deliberate, forward-looking pass — distinct from routing "
-    "urgent items to people. Your ONLY tool is `add_watchlist_entry`.\n\n"
-    "## WHAT BELONGS ON THE WATCHLIST\n\n"
-    "An ongoing, externally-observable condition we'd want flagged when it "
-    "next changes — e.g. a public competitor's stock, a regulator's or "
-    "competitor's RSS/Atom feed, a vendor status page. A one-off event that "
-    "is already fully known is NOT watchlist material; the *ongoing source* "
-    "behind it might be.\n\n"
-    "## RULES\n\n"
-    f"  - Add AT MOST {_MAX_WATCHLIST_ADDS_PER_RUN} entries this run. It is "
-    "normal to add several; it is also fine to add none.\n"
-    "  - `signal_type` MUST be one of: `stock` (a ticker), `rss` (a real "
-    "Atom/RSS feed URL), `vendor_status` (a real status-page feed URL).\n"
-    "  - `target` MUST be concrete and real: a ticker symbol, or a URL. "
-    "PREFER a URL taken from a finding's `urls` list — do NOT invent feed "
-    "URLs. If you cannot give a real target, do not add the entry.\n"
-    "  - `slug` must be unique kebab-case (e.g. `stock-tsla`, "
-    "`rss-acme-blog`).\n"
-    "  - SKIP anything already on the current watchlist (listed below).\n"
-    "  - Set `route_to_specialist` to the owning specialist when obvious.\n\n"
-    "After your tool calls, emit ONE short line: what you added and what you "
-    "deliberately skipped. Be terse."
-)
+def _build_watchlist_system(max_direct: int, max_suggest: int) -> str:
+    """System prompt for the watchlist pass. Built per call because the
+    budgets come from settings; static per deployment, so it caches."""
+    return (
+        "You are the user's Executive deciding what the company should "
+        "MONITOR going forward, based on this run's research findings.\n\n"
+        "This is a deliberate, forward-looking pass — distinct from routing "
+        "urgent items to people. Your ONLY tool is `propose_watch`. You do "
+        "not add anything yourself: policy code adds a proposal on its own "
+        "when it is grounded in company data and corroborated, and files "
+        "anything less certain as a SUGGESTION the principal approves on the "
+        "watch list. Being honest about certainty is what keeps the watch "
+        "list trusted.\n\n"
+        "## WHAT BELONGS ON THE WATCHLIST\n\n"
+        "An ongoing, externally-observable source tied to a NAMED company "
+        "entity — a competitor, vendor, ticker or initiative from the company "
+        "context — that we'd want flagged when it next changes: a public "
+        "competitor's ticker or filings, a vendor's status page, a competitor's "
+        "own blog / changelog feed. A one-off event already fully known is NOT "
+        "watchlist material; the *ongoing source* behind it might be. "
+        "Industry news feeds and generic searches are almost never worth it.\n\n"
+        "## RULES\n\n"
+        "  - Propose at most a handful of sources; most runs warrant zero or "
+        f"one. Policy adds at most {max_direct} on its own and files at most "
+        f"{max_suggest} suggestions per run — extra proposals are dropped.\n"
+        "  - `grounding_entity` MUST name the competitor / vendor / ticker / "
+        "initiative from the company context this source is about.\n"
+        "  - `target` MUST be concrete and real: a ticker symbol, or a URL "
+        "taken from a finding's `urls` list — do NOT invent feed URLs. If you "
+        "cannot give a real target, do not propose.\n"
+        "  - `certainty` = 'confident' ONLY when the entity is in the company "
+        "context AND the target is the entity's own source (its ticker, its "
+        "site, its status page). Otherwise 'unsure'.\n"
+        "  - `rationale` is the one line the principal reads: why this source, "
+        "for this company, now.\n"
+        "  - SKIP anything already on the current watchlist and NEVER propose "
+        "a target listed under DECLINED.\n"
+        "  - `slug` must be unique kebab-case (e.g. `stock-tsla`, "
+        "`rss-acme-blog`). Set `route_to_specialist` when obvious.\n\n"
+        "After your tool calls, emit ONE short line: what you proposed and "
+        "what you deliberately skipped. Be terse."
+    )
 
 
 class ExecutiveResearchInput(BaseModel):
@@ -571,6 +591,7 @@ class ExecutiveResearchWorkflow(Workflow):
         try:
             watchlist_calls = await _watchlist_analysis_loop(
                 deduped, existing_watchlist,
+                profile=profile, initiatives=initiatives,
             )
         except Exception:
             logger.exception("research: watchlist-analysis pass failed")
@@ -583,7 +604,8 @@ class ExecutiveResearchWorkflow(Workflow):
             summary=(
                 f"tool_calls={len(tool_calls)} "
                 f"ok={sum(1 for t in tool_calls if t['ok'])} "
-                f"watchlist_adds={sum(1 for t in watchlist_calls if t['ok'])}"
+                f"watchlist_adds={sum(1 for t in watchlist_calls if t.get('outcome') == 'added')} "
+                f"watchlist_suggested={sum(1 for t in watchlist_calls if t.get('outcome') == 'suggested')}"
             ),
         )
 
@@ -873,46 +895,77 @@ async def _executive_synthesis_loop(
 async def _watchlist_analysis_loop(
     findings: list[ResearchFinding],
     existing_watchlist: list[Any],
+    *,
+    profile: Any = None,
+    initiatives: list[Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Dedicated forward-looking pass: decide what to MONITOR going forward
-    and call ``add_watchlist_entry`` for each.
+    """Dedicated forward-looking pass: the model PROPOSES sources to monitor
+    via ``propose_watch``; ``watch_policy.apply_proposals`` then decides,
+    deterministically, which are added on their own (grounded in company
+    data + corroborated) and which become suggestions for the principal.
 
     Separate from ``_executive_synthesis_loop`` (which routes urgent items
-    to people) and from its budget, so adding monitors is the explicit goal
-    here rather than a deprioritized afterthought. Returns the tool-call
-    summaries (same shape as the synthesis loop) so they merge into the
-    run's ``tool_calls``. Only ``add_watchlist_entry`` is offered — no
-    channel tools, so no synthetic Session is needed.
+    to people) and from its budget. Returns tool-call summaries (same shape
+    as the synthesis loop, plus ``outcome`` = added | suggested | rejected)
+    so they merge into the run's ``tool_calls``. Only ``propose_watch`` is
+    offered — no channel tools, so no synthetic Session is needed.
     """
     if not findings:
         return []
 
     from openexecutive.config import get_settings
+    from openexecutive.monitoring import store as monitoring_store
+    from openexecutive.monitoring.research import watch_policy
     from openexecutive.orchestrator.watchlist_tools import (
-        ADD_WATCHLIST_ENTRY_TOOL,
-        handle_add_watchlist_entry,
+        PROPOSE_WATCH_TOOL,
+        handle_propose_watch,
     )
     from openexecutive.providers import get_provider
     from openexecutive.workflows._synthesis import execute_tool_calls
 
-    handlers = {"add_watchlist_entry": handle_add_watchlist_entry}
-    tools = [ADD_WATCHLIST_ENTRY_TOOL]
+    policy_settings = watch_policy.PolicySettings.load()
+    proposals: list[watch_policy.WatchProposal] = []
+
+    async def _propose(tool_input: dict[str, Any]) -> str:
+        return await handle_propose_watch(tool_input, proposals)
+
+    handlers = {"propose_watch": _propose}
+    tools = [PROPOSE_WATCH_TOOL]
     settings = get_settings()
     model = settings.routing_model
+    try:
+        declines = monitoring_store.list_declines()
+    except Exception:
+        logger.exception("research.watchlist: list_declines failed")
+        declines = []
+    try:
+        outcome_counts = monitoring_store.policy_outcome_counts()
+        specialist_counts = monitoring_store.specialist_outcome_counts()
+    except Exception:
+        logger.exception("research.watchlist: outcome counts failed")
+        outcome_counts, specialist_counts = {}, {}
+
     messages: list[dict[str, Any]] = [
         {
             "role": "user",
-            "content": _render_watchlist_turn(findings, existing_watchlist),
+            "content": _render_watchlist_turn(
+                findings, existing_watchlist,
+                declines=declines, outcome_counts=outcome_counts,
+                specialist_counts=specialist_counts,
+            ),
         },
     ]
-    tool_calls: list[dict[str, Any]] = []
+    system = _build_watchlist_system(
+        policy_settings.max_direct_adds, policy_settings.max_suggestions,
+    )
+    call_summaries: list[dict[str, Any]] = []
 
     for _iteration in range(1, _MAX_WATCHLIST_ITERATIONS + 1):
         try:
             response = await get_provider(model).messages_create(
                 model=model,
                 max_tokens=_MAX_SYNTHESIS_TOKENS,
-                system=_WATCHLIST_SYSTEM,
+                system=system,
                 tools=tools,  # type: ignore[arg-type]
                 messages=messages,  # type: ignore[arg-type]
             )
@@ -920,22 +973,19 @@ async def _watchlist_analysis_loop(
             logger.exception("research.watchlist: provider call failed")
             break
 
-        ok_so_far = sum(1 for t in tool_calls if t.get("ok"))
-        budget_remaining = max(0, _MAX_WATCHLIST_ADDS_PER_RUN - ok_so_far)
+        budget_remaining = max(0, _MAX_WATCHLIST_PROPOSALS_PER_RUN - len(proposals))
         iter_calls = await execute_tool_calls(
             response, handlers, budget_remaining=budget_remaining,
         )
-        tool_calls.extend(iter_calls)
+        call_summaries.extend(iter_calls)
 
         stop_reason = getattr(response, "stop_reason", "")
         if stop_reason != "tool_use" or not iter_calls:
             break
-
-        new_ok = sum(1 for t in iter_calls if t.get("ok"))
-        if (ok_so_far + new_ok) >= _MAX_WATCHLIST_ADDS_PER_RUN:
+        if len(proposals) >= _MAX_WATCHLIST_PROPOSALS_PER_RUN:
             logger.info(
-                "research.watchlist: budget exhausted (%d/%d); stopping",
-                ok_so_far + new_ok, _MAX_WATCHLIST_ADDS_PER_RUN,
+                "research.watchlist: proposal cap reached (%d); stopping",
+                len(proposals),
             )
             break
 
@@ -975,7 +1025,26 @@ async def _watchlist_analysis_loop(
             })
         messages.append({"role": "user", "content": tool_results})
 
-    return tool_calls
+    # Proposals the handler refused (bad target, declined, duplicate slug)
+    # are already in call_summaries with ok=False; keep them so the artifact
+    # shows what the model tried. Policy decides the rest.
+    refused = [c for c in call_summaries if not c.get("ok")]
+    for c in refused:
+        c["outcome"] = "rejected"
+    if not proposals:
+        return refused
+
+    ctx = watch_policy.PolicyContext(
+        vocabulary=watch_policy.grounding_vocabulary(
+            profile, list(initiatives or []), list(existing_watchlist),
+        ),
+        priority_terms=watch_policy.priority_terms(profile),
+        existing=list(existing_watchlist),
+        outcome_counts=outcome_counts,
+        settings=policy_settings,
+    )
+    decided = watch_policy.apply_proposals(proposals, findings, ctx)
+    return refused + decided
 
 
 # Tools the Executive synthesis pass MUST NOT call. Two reasons:
@@ -1156,13 +1225,19 @@ def _render_synthesis_turn(findings: list[ResearchFinding], people: list[Any]) -
 def _render_watchlist_turn(
     findings: list[ResearchFinding],
     existing_watchlist: list[Any],
+    *,
+    declines: list[Any] | None = None,
+    outcome_counts: dict[tuple[str, str], dict[str, int]] | None = None,
+    specialist_counts: dict[str, dict[str, int]] | None = None,
 ) -> str:
-    """User-turn for the dedicated watchlist-analysis pass: the findings
-    (with their URLs) plus the current watchlist for dedup."""
+    """User-turn for the watchlist-analysis pass: the findings (with URLs),
+    the current watchlist with its trust record, targets the principal
+    declined, and how the policy's past guesses turned out."""
     parts: list[str] = ["FINDINGS FROM THIS RESEARCH RUN:\n"]
     for i, f in enumerate(findings, start=1):
         block = (
-            f"#{i} [{f.severity_hint.value} | {f.confidence}] "
+            f"#{i} [{f.severity_hint.value} | {f.confidence}"
+            f"{' | verified' if f.verification == 'confirmed' else ''}] "
             f"({f.source_specialist}) {f.title}\n"
             f"  {f.summary}\n"
         )
@@ -1176,15 +1251,63 @@ def _render_watchlist_turn(
             slug = getattr(item, "slug", "")
             signal_type = getattr(item, "signal_type", "")
             target = getattr(item, "target", "")
-            if slug:
-                parts.append(f"- {slug} [{signal_type}] target={target}")
+            if not slug:
+                continue
+            line = f"- {slug} [{signal_type}] target={target}"
+            origin = getattr(item, "origin", "")
+            if origin:
+                line += f" origin={origin}"
+            fired = getattr(item, "fired_count", 0) or 0
+            dismissed = getattr(item, "dismiss_count", 0) or 0
+            trust = getattr(item, "trust_score", None)
+            if fired or dismissed:
+                line += f" fired={fired} dismissed={dismissed}"
+            if isinstance(trust, (int, float)) and trust < 1.0:
+                line += f" trust={trust:.2f}"
+            if not getattr(item, "enabled", True):
+                line += " (disabled)"
+            parts.append(line)
     else:
         parts.append("- (nothing yet)")
 
+    if declines:
+        parts.append("\nDECLINED BY THE PRINCIPAL (never propose these again):")
+        for d in declines[:40]:
+            target = getattr(d, "normalized_target", "")
+            reason = getattr(d, "reason", "")
+            entity = getattr(d, "entity", "")
+            if target:
+                line = f"- {target}"
+                if entity:
+                    line += f" (about {entity})"
+                if reason:
+                    line += f" — {reason}"
+                parts.append(line)
+
+    history_lines: list[str] = []
+    for (signal_type, kind), tally in sorted((outcome_counts or {}).items()):
+        approved = tally.get("approved", 0)
+        declined = tally.get("declined", 0) + tally.get("auto_disabled", 0) + tally.get("expired", 0)
+        if approved + declined:
+            history_lines.append(
+                f"- {signal_type} watches grounded in a {kind or 'unknown'}: "
+                f"{approved} approved / {declined} declined or dropped"
+            )
+    for specialist, tally in sorted((specialist_counts or {}).items()):
+        approved = tally.get("approved", 0)
+        declined = tally.get("declined", 0) + tally.get("auto_disabled", 0) + tally.get("expired", 0)
+        if approved + declined:
+            history_lines.append(
+                f"- proposals from {specialist}: {approved} approved / {declined} declined or dropped"
+            )
+    if history_lines:
+        parts.append("\nHOW PAST PROPOSALS TURNED OUT:")
+        parts.extend(history_lines[:12])
+
     parts.append(
         "\nDecide which ongoing sources are worth monitoring and call "
-        "add_watchlist_entry for each — real ticker/feed targets only, "
-        "preferring URLs from the findings above."
+        "propose_watch for each — real ticker/feed targets only, preferring "
+        "URLs from the findings above, each tied to a named company entity."
     )
     return "\n".join(parts)
 
@@ -1223,7 +1346,10 @@ def _render_artifact(
                 f"{_inline(f.summary)}"
             )
 
-    routed = [t for t in tool_calls if t.get("tool") != "add_watchlist_entry"]
+    routed = [
+        t for t in tool_calls
+        if t.get("tool") not in ("add_watchlist_entry", "propose_watch")
+    ]
     if routed:
         lines.append("\n## Actions routed")
         for t in routed[:25]:
@@ -1233,15 +1359,29 @@ def _render_artifact(
             )
 
     watchlist_calls = [
-        t for t in tool_calls if t.get("tool") == "add_watchlist_entry"
+        t for t in tool_calls
+        if t.get("tool") in ("add_watchlist_entry", "propose_watch")
     ]
-    if watchlist_calls:
+    added = [
+        t for t in watchlist_calls
+        if t.get("outcome") == "added" or (t.get("tool") == "add_watchlist_entry" and t.get("ok"))
+    ]
+    suggested = [t for t in watchlist_calls if t.get("outcome") == "suggested"]
+    rejected = [t for t in watchlist_calls if t not in added and t not in suggested]
+    if added:
         lines.append("\n## Now watching")
-        for t in watchlist_calls[:25]:
-            # Show failures too (e.g. slug-dedup rejections) so an add that
-            # didn't take isn't silently dropped from the artifact.
-            mark = "✓" if t.get("ok") else "✗"
-            lines.append(f"- {mark} {_inline(t.get('result_preview', ''))}")
+        for t in added[:25]:
+            lines.append(f"- ✓ {_inline(t.get('result_preview', ''))}")
+    if suggested:
+        lines.append("\n## Suggested for your approval (see /watchlist)")
+        for t in suggested[:25]:
+            lines.append(f"- ? {_inline(t.get('result_preview', ''))}")
+    if rejected:
+        # Show refusals too (declined target, bad feed, policy) so a proposal
+        # that didn't take isn't silently dropped from the artifact.
+        lines.append("\n## Watch proposals not taken")
+        for t in rejected[:25]:
+            lines.append(f"- ✗ {_inline(t.get('result_preview', ''))}")
 
     lines.append("\n## Per-specialist activity")
     for s in per_specialist:

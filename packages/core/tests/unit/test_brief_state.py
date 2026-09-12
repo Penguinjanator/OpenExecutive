@@ -125,10 +125,36 @@ def test_handled_since_reads_review_audit_events(tmp_path: Path, monkeypatch: py
     monkeypatch.setattr(audit_logger, "get_audit_logger", lambda: al)
     al.log("alert_review_routed", "Routed 'Acme renewal' to Dana", actor="executive")
     al.log("alert_review_closed", "Resolved 'Stripe incident' — vendor marked resolved", actor="executive")
+    al.log("watchlist_research_added", "Started watching stock-acme — competitor ticker", actor="executive")
+    al.log("watchlist_auto_disabled", "Stopped watching rss-noise — dismissed 3 of 6", actor="scheduler")
     al.log("tool_invocation", "unrelated", actor="executive")
 
     handled = brief_state.handled_since(datetime.now(UTC) - timedelta(hours=1))
     kinds = sorted(h["kind"] for h in handled)
-    assert kinds == ["closed", "routed"]
+    assert kinds == ["closed", "routed", "stopped_watching", "watching"]
     assert all(h["summary"] and h["at"] for h in handled)
     assert brief_state.handled_since(datetime.now(UTC) + timedelta(hours=1)) == []
+
+
+def test_fingerprint_moves_with_pending_watch_suggestions() -> None:
+    since = datetime.now(UTC) - timedelta(hours=12)
+    base = dict(today_data={"proposals": [], "departments": [], "people": []}, activity=[], handled=[], since=since)
+    assert brief_state.build_brief_fingerprint(**base) == brief_state.build_brief_fingerprint(**base, pending_watch_suggestions=0)
+    assert brief_state.build_brief_fingerprint(**base) != brief_state.build_brief_fingerprint(**base, pending_watch_suggestions=2)
+
+
+def test_pending_watch_suggestions_counts_dry_run_research_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from openexecutive.alerts.store import initialize_db as init_alerts
+    from openexecutive.memory.episodic import initialize_db as init_episodic
+    from openexecutive.monitoring import store as ms
+
+    db = tmp_path / "w.db"
+    monkeypatch.setattr("openexecutive.memory.episodic.DB_PATH", db)
+    init_episodic(db)
+    init_alerts(db)
+    ms.initialize_db(db)
+    assert brief_state.pending_watch_suggestions() == 0
+    ms.insert_watchlist_item(slug="rss-a", signal_type="rss", target="https://a.com/f",
+                             mode="dry_run", origin="research_proposed", db_path=db)
+    ms.insert_watchlist_item(slug="rss-b", signal_type="rss", target="https://b.com/f", db_path=db)
+    assert brief_state.pending_watch_suggestions() == 1

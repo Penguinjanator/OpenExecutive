@@ -52,6 +52,15 @@ REVIEW_EVENT_TYPES: tuple[str, ...] = (
     "alert_review_changed",
 )
 
+# Every audit event type the handled block reads, mapped to the short kind
+# the brief and the /today rail render. The research watch policy's
+# autonomous moves ride alongside the alert review's.
+HANDLED_EVENT_KINDS: dict[str, str] = {
+    **{t: t.removeprefix("alert_review_") for t in REVIEW_EVENT_TYPES},
+    "watchlist_research_added": "watching",
+    "watchlist_auto_disabled": "stopped_watching",
+}
+
 
 def scope_for(kind: str) -> str:
     return f"{SCOPE_PREFIX}{kind}"
@@ -123,11 +132,11 @@ def handled_since(since: datetime, limit: int = 20) -> list[dict[str, Any]]:
 
         logger_ = get_audit_logger()
         out: list[dict[str, Any]] = []
-        for event_type in REVIEW_EVENT_TYPES:
+        for event_type, kind in HANDLED_EVENT_KINDS.items():
             for ev in logger_.query(event_type=event_type, since=since.isoformat(), limit=limit):
                 details = ev.details if isinstance(ev.details, dict) else {}
                 out.append({
-                    "kind": event_type.removeprefix("alert_review_"),
+                    "kind": kind,
                     "summary": ev.summary,
                     "at": ev.ts,
                     "alert_id": details.get("alert_id"),
@@ -145,6 +154,7 @@ def build_brief_fingerprint(
     activity: list[dict[str, Any]],
     handled: list[dict[str, Any]],
     since: datetime | None,
+    pending_watch_suggestions: int = 0,
 ) -> str:
     """Stable hash of everything the brief would say. Deliberately free of
     dates and timestamps so an unchanged day yields the same fingerprint
@@ -166,6 +176,7 @@ def build_brief_fingerprint(
         "awaiting": sorted(
             int(p.get("id", 0)) for p in today_data.get("people", []) if p.get("awaiting_count", 0)
         ),
+        "watch_suggestions": int(pending_watch_suggestions),
     }
     blob = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
@@ -186,12 +197,26 @@ def suppressed_line(n_waiting: int) -> str:
     return SUPPRESSED_TEMPLATE.format(n=n_waiting, s="" if n_waiting == 1 else "s")
 
 
+def pending_watch_suggestions() -> int:
+    """Research watch suggestions awaiting the principal on /watchlist.
+    Zero when the monitoring store is unavailable."""
+    try:
+        from openexecutive.monitoring import store as monitoring_store
+
+        return len(monitoring_store.list_pending_suggestions())
+    except Exception:
+        logger.debug("brief_state: pending_watch_suggestions unavailable", exc_info=True)
+        return 0
+
+
 __all__ = [
+    "HANDLED_EVENT_KINDS",
     "REVIEW_EVENT_TYPES",
     "SUPPRESSED_TEMPLATE",
     "build_brief_fingerprint",
     "handled_since",
     "last_delivered",
+    "pending_watch_suggestions",
     "record_delivered",
     "scope_for",
     "since_for",

@@ -13,6 +13,7 @@ there.
 from __future__ import annotations
 
 import re
+from urllib.parse import urlsplit, urlunsplit
 
 from openexecutive.alerts.models import AlertSeverity
 
@@ -34,9 +35,43 @@ def is_valid_severity(value: str) -> bool:
     return value in VALID_SEVERITY_VALUES
 
 
+def normalize_target(signal_type: str, target: str) -> str:
+    """Canonical form of a watch target, so two spellings of one source
+    compare equal (the declines memory and the duplicate-source guard key
+    on this). Tickers / CIKs upper-case; URLs lower-case scheme + host and
+    drop the fragment and a trailing slash. Never raises."""
+    raw = (target or "").strip()
+    if signal_type in ("stock", "edgar"):
+        return raw.upper()
+    if "://" not in raw:
+        return raw.lower()
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return raw.lower()
+    path = parts.path.rstrip("/") if parts.path not in ("", "/") else ""
+    return urlunsplit((
+        parts.scheme.lower(), parts.netloc.lower(), path, parts.query, "",
+    ))
+
+
+def registrable_domain(url: str) -> str:
+    """Host with a leading ``www.`` stripped (``""`` for non-URL targets).
+    Good enough to say "same site" for the duplicate-source guard."""
+    if "://" not in (url or ""):
+        return ""
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return ""
+    return host[4:] if host.startswith("www.") else host
+
+
 __all__ = [
     "VALID_SEVERITY_VALUES",
     "WATCHLIST_SLUG_RE",
     "is_valid_severity",
     "is_valid_watchlist_slug",
+    "normalize_target",
+    "registrable_domain",
 ]

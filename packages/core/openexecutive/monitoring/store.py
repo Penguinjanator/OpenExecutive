@@ -25,18 +25,26 @@ import logging
 import sqlite3
 from collections.abc import Generator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from openexecutive.alerts.models import AlertSeverity
 from openexecutive.memory.episodic import DB_PATH, _resolve_db_path
 from openexecutive.monitoring.models import (
+    DECLINE_EXPIRED_RETRY_DAYS,
+    DECLINE_KIND_EXPIRED,
     MODE_ACTIVE,
+    MODE_DRY_RUN,
+    ORIGIN_MANUAL,
+    ORIGIN_RESEARCH,
+    ORIGIN_RESEARCH_PROPOSED,
     OUTCOME_SUPPRESSED_BASELINE,
     Signal,
+    WatchlistDecline,
     WatchlistItem,
     is_valid_mode,
+    is_valid_origin,
     is_valid_outcome,
 )
 
@@ -133,6 +141,31 @@ def initialize_db(db_path: Path | None = None) -> None:
                 name TEXT PRIMARY KEY,
                 applied_at TEXT NOT NULL
             );
+
+            -- Targets the principal declined (or research suggestions that
+            -- aged out). Keyed by the normalized target so a re-proposal
+            -- under a new slug still hits. Read by the research watch policy.
+            CREATE TABLE IF NOT EXISTS watchlist_declines (
+                normalized_target TEXT PRIMARY KEY,
+                entity TEXT NOT NULL DEFAULT '',
+                signal_type TEXT NOT NULL DEFAULT '',
+                slug TEXT NOT NULL DEFAULT '',
+                kind TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                declined_at TEXT NOT NULL
+            );
+
+            -- How the research watch policy's guesses turned out
+            -- (approved / declined / auto_disabled), keyed by the shape of
+            -- the guess so the policy can calibrate itself over time.
+            CREATE TABLE IF NOT EXISTS watchlist_policy_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_type TEXT NOT NULL,
+                grounding_kind TEXT NOT NULL DEFAULT '',
+                specialist TEXT NOT NULL DEFAULT '',
+                outcome TEXT NOT NULL,
+                at TEXT NOT NULL
+            );
         """)
         # Additive migration for DBs created before enrichment landed.
         # ``CREATE TABLE IF NOT EXISTS`` above is a no-op on an existing
@@ -161,6 +194,10 @@ def initialize_db(db_path: Path | None = None) -> None:
             _migrate_baselined_at(conn)
         # Add future migrations BELOW, not inside the guard above.
         _migrate_vendor_status_rekey(conn)
+        # Provenance of a watch (manual / executive / research /
+        # research_proposed). Pre-existing rows are 'manual': nothing the
+        # research policy owns predates the column.
+        _ensure_column(conn, "watchlist", "origin", "TEXT NOT NULL DEFAULT 'manual'")
 
 
 def _migrate_baselined_at(conn: sqlite3.Connection) -> None:
@@ -302,15 +339,18 @@ def insert_watchlist_item(
     mode: str = MODE_ACTIVE,
     enabled: bool = True,
     notes: str = "",
+    origin: str = ORIGIN_MANUAL,
     db_path: Path | None = None,
 ) -> int:
     """Insert a new watchlist row. Returns its id.
 
-    Raises ``ValueError`` for unknown ``mode`` so callers fail loudly
-    rather than silently storing a value the pipeline can't interpret.
+    Raises ``ValueError`` for unknown ``mode`` / ``origin`` so callers fail
+    loudly rather than silently storing a value the pipeline can't interpret.
     """
     if not is_valid_mode(mode):
         raise ValueError(f"Unknown watchlist mode {mode!r}")
+    if not is_valid_origin(origin):
+        raise ValueError(f"Unknown watchlist origin {origin!r}")
     now = datetime.now(UTC).isoformat()
     with _get_conn(db_path) as conn:
         cursor = conn.execute(
@@ -318,8 +358,8 @@ def insert_watchlist_item(
             "(slug, signal_type, target, config_json, trigger_json, cadence, "
             "severity_floor, severity_ceiling, route_to_specialist, "
             "route_to_department, route_to_person_id, mode, enabled, "
-            "created_at, notes) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "created_at, notes, origin) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 slug,
                 signal_type,
@@ -338,6 +378,7 @@ def insert_watchlist_item(
                 1 if enabled else 0,
                 now,
                 notes,
+                origin,
             ),
         )
         return int(cursor.lastrowid or 0)
@@ -466,6 +507,7 @@ _ALLOWED_UPDATE_COLUMNS: frozenset[str] = frozenset({
     "notes",
     "config_json",
     "route_to_specialist",
+    "origin",
 })
 
 
@@ -502,14 +544,19 @@ def update_watchlist_fields(
 
 
 def delete_watchlist_item(item_id: int, db_path: Path | None = None) -> bool:
-    """Hard-delete a watchlist row. Returns True iff a row was removed.
+    """Hard-delete a watchlist row and its ``external_signals`` history.
+    Returns True iff a row was removed.
 
-    External_signals rows for this watchlist_id are NOT cascade-deleted —
-    the audit trail of past signals stays intact so historical alerts can
-    still be traced. Callers who want to suppress future surfacing should
-    prefer ``set_enabled(item_id, False)``.
+    The FK from external_signals is enforced (PRAGMA foreign_keys=ON), so a
+    watch that has ever recorded a signal cannot be deleted on its own; the
+    signals go with it, in the same transaction. Alerts already promoted
+    from those signals are untouched (they live in ``alerts``), and the
+    audit_log keeps the ``external_signal_*`` rows, so what the watch
+    surfaced stays traceable. Callers who want to suppress future surfacing
+    without losing the row should prefer ``set_enabled(item_id, False)``.
     """
     with _get_conn(db_path) as conn:
+        conn.execute("DELETE FROM external_signals WHERE watchlist_id = ?", (item_id,))
         cursor = conn.execute("DELETE FROM watchlist WHERE id = ?", (item_id,))
         return cursor.rowcount > 0
 
@@ -525,6 +572,191 @@ def set_enabled(
             (1 if enabled else 0, item_id),
         )
         return cursor.rowcount > 0
+
+
+# --------------------------------------------------------------------- #
+# Research suggestions, declines memory, policy outcomes
+# --------------------------------------------------------------------- #
+
+
+def list_pending_suggestions(db_path: Path | None = None) -> list[WatchlistItem]:
+    """Research suggestions awaiting the principal: ``research_proposed``
+    rows still in ``dry_run``. Oldest first."""
+    resolved = _resolve_db_path(db_path)
+    if not resolved.exists():
+        return []
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM watchlist WHERE origin = ? AND mode = ? ORDER BY id",
+            (ORIGIN_RESEARCH_PROPOSED, MODE_DRY_RUN),
+        ).fetchall()
+    return [_row_to_watchlist(row) for row in rows]
+
+
+def approve_suggestion(item_id: int, db_path: Path | None = None) -> bool:
+    """Flip a pending suggestion to a live research watch. Returns False when
+    the row is not a pending suggestion (already approved, or not research)."""
+    with _get_conn(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE watchlist SET mode = ?, origin = ?, enabled = 1 "
+            "WHERE id = ? AND origin = ? AND mode = ?",
+            (MODE_ACTIVE, ORIGIN_RESEARCH, item_id, ORIGIN_RESEARCH_PROPOSED, MODE_DRY_RUN),
+        )
+        return cursor.rowcount > 0
+
+
+def _row_to_decline(row: sqlite3.Row) -> WatchlistDecline:
+    return WatchlistDecline(**dict(row))
+
+
+def insert_decline(
+    *,
+    normalized_target: str,
+    kind: str,
+    reason: str = "",
+    entity: str = "",
+    signal_type: str = "",
+    slug: str = "",
+    db_path: Path | None = None,
+) -> None:
+    """Record (or refresh) a decline for ``normalized_target``. An explicit
+    decline always overwrites an expired one; an expiry never downgrades an
+    explicit decline."""
+    now = datetime.now(UTC).isoformat()
+    with _get_conn(db_path) as conn:
+        existing = conn.execute(
+            "SELECT kind FROM watchlist_declines WHERE normalized_target = ?",
+            (normalized_target,),
+        ).fetchone()
+        if existing is not None and existing["kind"] != DECLINE_KIND_EXPIRED and kind == DECLINE_KIND_EXPIRED:
+            return
+        conn.execute(
+            "INSERT INTO watchlist_declines "
+            "(normalized_target, entity, signal_type, slug, kind, reason, declined_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(normalized_target) DO UPDATE SET "
+            "entity = excluded.entity, signal_type = excluded.signal_type, "
+            "slug = excluded.slug, kind = excluded.kind, reason = excluded.reason, "
+            "declined_at = excluded.declined_at",
+            (normalized_target, entity[:200], signal_type, slug, kind, reason, now),
+        )
+
+
+def list_declines(db_path: Path | None = None) -> list[WatchlistDecline]:
+    resolved = _resolve_db_path(db_path)
+    if not resolved.exists():
+        return []
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM watchlist_declines ORDER BY declined_at DESC"
+        ).fetchall()
+    return [_row_to_decline(row) for row in rows]
+
+
+def delete_decline(normalized_target: str, db_path: Path | None = None) -> bool:
+    with _get_conn(db_path) as conn:
+        cursor = conn.execute(
+            "DELETE FROM watchlist_declines WHERE normalized_target = ?",
+            (normalized_target,),
+        )
+        return cursor.rowcount > 0
+
+
+def is_declined(
+    normalized_target: str,
+    *,
+    now: datetime | None = None,
+    db_path: Path | None = None,
+) -> bool:
+    """True when the target must not be proposed again: an explicit decline
+    (permanent), or an unreviewed expiry younger than the retry window."""
+    resolved = _resolve_db_path(db_path)
+    if not resolved.exists():
+        return False
+    with _get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT kind, declined_at FROM watchlist_declines WHERE normalized_target = ?",
+            (normalized_target,),
+        ).fetchone()
+    if row is None:
+        return False
+    if row["kind"] != DECLINE_KIND_EXPIRED:
+        return True
+    try:
+        declined_at = datetime.fromisoformat(row["declined_at"])
+    except ValueError:
+        return True
+    if declined_at.tzinfo is None:
+        declined_at = declined_at.replace(tzinfo=UTC)
+    return (now or datetime.now(UTC)) - declined_at < timedelta(days=DECLINE_EXPIRED_RETRY_DAYS)
+
+
+def record_policy_outcome(
+    *,
+    signal_type: str,
+    grounding_kind: str,
+    specialist: str,
+    outcome: str,
+    db_path: Path | None = None,
+) -> None:
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            "INSERT INTO watchlist_policy_outcomes "
+            "(signal_type, grounding_kind, specialist, outcome, at) VALUES (?, ?, ?, ?, ?)",
+            (signal_type, grounding_kind, specialist[:64], outcome, datetime.now(UTC).isoformat()),
+        )
+
+
+def policy_outcome_counts(
+    db_path: Path | None = None,
+) -> dict[tuple[str, str], dict[str, int]]:
+    """``{(signal_type, grounding_kind): {outcome: n}}`` — the policy's
+    track record by the shape of the guess. Empty on a fresh install."""
+    resolved = _resolve_db_path(db_path)
+    if not resolved.exists():
+        return {}
+    out: dict[tuple[str, str], dict[str, int]] = {}
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT signal_type, grounding_kind, outcome, COUNT(*) AS n "
+            "FROM watchlist_policy_outcomes GROUP BY signal_type, grounding_kind, outcome"
+        ).fetchall()
+    for row in rows:
+        key = (str(row["signal_type"]), str(row["grounding_kind"]))
+        out.setdefault(key, {})[str(row["outcome"])] = int(row["n"])
+    return out
+
+
+def specialist_outcome_counts(db_path: Path | None = None) -> dict[str, dict[str, int]]:
+    """``{specialist: {outcome: n}}`` for the research turn's calibration line."""
+    resolved = _resolve_db_path(db_path)
+    if not resolved.exists():
+        return {}
+    out: dict[str, dict[str, int]] = {}
+    with _get_conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT specialist, outcome, COUNT(*) AS n FROM watchlist_policy_outcomes "
+            "WHERE specialist != '' GROUP BY specialist, outcome"
+        ).fetchall()
+    for row in rows:
+        out.setdefault(str(row["specialist"]), {})[str(row["outcome"])] = int(row["n"])
+    return out
+
+
+def count_signals_since(
+    watchlist_id: int, since: datetime, db_path: Path | None = None,
+) -> int:
+    """Signals (any outcome) captured for a watch since ``since``."""
+    resolved = _resolve_db_path(db_path)
+    if not resolved.exists():
+        return 0
+    with _get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM external_signals "
+            "WHERE watchlist_id = ? AND captured_at >= ?",
+            (watchlist_id, since.isoformat()),
+        ).fetchone()
+    return int(row["n"]) if row else 0
 
 
 # --------------------------------------------------------------------- #

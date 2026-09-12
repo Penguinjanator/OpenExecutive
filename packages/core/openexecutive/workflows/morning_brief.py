@@ -140,8 +140,10 @@ class MorningBriefWorkflow(Workflow):
             activity = []
 
         handled = brief_state.handled_since(since)
+        pending_suggestions = brief_state.pending_watch_suggestions()
         fingerprint = brief_state.build_brief_fingerprint(
             today_data=today_data, activity=activity, handled=handled, since=since,
+            pending_watch_suggestions=pending_suggestions,
         )
         previous = brief_state.last_delivered(BRIEF_KIND)
         suppressed = (
@@ -200,6 +202,7 @@ class MorningBriefWorkflow(Workflow):
             artifact_text = await synthesize_briefing_narrative(
                 today_data=today_data, activity=activity, period_label=period,
                 standalone=True, since=since, handled=handled,
+                pending_watch_suggestions=pending_suggestions,
             )
         except Exception as exc:
             logger.exception("morning_brief: synthesis failed")

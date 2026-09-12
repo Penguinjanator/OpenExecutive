@@ -48,6 +48,25 @@ def test_state_hash_changes_when_watchlist_grows(db: Path) -> None:
     assert before != after
 
 
+def test_state_hash_ignores_suggestions_and_disabled_rows(db: Path) -> None:
+    """Approving / declining a research suggestion must not read as a state
+    change that triggers a fresh 7-specialist run."""
+    before = research_scheduler.compute_research_state_hash(db_path=db)
+    monitoring_store.insert_watchlist_item(
+        slug="rss-sugg", signal_type="rss", target="https://s.com/feed",
+        mode="dry_run", origin="research_proposed", db_path=db,
+    )
+    assert research_scheduler.compute_research_state_hash(db_path=db) == before
+    item = monitoring_store.get_watchlist_item_by_slug("rss-sugg", db_path=db)
+    assert item is not None and item.id is not None
+    monitoring_store.delete_watchlist_item(item.id, db_path=db)
+    assert research_scheduler.compute_research_state_hash(db_path=db) == before
+    monitoring_store.insert_watchlist_item(
+        slug="stock-off", signal_type="stock", target="OFF", enabled=False, db_path=db,
+    )
+    assert research_scheduler.compute_research_state_hash(db_path=db) == before
+
+
 def test_state_hash_changes_when_initiative_added(db: Path) -> None:
     from openexecutive.memory.episodic import store_initiative
 

@@ -224,6 +224,9 @@ export interface CompanyProfile {
   strategic_priorities: { current_year: string[]; north_star_metric: string };
   culture: { values: string[]; operating_principles: string[] };
   financials: { burn_rate_monthly: number | null; runway_months: number | null; key_metrics: Record<string, unknown> };
+  /** External dependencies the research watch policy treats as company data. */
+  vendors: string[];
+  tickers: string[];
 }
 
 export async function getCompanyProfile(): Promise<CompanyProfile> {
@@ -2741,6 +2744,10 @@ export type WatchlistSignalType =
 export type WatchlistCadence = "real_time" | "15min" | "hourly" | "daily" | "weekly";
 export type WatchlistMode = "active" | "dry_run";
 export type WatchlistSeverity = "low" | "medium" | "high" | "urgent";
+/** Who put the row on the watchlist. `research_proposed` = a pending suggestion. */
+export type WatchlistOrigin = "manual" | "executive" | "research" | "research_proposed";
+/** Why a research suggestion / watch was declined — each picks a different remedy. */
+export type WatchDeclineReason = "not_relevant" | "too_noisy" | "wrong_source";
 
 export interface WatchlistItem {
   id: number;
@@ -2764,6 +2771,7 @@ export interface WatchlistItem {
   dismiss_count: number;
   trust_score: number;
   notes: string;
+  origin: WatchlistOrigin | string;
 }
 
 export interface WatchlistSignal {
@@ -2868,11 +2876,51 @@ export async function patchWatchlistItem(
   return res.json();
 }
 
-export async function deleteWatchlistItem(slug: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/watchlist/${encodeURIComponent(slug)}`, {
+export async function deleteWatchlistItem(
+  slug: string,
+  reason?: WatchDeclineReason,
+): Promise<void> {
+  const qs = reason ? `?reason=${encodeURIComponent(reason)}` : "";
+  const res = await fetch(`${API_BASE}/watchlist/${encodeURIComponent(slug)}${qs}`, {
     method: "DELETE",
   });
   if (!res.ok) throw new Error(`Failed to delete watchlist entry: ${res.statusText}`);
+}
+
+/** Turn a research suggestion (origin=research_proposed, dry_run) into a live watch. */
+export async function approveWatchSuggestion(slug: string): Promise<WatchlistItem> {
+  const res = await fetch(`${API_BASE}/watchlist/${encodeURIComponent(slug)}/approve`, {
+    method: "POST",
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Failed to approve suggestion: ${res.statusText}${text ? ` — ${text}` : ""}`);
+  }
+  return res.json();
+}
+
+export interface WatchDeclineResponse {
+  slug: string;
+  reason: string;
+  /** "removed" (declined + deleted) or "kept_quiet" (too_noisy → live with a high floor). */
+  result: "removed" | "kept_quiet" | string;
+}
+
+/** Decline a research suggestion. The reason picks the remedy server-side. */
+export async function declineWatchSuggestion(
+  slug: string,
+  reason: WatchDeclineReason,
+): Promise<WatchDeclineResponse> {
+  const res = await fetch(`${API_BASE}/watchlist/${encodeURIComponent(slug)}/decline`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reason }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Failed to decline suggestion: ${res.statusText}${text ? ` — ${text}` : ""}`);
+  }
+  return res.json();
 }
 
 // ---------------------------------------------------------------------------

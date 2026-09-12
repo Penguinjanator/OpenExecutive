@@ -211,7 +211,7 @@ async def test_workflow_runs_end_to_end_with_stubbed_specialists(
         "openexecutive.workflows.executive_research.research_one_specialist",
         fake_research_one,
     )
-    async def fake_watchlist(findings, existing_watchlist):
+    async def fake_watchlist(findings, existing_watchlist, **_kw):
         return []
 
     monkeypatch.setattr(
@@ -330,7 +330,7 @@ async def test_workflow_drops_low_confidence_pre_synthesis(
         "openexecutive.workflows.executive_research.research_one_specialist",
         fake_research_one,
     )
-    async def fake_watchlist(findings, existing_watchlist):
+    async def fake_watchlist(findings, existing_watchlist, **_kw):
         return []
 
     monkeypatch.setattr(

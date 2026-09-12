@@ -22,7 +22,11 @@ from openexecutive.alerts.models import AlertSeverity
 from openexecutive.audit import log_event as audit_log
 from openexecutive.monitoring import store as ms
 from openexecutive.monitoring.models import (
+    DECLINE_KIND_EXPLICIT,
+    DECLINE_REASON_NOT_RELEVANT,
     MODE_ACTIVE,
+    ORIGIN_EXECUTIVE,
+    RESEARCH_ORIGINS,
     is_valid_cadence,
     is_valid_mode,
 )
@@ -37,6 +41,7 @@ from openexecutive.monitoring.validation import (
 from openexecutive.monitoring.validation import (
     WATCHLIST_SLUG_RE as _SLUG_RE,
 )
+from openexecutive.monitoring.validation import normalize_target
 
 logger = logging.getLogger(__name__)
 
@@ -215,16 +220,23 @@ LIST_WATCHLIST_TOOL: dict[str, Any] = {
 REMOVE_WATCHLIST_ENTRY_TOOL: dict[str, Any] = {
     "name": "remove_watchlist_entry",
     "description": (
-        "Hard-delete a watchlist entry by slug. Historical "
-        "``external_signals`` rows that referenced this entry are KEPT for "
-        "audit. Use when the principal says 'stop watching X' AND wants the "
-        "config gone. For temporary suppression prefer "
-        "``tune_watchlist_entry`` with enabled=false."
+        "Hard-delete a watchlist entry by slug (its recorded signal history "
+        "goes with it; alerts it already raised and the audit log stay). Use "
+        "when the principal says 'stop watching X' AND wants the config gone. "
+        "For temporary suppression prefer ``tune_watchlist_entry`` with "
+        "enabled=false. For a research-added watch, an optional ``reason`` "
+        "(not_relevant | too_noisy | wrong_source) is remembered so the "
+        "research pass never re-proposes it."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
             "slug": {"type": "string", "description": "Slug of the entry to remove."},
+            "reason": {
+                "type": "string",
+                "enum": ["not_relevant", "too_noisy", "wrong_source"],
+                "description": "Why (research-added watches only); defaults to not_relevant.",
+            },
         },
         "required": ["slug"],
     },
@@ -278,6 +290,69 @@ TUNE_WATCHLIST_ENTRY_TOOL: dict[str, Any] = {
 }
 
 
+# Research-only tool: the executive_research watchlist pass may only PROPOSE
+# a watch. Deterministic policy (monitoring.research.watch_policy) decides
+# whether it is added on its own or shown to the principal as a suggestion.
+# Not part of WATCHLIST_TOOLS — the chat Executive keeps add_watchlist_entry.
+PROPOSE_WATCH_TOOL: dict[str, Any] = {
+    "name": "propose_watch",
+    "description": (
+        "Propose an ongoing external source for the company to monitor, tied "
+        "to a named company entity (a competitor, vendor, ticker or initiative "
+        "from the company context). Policy code decides: a proposal grounded in "
+        "company data and backed by a verified finding is added on its own; "
+        "anything you are not sure about becomes a suggestion the principal "
+        "approves. Never re-propose a target listed as declined."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "slug": {"type": "string", "description": "Unique kebab-case id, e.g. 'stock-acme', 'rss-acme-blog'."},
+            "signal_type": {
+                "type": "string",
+                "enum": ["stock", "rss", "vendor_status", "edgar", "page_watch", "query"],
+            },
+            "target": {
+                "type": "string",
+                "description": (
+                    "Concrete, real target: a ticker (stock/edgar), a feed or page URL "
+                    "taken from a finding's urls (rss/vendor_status/page_watch), or a "
+                    "search query (query). Never invent a URL."
+                ),
+            },
+            "grounding_entity": {
+                "type": "string",
+                "description": (
+                    "The company-context entity this watch is about, by name — a "
+                    "competitor, vendor, ticker, initiative or the company itself."
+                ),
+            },
+            "rationale": {
+                "type": "string",
+                "description": "<=240 chars, shown to the principal: why this source is worth watching.",
+            },
+            "finding_index": {
+                "type": "integer",
+                "description": "The 1-based '#N' of the finding this proposal comes from.",
+            },
+            "certainty": {
+                "type": "string",
+                "enum": ["confident", "unsure"],
+                "description": (
+                    "'confident' only when the entity is in the company data and the "
+                    "source is the entity's own (its ticker, its site, its status page). "
+                    "'unsure' can only turn an add into a suggestion — never the reverse."
+                ),
+            },
+            "display_label": {"type": "string"},
+            "trigger": {"type": "object", "description": "Optional adapter trigger; policy adds quiet defaults."},
+            "route_to_specialist": {"type": "string"},
+        },
+        "required": ["slug", "signal_type", "target", "grounding_entity", "rationale", "certainty"],
+    },
+}
+
+
 WATCHLIST_TOOLS: list[dict[str, Any]] = [
     ADD_WATCHLIST_ENTRY_TOOL,
     LIST_WATCHLIST_TOOL,
@@ -310,8 +385,29 @@ def _err(tool: str, msg: str) -> str:
 # --------------------------------------------------------------------- #
 
 
-async def handle_add_watchlist_entry(tool_input: dict[str, Any]) -> str:
-    tool = "add_watchlist_entry"
+def _display_label_config(signal_type: str, display_label: Any) -> dict[str, Any]:
+    """Map the user-facing label onto the adapter-specific config key."""
+    config: dict[str, Any] = {}
+    if display_label:
+        if signal_type == "vendor_status":
+            config["vendor_label"] = display_label
+        elif signal_type == "rss":
+            config["feed_label"] = display_label
+        elif signal_type == "stock":
+            config["display_name"] = display_label
+        elif signal_type in ("query", "edgar", "page_watch"):
+            config["label"] = display_label
+    return config
+
+
+async def _validated_target(
+    tool: str, tool_input: dict[str, Any],
+) -> tuple[str, str, str, dict[str, Any], dict[str, Any]] | str:
+    """Shared insert-time validation for add_watchlist_entry / propose_watch.
+
+    Returns ``(slug, signal_type, target, config, trigger)`` with the target
+    validated + normalized (a non-feed rss URL may convert to page_watch), or
+    the JSON error string to return to the model."""
     try:
         slug = str(tool_input["slug"]).strip()
         signal_type = str(tool_input["signal_type"]).strip()
@@ -321,12 +417,37 @@ async def handle_add_watchlist_entry(tool_input: dict[str, Any]) -> str:
 
     if not slug or not signal_type or not target:
         return _err(tool, "slug, signal_type, target are all required and non-empty")
-
     if not _SLUG_RE.match(slug):
         return _err(tool, f"slug {slug!r} must match {_SLUG_RE.pattern}")
-
     if signal_type not in list_registered_kinds():
         return _err(tool, f"signal_type {signal_type!r} has no registered adapter")
+
+    trigger = tool_input.get("trigger") or {}
+    if not isinstance(trigger, dict):
+        return _err(tool, "trigger must be a JSON object")
+
+    if ms.get_watchlist_item_by_slug(slug) is not None:
+        return _err(tool, f"slug {slug!r} already exists; use tune_watchlist_entry to modify")
+
+    config = _display_label_config(signal_type, tool_input.get("display_label"))
+    # Validate the target before it lands: a non-feed rss URL is converted
+    # to a scrape-backed page_watch (when scrapeable) or rejected, so the
+    # research workflow can't seed the watchlist with dead feed rows.
+    try:
+        signal_type, target, config = await validate_and_normalize_target(
+            signal_type, target, config,
+        )
+    except WatchlistTargetError as exc:
+        return _err(tool, exc.reason)
+    return slug, signal_type, target, config, trigger
+
+
+async def handle_add_watchlist_entry(tool_input: dict[str, Any]) -> str:
+    tool = "add_watchlist_entry"
+    validated = await _validated_target(tool, tool_input)
+    if isinstance(validated, str):
+        return validated
+    slug, signal_type, target, config, trigger = validated
 
     cadence = str(tool_input.get("cadence", "15min"))
     if not is_valid_cadence(cadence):
@@ -344,37 +465,6 @@ async def handle_add_watchlist_entry(tool_input: dict[str, Any]) -> str:
         return _err(tool, f"unknown severity_ceiling {ceiling_str!r}")
     floor = AlertSeverity(floor_str)
     ceiling = AlertSeverity(ceiling_str)
-
-    config: dict[str, Any] = {}
-    display_label = tool_input.get("display_label")
-    if display_label:
-        # Adapter expects vendor-specific keys; map the user-facing name.
-        if signal_type == "vendor_status":
-            config["vendor_label"] = display_label
-        elif signal_type == "rss":
-            config["feed_label"] = display_label
-        elif signal_type == "stock":
-            config["display_name"] = display_label
-        elif signal_type in ("query", "edgar", "page_watch"):
-            config["label"] = display_label
-
-    trigger = tool_input.get("trigger") or {}
-    if not isinstance(trigger, dict):
-        return _err(tool, "trigger must be a JSON object")
-
-    existing = ms.get_watchlist_item_by_slug(slug)
-    if existing is not None:
-        return _err(tool, f"slug {slug!r} already exists; use tune_watchlist_entry to modify")
-
-    # Validate the target before it lands: a non-feed rss URL is converted
-    # to a scrape-backed page_watch (when scrapeable) or rejected, so the
-    # research workflow can't seed the watchlist with dead feed rows.
-    try:
-        signal_type, target, config = await validate_and_normalize_target(
-            signal_type, target, config,
-        )
-    except WatchlistTargetError as exc:
-        return _err(tool, exc.reason)
 
     try:
         new_id = ms.insert_watchlist_item(
@@ -394,6 +484,7 @@ async def handle_add_watchlist_entry(tool_input: dict[str, Any]) -> str:
             route_to_specialist=str(tool_input.get("route_to_specialist", "")),
             mode=mode,
             notes=str(tool_input.get("notes", ""))[:500],
+            origin=ORIGIN_EXECUTIVE,
         )
     except Exception as exc:
         logger.exception("add_watchlist_entry: insert failed")
@@ -417,6 +508,52 @@ async def handle_add_watchlist_entry(tool_input: dict[str, Any]) -> str:
         "signal_type": signal_type,
         "mode": mode,
     })
+
+
+async def handle_propose_watch(tool_input: dict[str, Any], collector: list[Any]) -> str:
+    """Validate a research proposal and queue it for the watch policy.
+
+    Nothing is written here — ``watch_policy.apply_proposals`` runs after the
+    model's turn and decides add / suggest / reject. A target the principal
+    declined is refused HERE so a new slug cannot route around the decline.
+    """
+    from openexecutive.monitoring.research.watch_policy import WatchProposal
+
+    tool = "propose_watch"
+    validated = await _validated_target(tool, tool_input)
+    if isinstance(validated, str):
+        return validated
+    slug, signal_type, target, config, trigger = validated
+
+    normalized = normalize_target(signal_type, target)
+    if ms.is_declined(normalized):
+        return _err(tool, f"target {target!r} was declined by the principal — do not re-propose it")
+
+    certainty = str(tool_input.get("certainty", "unsure")).strip().lower()
+    if certainty not in ("confident", "unsure"):
+        certainty = "unsure"
+    raw_index = tool_input.get("finding_index")
+    finding_index: int | None
+    try:
+        finding_index = int(raw_index) - 1 if raw_index is not None else None
+    except (TypeError, ValueError):
+        finding_index = None
+
+    collector.append(WatchProposal(
+        slug=slug,
+        signal_type=signal_type,
+        target=target,
+        normalized_target=normalized,
+        rationale=str(tool_input.get("rationale", ""))[:240],
+        grounding_entity=str(tool_input.get("grounding_entity", ""))[:120],
+        finding_index=finding_index,
+        certainty=certainty,
+        config=config,
+        trigger=trigger,
+        route_to_specialist=str(tool_input.get("route_to_specialist", ""))[:32],
+        display_label=str(tool_input.get("display_label", ""))[:120],
+    ))
+    return json.dumps({"ok": True, "queued": slug, "signal_type": signal_type})
 
 
 async def handle_list_watchlist(tool_input: dict[str, Any]) -> str:
@@ -476,6 +613,20 @@ async def handle_remove_watchlist_entry(tool_input: dict[str, Any]) -> str:
     except Exception as exc:
         logger.exception("remove_watchlist_entry: delete failed")
         return _err(tool, f"delete failed: {exc}")
+
+    # "Stop watching" a research-added source is feedback: remember the
+    # decline so the research pass never re-proposes it under a new slug.
+    if removed and item.origin in RESEARCH_ORIGINS:
+        try:
+            ms.insert_decline(
+                normalized_target=normalize_target(item.signal_type, item.target),
+                kind=DECLINE_KIND_EXPLICIT,
+                reason=str(tool_input.get("reason") or DECLINE_REASON_NOT_RELEVANT),
+                signal_type=item.signal_type,
+                slug=item.slug,
+            )
+        except Exception:
+            logger.exception("remove_watchlist_entry: decline record failed")
 
     _audit(
         tool, removed,

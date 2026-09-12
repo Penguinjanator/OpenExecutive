@@ -80,3 +80,13 @@ def test_eod_context_splits_and_lists_handled() -> None:
     assert "CARRIED OVER: 2 older item(s)" in text
     legacy = _render_eod_context(period_label="p", today_data=_today(), activity=[])
     assert "STILL AWAITING DECISION:" in legacy and "CARRIED OVER" not in legacy
+
+
+def test_render_context_mentions_pending_watch_suggestions_once() -> None:
+    since = datetime.now(UTC) - timedelta(hours=24)
+    text = render_briefing_context(
+        period_label="p", today_data=_today(), activity=[], since=since, pending_watch_suggestions=2,
+    )
+    assert "WATCH SUGGESTIONS WAITING: 2 sources" in text and "/watchlist" in text
+    quiet = render_briefing_context(period_label="p", today_data=_today(), activity=[], since=since)
+    assert "WATCH SUGGESTIONS" not in quiet

@@ -226,3 +226,15 @@ def test_concurrent_saves_do_not_break_each_other(tmp_path: Path):
     assert errors == []
     assert CompanyProfile.load_from_yaml(path).name.startswith("w")
     assert [p.name for p in tmp_path.iterdir()] == ["profile.yaml"]
+
+
+def test_profile_vendors_and_tickers_render_and_roundtrip(tmp_path: Path):
+    profile = CompanyProfile(name="Acme", vendors=["Stripe", "AWS"], tickers=["ACME"])
+    block = profile.to_prompt_block()
+    assert "Vendors: Stripe, AWS" in block and "Tracked tickers: ACME" in block
+    path = tmp_path / "p.yaml"
+    profile.save_to_yaml(path)
+    loaded = CompanyProfile.load_from_yaml(path)
+    assert loaded.vendors == ["Stripe", "AWS"] and loaded.tickers == ["ACME"]
+    # Older profile files without the fields still load.
+    assert CompanyProfile.model_validate({"name": "Old"}).vendors == []

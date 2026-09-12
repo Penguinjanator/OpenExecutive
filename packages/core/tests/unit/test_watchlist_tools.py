@@ -237,3 +237,34 @@ async def test_add_invokes_target_validation_and_surfaces_rejection(
     }))
     assert "error" in result and "not a feed" in result["error"]
     assert ms.get_watchlist_item_by_slug("rss-bad") is None
+
+
+# --------------------------------------------------------------------- #
+# origin + declines memory
+# --------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_add_stamps_executive_origin(db: Path) -> None:
+    await wt.handle_add_watchlist_entry({
+        "slug": "stock-aapl", "signal_type": "stock", "target": "AAPL",
+    })
+    row = ms.get_watchlist_item_by_slug("stock-aapl", db_path=db)
+    assert row is not None and row.origin == "executive"
+
+
+@pytest.mark.asyncio
+async def test_remove_research_watch_records_decline(db: Path) -> None:
+    ms.insert_watchlist_item(
+        slug="rss-acme", signal_type="rss", target="https://Acme.com/feed/",
+        origin="research", db_path=db,
+    )
+    ms.insert_watchlist_item(slug="stock-mine", signal_type="stock", target="MINE", db_path=db)
+    out = json.loads(await wt.handle_remove_watchlist_entry({"slug": "rss-acme", "reason": "too_noisy"}))
+    assert out["ok"] is True
+    declines = ms.list_declines(db_path=db)
+    assert [d.normalized_target for d in declines] == ["https://acme.com/feed"]
+    assert declines[0].kind == "declined_explicit" and declines[0].reason == "too_noisy"
+    # A manual row removed is not a decline.
+    await wt.handle_remove_watchlist_entry({"slug": "stock-mine"})
+    assert len(ms.list_declines(db_path=db)) == 1

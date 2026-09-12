@@ -63,6 +63,11 @@ class CompanyProfile(BaseModel):
     )
     culture: Culture = Field(default_factory=Culture)
     financials: Financials = Field(default_factory=Financials)
+    # External entities the company depends on or tracks. Named here so the
+    # research watchlist policy can treat a watch on them as grounded in
+    # company data (auto-added) rather than inferred (needs approval).
+    vendors: list[str] = Field(default_factory=list)  # e.g. ["Stripe", "AWS"]
+    tickers: list[str] = Field(default_factory=list)  # own + competitor tickers
 
     @classmethod
     def load_from_yaml(cls, path: Path | str) -> CompanyProfile:
@@ -180,6 +185,13 @@ class CompanyProfile(BaseModel):
                     "  Our advantages: "
                     + "; ".join(self.competitive_landscape.competitive_advantages)
                 )
+
+        if self.vendors or self.tickers:
+            lines.extend(["", "**External Dependencies**:"])
+            if self.vendors:
+                lines.append("  Vendors: " + ", ".join(self.vendors))
+            if self.tickers:
+                lines.append("  Tracked tickers: " + ", ".join(self.tickers))
 
         if self.strategic_priorities.current_year:
             lines.extend(["", "**Strategic Priorities (Current Year)**:"])

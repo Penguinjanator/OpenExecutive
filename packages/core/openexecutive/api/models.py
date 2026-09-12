@@ -202,6 +202,8 @@ class CompanyProfileResponse(BaseModel):
     strategic_priorities: StrategicPrioritiesData
     culture: CultureData
     financials: FinancialsData
+    vendors: list[str] = Field(default_factory=list)
+    tickers: list[str] = Field(default_factory=list)
 
 
 class CompanyProfileUpdateRequest(BaseModel):
@@ -219,3 +221,5 @@ class CompanyProfileUpdateRequest(BaseModel):
     strategic_priorities: StrategicPrioritiesData | None = None
     culture: CultureData | None = None
     financials: FinancialsData | None = None
+    vendors: list[str] | None = None
+    tickers: list[str] | None = None
