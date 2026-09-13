@@ -152,8 +152,10 @@ def rewritten_since(
     for p in proposals:
         if p.get("review_verdict") != "changed":
             continue
+        # Fail open like split_proposals: a rewrite with no readable stamp is
+        # reported rather than dropped from every block.
         reviewed = parse_aware(p.get("last_reviewed_at"))
-        if reviewed is not None and reviewed >= since:
+        if reviewed is None or reviewed >= since:
             out.append(p)
     return out
 
@@ -216,18 +218,20 @@ def build_brief_fingerprint(
     tomorrow (activity is keyed by kind + summary, never by its stamp)."""
     new, carried = split_proposals(today_data.get("proposals", []), since)
     payload = {
-        "new": sorted(int(p.get("alert_id", 0)) for p in new),
-        "carried": sorted(int(p.get("alert_id", 0)) for p in carried),
+        "new": sorted(int(p.get("alert_id") or 0) for p in new),
+        "carried": sorted(int(p.get("alert_id") or 0) for p in carried),
         "likely_stale": sum(1 for p in carried if p.get("review_verdict") == "likely_stale"),
         "activity": sorted(
             (str(a.get("kind", "")), str(a.get("summary", ""))[:80]) for a in activity
         ),
         "handled": sorted((h["kind"], h["summary"][:80]) for h in handled),
         # A rewrite alone must still un-suppress the brief now that it no
-        # longer rides in `handled` (keyed on the note, never the stamp).
+        # longer rides in `handled` (keyed on the note, never the stamp). Same
+        # list the REWRITTEN block renders: carried items only — a new item
+        # already moves the fingerprint by id.
         "rewritten": sorted(
-            (int(p.get("alert_id", 0)), str(p.get("review_note", ""))[:80])
-            for p in rewritten_since(today_data.get("proposals", []), since)
+            (int(p.get("alert_id") or 0), str(p.get("review_note", ""))[:80])
+            for p in rewritten_since(carried, since)
         ),
         "depts": sorted(
             (d.get("slug", ""), d.get("at_risk_count", 0), d.get("off_track_count", 0))

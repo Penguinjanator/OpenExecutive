@@ -163,11 +163,19 @@ def _as_int(raw: Any) -> int | None:
         return None
 
 
-def _alert_status_now(alert_id: int | None) -> str:
-    """Current lifecycle state of the alert a handled row touched."""
+def _alert_status_now(alert_id: int | None, now: datetime) -> str:
+    """Current lifecycle state of the alert a handled row touched.
+
+    ``open`` means exactly "in the /today queue right now" (`lifecycle.is_live`:
+    unread, inside its TTL, not snoozed) — the only state where a "still open"
+    jump link has a card to land on and where a close row can be read as
+    undone. ``acked`` is the principal's own approval (not an Undo target),
+    ``inactive`` a snoozed / TTL-expired row the sweep has not closed yet.
+    """
     if alert_id is None:
         return ""
     try:
+        from openexecutive.alerts import lifecycle
         from openexecutive.alerts.store import get_alert
 
         alert = get_alert(alert_id)
@@ -180,7 +188,9 @@ def _alert_status_now(alert_id: int | None) -> str:
         return "merged"
     if alert.status in {"resolved", "dismissed", "expired"}:
         return alert.status
-    return "open"
+    if alert.status == "ack":
+        return "acked"
+    return "open" if lifecycle.is_live(alert, now) else "inactive"
 
 
 # Which audit-details keys fill a handled row's `target` and `detail`, per
@@ -211,7 +221,7 @@ def _handled_outcome(kind: str, details: dict[str, Any]) -> str:
     return ""
 
 
-def _handled_item(h: dict[str, Any]) -> HandledItem:
+def _handled_item(h: dict[str, Any], now: datetime) -> HandledItem:
     """One structured rail row from a `brief_state.handled_since` entry."""
     kind = str(h["kind"])
     raw_details = h.get("details")
@@ -235,7 +245,7 @@ def _handled_item(h: dict[str, Any]) -> HandledItem:
         outcome=_handled_outcome(kind, details),
         evidence_ref=str(details.get("evidence_ref") or ""),
         superseded_by_alert_id=_as_int(details.get("superseded_by_alert_id")),
-        status=_alert_status_now(alert_id),
+        status=_alert_status_now(alert_id, now),
     )
 
 
@@ -245,7 +255,7 @@ def _handled_overnight(now: datetime) -> list[HandledItem]:
         from openexecutive.briefing import brief_state
 
         since = brief_state.since_for("principal_brief_morning", now=now)
-        return [_handled_item(h) for h in brief_state.handled_since(since, limit=20)]
+        return [_handled_item(h, now) for h in brief_state.handled_since(since, limit=20)]
     except Exception:
         logger.debug("today: handled_overnight unavailable", exc_info=True)
         return []
@@ -363,10 +373,12 @@ class HandledItem(BaseModel):
     evidence_ref: str = ""
     # The survivor a merge folded this alert into, for collapsing the pair.
     superseded_by_alert_id: int | None = None
-    # The alert's status NOW ("open" | "resolved" | "dismissed" | "expired" |
-    # "merged"), "" when there is no alert. The rail is rebuilt from the audit
-    # log on every fetch, so this is what tells the UI a close was already
-    # undone (offer "Reopened", not another Undo).
+    # The alert's status NOW: "open" (live in the /today queue) | "resolved" |
+    # "dismissed" | "expired" | "merged" | "acked" (principal approved it) |
+    # "inactive" (snoozed / past TTL, unswept); "" when there is no alert. The
+    # rail is rebuilt from the audit log on every fetch, so this is what tells
+    # the UI a close was already undone (offer "Reopened", not another Undo)
+    # and whether a "still open" link has a card to land on.
     status: str = ""
 
 

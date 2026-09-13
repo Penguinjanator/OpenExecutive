@@ -109,8 +109,9 @@ def test_render_context_lists_rewritten_open_items_separately_from_handled() -> 
     )
     assert "REWRITTEN BY THE EXECUTIVE SINCE LAST BRIEF" in text
     assert "- item 4 — payouts now delayed for 7 merchants" in text
-    handled_block = text.split("HANDLED OVERNIGHT BY THE EXECUTIVE", 1)[1]
-    assert "item 4" not in handled_block
+    # Listed exactly once, under REWRITTEN — not re-listed as new or carried.
+    assert text.count("item 4") == 1
+    assert text.index("REWRITTEN BY THE EXECUTIVE") < text.index("HANDLED OVERNIGHT BY THE EXECUTIVE")
     # Rewritten items are still carried-over for the count.
     assert "CARRIED OVER: 3 older item(s)" in text
 

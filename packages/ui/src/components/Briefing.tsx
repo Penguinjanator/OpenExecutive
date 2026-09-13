@@ -1402,7 +1402,7 @@ function MonitoringRow({
     </>
   );
   return (
-    <div className="relative group py-3 hover:bg-surface-overlay/30 transition-colors">
+    <div id={`alert-${proposal.alert_id}`} className="relative group py-3 hover:bg-surface-overlay/30 transition-colors">
       {onContinue ? (
         <button
           type="button"
@@ -1528,8 +1528,10 @@ interface HandledRow {
 
 // Collapse the newest-first list to one row per alert. A merge whose survivor
 // is also listed becomes a "duplicate folded in" count on the survivor. The
-// newest move wins the visible slot, except an escalation, which always
-// stays visible — the boast must never bury the row that needs the CEO.
+// newest move wins the visible slot, with two overrides: a close (terminal,
+// and the row that carries Undo) is never hidden behind an older move, and
+// otherwise an escalation beats routed / nudged / drafted — the boast must
+// never bury the row that needs the CEO.
 function groupHandled(items: HandledItem[]): HandledRow[] {
   const listed = new Set(items.map((h) => h.alert_id).filter((id): id is number => id != null));
   const foldedInto = new Map<number, number>();
@@ -1555,7 +1557,7 @@ function groupHandled(items: HandledItem[]): HandledRow[] {
       };
       byKey.set(key, fresh);
       rows.push(fresh);
-    } else if (h.kind === "escalated" && row.item.kind !== "escalated") {
+    } else if (h.kind === "escalated" && !isCloseKind(row.item) && row.item.kind !== "escalated") {
       row.also.push(row.item);
       row.item = h;
     } else {
@@ -1583,7 +1585,7 @@ function handledHeadline(rows: HandledRow[], reverted: (h: HandledItem) => boole
   let waiting = 0;
   for (const r of rows) {
     const k = r.item.kind;
-    if (k === "closed" && !reverted(r.item)) offPlate += 1;
+    if (isCloseKind(r.item) && !reverted(r.item)) offPlate += 1;
     else if (k === "routed" || k === "nudged") others += 1;
     else if (k === "escalated") waiting += 1;
   }
@@ -1634,8 +1636,14 @@ function handledSentence(h: HandledItem): React.ReactNode {
   }
 }
 
+// Statuses `POST /alerts/{id}/reopen` accepts, plus "" for an unknown lookup.
+const HANDLED_REOPENABLE = new Set(["", "resolved", "dismissed", "expired", "merged"]);
+
+// Jump to the alert's card; when it is folded behind "Show more" (no element
+// yet), land on the queue section instead of clicking dead.
 function scrollToAlertCard(alertId: number) {
-  document.getElementById(`alert-${alertId}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+  const target = document.getElementById(`alert-${alertId}`) ?? document.getElementById(SECTION_IDS.needsYou);
+  target?.scrollIntoView({ behavior: "smooth", block: "center" });
 }
 
 // The audit page pre-filters on these two query params, so the row's
@@ -1650,7 +1658,7 @@ function handledProofHref(h: HandledItem): string | null {
 function handledAlsoLine(row: HandledRow): string {
   const parts: string[] = [];
   if (row.foldedIn > 0) parts.push(`${row.foldedIn} duplicate${row.foldedIn === 1 ? "" : "s"} folded in`);
-  if (row.also.length > 0) parts.push(`also ${row.also.map((a) => handledVerb(a.kind)).join(", ")} earlier`);
+  if (row.also.length > 0) parts.push(`also ${row.also.map((a) => handledVerb(a.kind)).join(", ")}`);
   return parts.join(" · ");
 }
 
@@ -1673,7 +1681,12 @@ function HandledRowView({
   onReopen?: (rowKey: string, alertId: number) => void;
 }) {
   const h = row.item;
-  const canUndo = Boolean(onReopen) && h.alert_id != null && isCloseKind(h) && !reverted;
+  // Undo only while the close still stands and the server would accept a
+  // reopen (resolved / dismissed / expired / merged; "" = status unknown).
+  const canUndo =
+    Boolean(onReopen) && h.alert_id != null && isCloseKind(h) && !reverted && HANDLED_REOPENABLE.has(h.status ?? "");
+  // "open" means live in the queue right now — the only state with a card to
+  // jump to (an acked or snoozed alert has none).
   const stillOpen = h.alert_id != null && h.status === "open" && !isCloseKind(h);
   const proofHref = handledProofHref(h);
   const alsoLine = handledAlsoLine(row);
@@ -1756,9 +1769,12 @@ function HandledOvernightPanel({
   const rows = groupHandled(items);
   const loud = rows.filter((r) => !isQuietKind(r.item.kind));
   const quiet = rows.filter((r) => isQuietKind(r.item.kind));
-  const visible = showAll ? [...loud, ...quiet] : loud.slice(0, HANDLED_VISIBLE);
+  // Quiet rows hide behind "Show more" only when there is something louder
+  // to show first; a rail of nothing but suggestions still lists them.
+  const primary = loud.length > 0 ? loud : quiet;
+  const visible = showAll ? [...loud, ...quiet] : primary.slice(0, HANDLED_VISIBLE);
   const hiddenCount = rows.length - visible.length;
-  const closesStanding = rows.filter((r) => r.item.kind === "closed" && !reverted(r.item)).length;
+  const closesStanding = rows.filter((r) => isCloseKind(r.item) && !reverted(r.item)).length;
 
   return (
     <section id={SECTION_IDS.handled} className="rounded-xl border border-line bg-surface-elevated p-4">
@@ -2075,7 +2091,7 @@ export default function Briefing({ onContinue, showHeader = false, firstName }: 
   const statPills: StatPill[] = today
     ? briefingStats({
         needsYou: mineProposals.length,
-        handledOvernight: handledOvernight.length,
+        handledOvernight: groupHandled(handledOvernight).length,
         peopleOverdue,
         peopleNeedReply,
         deptAtRisk: deptAtRiskCount,

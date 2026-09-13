@@ -1536,7 +1536,9 @@ def test_handled_overnight_rows_are_structured_and_track_current_status(
     routed_id = _alert("Q3 pricing page copy stale")
     survivor_id = _alert("Payout delay")
     dup_id = _alert("Payout delay (duplicate)")
+    acked_id = _alert("SOC2 evidence request")
     alert_store.set_status(closed_id, "resolved")
+    alert_store.set_status(acked_id, "ack")
     alert_store.set_status(undone_id, "dismissed")
     alert_store.mark_superseded(dup_id, survivor_id)
 
@@ -1553,6 +1555,9 @@ def test_handled_overnight_rows_are_structured_and_track_current_status(
     al.log("alert_review_merged", "Merged 'Payout delay (duplicate)' into 'Payout delay'", actor="executive",
            details={"alert_id": dup_id, "headline": "Payout delay (duplicate)",
                     "superseded_by_alert_id": survivor_id, "superseded_by_headline": "Payout delay"})
+    al.log("alert_review_escalated", "Escalated 'SOC2 evidence request' to high (sent)", actor="executive",
+           details={"alert_id": acked_id, "headline": "SOC2 evidence request", "new_severity": "high",
+                    "evidence": "auditor deadline Friday"})
     al.log("watchlist_research_added", "Started watching stock-acme — competitor ticker", actor="executive",
            details={"slug": "stock-acme", "rationale": "competitor ticker named on Sales"})
     al.log("alert_review_changed", "Updated 'Something' — rewritten", actor="executive",
@@ -1581,6 +1586,12 @@ def test_handled_overnight_rows_are_structured_and_track_current_status(
     merged = rows["Payout delay (duplicate)"]
     assert merged["target"] == "Payout delay" and merged["superseded_by_alert_id"] == survivor_id
     assert merged["status"] == "merged"
+
+    # The principal approved this one after the escalation: not "open" (no
+    # card to jump to), not reopenable.
+    escalated = rows["SOC2 evidence request"]
+    assert escalated["target"] == "high" and escalated["detail"] == "auditor deadline Friday"
+    assert escalated["status"] == "acked"
 
     watching = rows["stock-acme"]
     assert watching["kind"] == "watching" and watching["alert_id"] is None

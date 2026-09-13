@@ -194,7 +194,8 @@ def test_rewritten_since_picks_changed_verdicts_reviewed_in_window() -> None:
         {"alert_id": 3, "review_verdict": "relevant", "last_reviewed_at": inside},
         {"alert_id": 4, "review_verdict": "changed"},
     ]
-    assert [p["alert_id"] for p in brief_state.rewritten_since(proposals, since)] == [1]
+    # 4 has no stamp: reported (fail open, like split_proposals), never dropped.
+    assert [p["alert_id"] for p in brief_state.rewritten_since(proposals, since)] == [1, 4]
     assert brief_state.rewritten_since(proposals, None) == []
 
 
