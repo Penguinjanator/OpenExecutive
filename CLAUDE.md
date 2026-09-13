@@ -182,6 +182,11 @@ See `.env.example`. Required: `ANTHROPIC_API_KEY`. Optional integrations: `SLACK
 > "handled overnight" block). Patch it in an autouse fixture, and delete a
 > stray `packages/core/episodic_memory.db` (gitignored) if one appears.
 
+> **Pre-existing ruff hits in `tests/unit/test_attachments.py`** (unsorted
+> imports, unused `asyncio`): `make lint` only checks `openexecutive/`, so CI
+> is unaffected — lint the specific test files you touched rather than
+> `tests/` as a whole.
+
 > **Known-red on `main`:** `tests/integration/test_chat_committee.py::
 > test_chat_with_committee_streams_phases_and_revised_text` fails on the
 > base commit independently of local changes; deselect it when comparing
