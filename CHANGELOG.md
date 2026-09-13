@@ -118,8 +118,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "person 12", and the nudge bookkeeping marker is stripped for display.
   The rail is now one line by default — a count-only first-person heading
   ("Since your last brief: N off your plate, N in others' hands, N waiting
-  on you") — with the rows behind a "details" disclosure, and nothing at
-  all on a night with nothing handled. Expanded, rows read first-person
+  on you", plus drafts / suggestions / watch changes / reopened-by-you
+  when present) — with the rows behind a "details" disclosure, and nothing
+  at all on a night with nothing handled. Expanded, rows read first-person
   ("Resolved *X* — evidence", "Dismissed *X* as stale — …", "Handed *X* to
   Dana Kim", "Chased Dana Kim on *X*"), escalations first, one row per
   alert, every row linking its evidence to a pre-filtered `/audit` (the

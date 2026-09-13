@@ -1577,26 +1577,31 @@ function joinClauses(parts: string[]): string {
 
 // "Since your last brief: 3 off your plate, 2 in others' hands, and 1 waiting
 // on you." Counts only — a name lookup that fell back to "person 12" can
-// never leak into the headline. A reverted close is back on the plate, so it
-// is not counted.
+// never leak into the headline. Every kind lands in some bucket, because
+// this sentence is the whole default render: a close the principal already
+// undid reads as "reopened by you", never as a fresh move.
 function handledHeadline(rows: HandledRow[], reverted: (h: HandledItem) => boolean): string {
-  let offPlate = 0;
-  let others = 0;
-  let waiting = 0;
+  const counts = { offPlate: 0, reopened: 0, others: 0, waiting: 0, drafted: 0, suggested: 0, watches: 0, other: 0 };
   for (const r of rows) {
     const k = r.item.kind;
-    if (isCloseKind(r.item) && !reverted(r.item)) offPlate += 1;
-    else if (k === "routed" || k === "nudged") others += 1;
-    else if (k === "escalated") waiting += 1;
+    if (isCloseKind(r.item)) counts[reverted(r.item) ? "reopened" : "offPlate"] += 1;
+    else if (k === "routed" || k === "nudged") counts.others += 1;
+    else if (k === "escalated") counts.waiting += 1;
+    else if (k === "drafted") counts.drafted += 1;
+    else if (k === "suggested_workflow") counts.suggested += 1;
+    else if (k === "watching" || k === "stopped_watching") counts.watches += 1;
+    else counts.other += 1;
   }
+  const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
   const parts: string[] = [];
-  if (offPlate > 0) parts.push(`${offPlate} off your plate`);
-  if (others > 0) parts.push(`${others} in others' hands`);
-  if (waiting > 0) parts.push(`${waiting} waiting on you`);
-  if (parts.length === 0) {
-    const n = rows.length;
-    return `Since your last brief: ${n} move${n === 1 ? "" : "s"} on my own.`;
-  }
+  if (counts.offPlate > 0) parts.push(`${counts.offPlate} off your plate`);
+  if (counts.others > 0) parts.push(`${counts.others} in others' hands`);
+  if (counts.waiting > 0) parts.push(`${counts.waiting} waiting on you`);
+  if (counts.drafted > 0) parts.push(plural(counts.drafted, "draft ready", "drafts ready"));
+  if (counts.suggested > 0) parts.push(plural(counts.suggested, "workflow suggested", "workflows suggested"));
+  if (counts.watches > 0) parts.push(plural(counts.watches, "watch change", "watch changes"));
+  if (counts.other > 0) parts.push(plural(counts.other, "other move", "other moves"));
+  if (counts.reopened > 0) parts.push(`${counts.reopened} reopened by you`);
   return `Since your last brief: ${joinClauses(parts)}.`;
 }
 
@@ -1736,6 +1741,8 @@ function HandledRowView({
   );
 }
 
+const HANDLED_DETAILS_ID = "sec-handled-details";
+
 function HandledOvernightPanel({
   items,
   onReopen,
@@ -1751,12 +1758,14 @@ function HandledOvernightPanel({
   // truth after a reload) or the in-session set marks it reverted.
   const reverted = (h: HandledItem) => isCloseKind(h) && (h.status === "open" || undone.has(handledKey(h)));
 
-  if (items.length === 0) return null;
+  // Guard on the grouped rows, not the raw items: a merge folded into a
+  // listed survivor leaves no row of its own.
   const rows = groupHandled(items);
+  if (rows.length === 0) return null;
 
   return (
     <section id={SECTION_IDS.handled} className="rounded-xl border border-line bg-surface-elevated px-4 py-2.5">
-      <div className="flex items-center gap-1.5">
+      <div className="flex items-start gap-1.5">
         <p className="min-w-0 flex-1 text-sm text-fg">{handledHeadline(rows, reverted)}</p>
         <InfoTip align="left">
           Moves I completed on my own since your last delivered brief — routed,
@@ -1768,13 +1777,14 @@ function HandledOvernightPanel({
           type="button"
           onClick={() => setOpen((v) => !v)}
           aria-expanded={open}
-          className="flex-shrink-0 text-[11px] text-fg-muted hover:text-fg transition-colors"
+          aria-controls={HANDLED_DETAILS_ID}
+          className="flex-shrink-0 mt-0.5 text-[11px] text-fg-muted hover:text-fg transition-colors"
         >
-          {open ? "hide ▾" : "details ▸"}
+          {open ? "hide" : "details"} <span aria-hidden="true">{open ? "▾" : "▸"}</span>
         </button>
       </div>
       {open && (
-        <div className="mt-1.5 divide-y divide-line border-t border-line">
+        <div id={HANDLED_DETAILS_ID} className="mt-1.5 divide-y divide-line border-t border-line">
           {rows.map((row) => (
             <HandledRowView key={handledKey(row.item)} row={row} reverted={reverted(row.item)} onReopen={onReopen} />
           ))}
