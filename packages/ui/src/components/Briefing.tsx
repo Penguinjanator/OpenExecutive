@@ -1481,33 +1481,33 @@ function MonitoringPanel({
 // escalated, drafted, merged, closed) plus the research watch policy's
 // autonomous adds/drops. Rewrites of open alerts are deliberately absent:
 // the alert is still in "Needs you" and its card carries the note, so
-// listing it here would double-report it and call it done. Every autonomous
-// close is reversible here (Undo → reopen), which is what makes the autonomy
-// un-scary: visible, evidence-cited, one click back.
+// listing it here would double-report it and call it done.
+//
+// Deliberately quiet: the default render is ONE sentence of counts. The
+// rows — and Undo for every autonomous close, which is what makes the
+// autonomy un-scary (visible, evidence-cited, one click back) — sit behind
+// a "details" disclosure. A night with nothing handled renders nothing.
 //
 // Voice: first person, past tense, specific, nothing the audit row cannot
 // back. The heading counts three buckets and never interpolates names, so
 // it reads the same whether the roster lookup found "Dana Kim" or not.
-const HANDLED_VISIBLE = 5;
 
 // One table per kind: reading order (what needs the principal first, then
-// what they can undo, then what went to others, then transparency), the short
-// past-tense verb for the "also …" trailer, and whether the row is
-// transparency rather than accomplishment (folded behind "Show more").
-const HANDLED_KINDS: Record<string, { order: number; verb: string; quiet?: true }> = {
+// what they can undo, then what went to others, then transparency) and the
+// short past-tense verb for the "also …" trailer.
+const HANDLED_KINDS: Record<string, { order: number; verb: string }> = {
   escalated: { order: 0, verb: "raised" },
   closed: { order: 1, verb: "closed" },
   merged: { order: 1, verb: "folded" },
   routed: { order: 2, verb: "routed" },
   nudged: { order: 2, verb: "chased" },
   drafted: { order: 2, verb: "drafted" },
-  suggested_workflow: { order: 3, verb: "suggested a workflow", quiet: true },
+  suggested_workflow: { order: 3, verb: "suggested a workflow" },
   watching: { order: 3, verb: "started watching" },
-  stopped_watching: { order: 3, verb: "stopped watching", quiet: true },
+  stopped_watching: { order: 3, verb: "stopped watching" },
 };
 const handledOrder = (kind: string) => HANDLED_KINDS[kind]?.order ?? 4;
 const handledVerb = (kind: string) => HANDLED_KINDS[kind]?.verb ?? kind;
-const isQuietKind = (kind: string) => HANDLED_KINDS[kind]?.quiet === true;
 
 // Stable key for one handled row (an alert can appear twice in one pass —
 // e.g. routed then closed — so the alert id alone is not unique).
@@ -1738,73 +1738,47 @@ function HandledRowView({
 
 function HandledOvernightPanel({
   items,
-  reviewedOpenCount,
   onReopen,
   undone,
 }: {
   items: HandledItem[];
-  // Open alerts the review re-read in the last day — the honest basis for
-  // the quiet-night line.
-  reviewedOpenCount: number;
   onReopen?: (rowKey: string, alertId: number) => void;
   undone: Set<string>;
 }) {
-  const [showAll, setShowAll] = useState(false);
+  const [open, setOpen] = useState(false);
   // The rail is rebuilt from the audit log on every fetch, so a close the
   // principal already undid still has its row: `status === "open"` (server
   // truth after a reload) or the in-session set marks it reverted.
   const reverted = (h: HandledItem) => isCloseKind(h) && (h.status === "open" || undone.has(handledKey(h)));
 
-  if (items.length === 0) {
-    if (reviewedOpenCount === 0) return null;
-    return (
-      <section id={SECTION_IDS.handled} className="rounded-xl border border-line bg-surface-elevated px-4 py-3">
-        <p className="text-xs text-fg-muted">
-          Quiet night. I re-read {reviewedOpenCount} open alert{reviewedOpenCount === 1 ? "" : "s"} — none needed a move.
-        </p>
-      </section>
-    );
-  }
-
+  if (items.length === 0) return null;
   const rows = groupHandled(items);
-  const loud = rows.filter((r) => !isQuietKind(r.item.kind));
-  const quiet = rows.filter((r) => isQuietKind(r.item.kind));
-  // Quiet rows hide behind "Show more" only when there is something louder
-  // to show first; a rail of nothing but suggestions still lists them.
-  const primary = loud.length > 0 ? loud : quiet;
-  const visible = showAll ? [...loud, ...quiet] : primary.slice(0, HANDLED_VISIBLE);
-  const hiddenCount = rows.length - visible.length;
-  const closesStanding = rows.filter((r) => isCloseKind(r.item) && !reverted(r.item)).length;
 
   return (
-    <section id={SECTION_IDS.handled} className="rounded-xl border border-line bg-surface-elevated p-4">
-      <div className="flex items-start gap-1.5 mb-2">
-        <p className="text-sm font-medium text-fg">{handledHeadline(rows, reverted)}</p>
+    <section id={SECTION_IDS.handled} className="rounded-xl border border-line bg-surface-elevated px-4 py-2.5">
+      <div className="flex items-center gap-1.5">
+        <p className="min-w-0 flex-1 text-sm text-fg">{handledHeadline(rows, reverted)}</p>
         <InfoTip align="left">
           Moves I completed on my own since your last delivered brief — routed,
           chased, escalated, drafted, folded, or closed with cited evidence.
           Rewrites of open alerts show on the card itself, not here. Undo puts a
           closed item back in your queue.
         </InfoTip>
-      </div>
-      <div className="divide-y divide-line">
-        {visible.map((row) => (
-          <HandledRowView key={handledKey(row.item)} row={row} reverted={reverted(row.item)} onReopen={onReopen} />
-        ))}
-      </div>
-      {(hiddenCount > 0 || showAll) && (
         <button
           type="button"
-          onClick={() => setShowAll((v) => !v)}
-          className="w-full pt-2 text-[11px] text-fg-muted hover:text-fg transition-colors"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          className="flex-shrink-0 text-[11px] text-fg-muted hover:text-fg transition-colors"
         >
-          {showAll ? "Show fewer" : `Show ${hiddenCount} more`}
+          {open ? "hide ▾" : "details ▸"}
         </button>
-      )}
-      {closesStanding > 0 && (
-        <p className="mt-2 pt-2 border-t border-line text-[11px] text-fg-subtle">
-          {closesStanding} fewer card{closesStanding === 1 ? "" : "s"} in your queue since your last brief · every close cites its evidence.
-        </p>
+      </div>
+      {open && (
+        <div className="mt-1.5 divide-y divide-line border-t border-line">
+          {rows.map((row) => (
+            <HandledRowView key={handledKey(row.item)} row={row} reverted={reverted(row.item)} onReopen={onReopen} />
+          ))}
+        </div>
       )}
     </section>
   );
@@ -2063,13 +2037,6 @@ export default function Briefing({ onContinue, showHeader = false, firstName }: 
   const restProposals = mineProposals.slice(1);
   const staleNeedsYouIds = olderThan(mineProposals, NEEDS_YOU_DISMISS_OLDER_THAN_DAYS);
   const handledOvernight = today?.handled_overnight ?? [];
-  // Open alerts the review actually re-read in the last day — the honest
-  // basis for the quiet-night line (a verdict stamped three days ago is not
-  // "I read it last night").
-  const reviewedOpenCount = (today?.proposals ?? []).filter((p) => {
-    const t = Date.parse(p.last_reviewed_at ?? "");
-    return !Number.isNaN(t) && Date.now() - t < 24 * 60 * 60 * 1000;
-  }).length;
 
   // Status-strip inputs, all from data already computed above.
   const inFlightCount = today?.in_flight?.length ?? 0;
@@ -2488,7 +2455,6 @@ export default function Briefing({ onContinue, showHeader = false, firstName }: 
                   />
                   <HandledOvernightPanel
                     items={handledOvernight}
-                    reviewedOpenCount={reviewedOpenCount}
                     onReopen={handleReopen}
                     undone={undoneRows}
                   />

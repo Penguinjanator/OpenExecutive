@@ -1280,10 +1280,11 @@ today:
     superseded_by_alert_id and `status` (the alert's state NOW, so an undone
     close renders "Reopened" rather than a second Undo). The UI's handled
     rail is first-person and count-based ("Since your last brief: N off your
-    plate, N in others' hands, N waiting on you"), escalations first, one
-    row per alert, five before "Show more", each row linking its evidence to
-    `/audit?event_type=…&q=…` and a still-open row to `#alert-<id>`; Undo →
-    `POST /alerts/{id}/reopen`. The "Executive handled N overnight" status
+    plate, N in others' hands, N waiting on you") shown as ONE line by
+    default, rows behind a "details" disclosure (escalations first, one row
+    per alert, each linking its evidence to `/audit?event_type=…&q=…` and a
+    still-open row to `#alert-<id>`; Undo → `POST /alerts/{id}/reopen`),
+    nothing rendered when empty. The "Executive handled N overnight" status
     pill is unchanged. UI: cards lead with `review_note`
     (amber "Likely stale" / "Updated" / "Since you last looked"), chips for
     age, seen ×N, why-now / due, folded-in, draft-ready, a "Reviewed <ago>"

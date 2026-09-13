@@ -116,16 +116,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   event_type, and the alert's `status` now) instead of one truncated
   sentence; routed / nudged audit summaries name the person rather than
   "person 12", and the nudge bookkeeping marker is stripped for display.
-  The rail reads first-person: a count-only heading ("Since your last
-  brief: N off your plate, N in others' hands, N waiting on you"),
-  escalations first, one row per alert ("Resolved *X* — evidence",
-  "Dismissed *X* as stale — …", "Handed *X* to Dana Kim", "Chased Dana Kim
-  on *X*"), five rows before "Show more", every row linking its evidence to
-  a pre-filtered `/audit` (the audit page now reads `event_type` / `q` from
-  the query string) and a still-open row jumping to its card. Undo is only
-  offered while the close still stands; a close already undone shows
-  "Reopened" after a reload. A quiet night renders one honest line instead
-  of nothing.
+  The rail is now one line by default — a count-only first-person heading
+  ("Since your last brief: N off your plate, N in others' hands, N waiting
+  on you") — with the rows behind a "details" disclosure, and nothing at
+  all on a night with nothing handled. Expanded, rows read first-person
+  ("Resolved *X* — evidence", "Dismissed *X* as stale — …", "Handed *X* to
+  Dana Kim", "Chased Dana Kim on *X*"), escalations first, one row per
+  alert, every row linking its evidence to a pre-filtered `/audit` (the
+  audit page now reads `event_type` / `q` from the query string) and a
+  still-open row jumping to its card. Undo is only offered while the close
+  still stands; a close already undone shows "Reopened" after a reload.
 - **Specialists are told what departments watch.** The research context
   every specialist receives now carries a `DEPARTMENT WATCH INTERESTS`
   block (each department's watched entities), and the grounding rule
