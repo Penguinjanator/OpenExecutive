@@ -25,6 +25,16 @@ import {
   type Today,
 } from "@/lib/api";
 import { clientCountsSummary, renewalBadge } from "@/lib/practice";
+import {
+  HANDLED_REOPENABLE,
+  groupHandled,
+  handledAlsoLine,
+  handledHeadline,
+  handledKey,
+  handledProofHref,
+  isCloseKind,
+  type HandledRow,
+} from "@/lib/handled";
 import InfoTip from "./InfoTip";
 import { phaseLabel } from "./onboarding/meta";
 import { SectionHeading } from "./memories/shared";
@@ -958,7 +968,7 @@ function ProposalCard({
     <div>{content}</div>
   );
   return (
-    <div className={`group py-3 hover:bg-surface-overlay/30 transition-colors${rowAccent}`}>
+    <div id={`alert-${proposal.alert_id}`} className={`group py-3 hover:bg-surface-overlay/30 transition-colors${rowAccent}`}>
       {contentArea}
       {/* Body expander — a sibling of the content area (never nested inside the
           Discuss click target, which HTML disallows) so a clamped long body can
@@ -1402,7 +1412,7 @@ function MonitoringRow({
     </>
   );
   return (
-    <div className="relative group py-3 hover:bg-surface-overlay/30 transition-colors">
+    <div id={`alert-${proposal.alert_id}`} className="relative group py-3 hover:bg-surface-overlay/30 transition-colors">
       {onContinue ? (
         <button
           type="button"
@@ -1476,26 +1486,127 @@ function MonitoringPanel({
   );
 }
 
-// Handled overnight — what the Executive's alert review did on its own since
-// the last morning brief (routed, nudged, escalated, drafted, merged, closed,
-// updated). Every autonomous close is reversible here (Undo → reopen), which
-// is what makes the autonomy un-scary: visible, evidence-cited, one click back.
-const HANDLED_KIND_LABEL: Record<string, string> = {
-  closed: "Closed",
-  routed: "Routed",
-  nudged: "Nudged",
-  escalated: "Escalated",
-  drafted: "Drafted",
-  merged: "Merged",
-  suggested_workflow: "Suggested",
-  changed: "Updated",
-};
+// Handled rail — pure logic lives in @/lib/handled (tested by `npm test`);
+// only rendering stays here.
 
-// Stable key for one handled row (an alert can appear twice in one pass —
-// e.g. updated then closed — so the alert id alone is not unique).
-function handledKey(h: HandledItem): string {
-  return `${h.kind}-${h.at}-${h.alert_id ?? ""}`;
+// First-person sentence for one row. Falls back to the audit summary when the
+// row predates the structured fields (no headline / target to compose from).
+function handledSentence(h: HandledItem): React.ReactNode {
+  const headline = h.headline ?? "";
+  const target = h.target ?? "";
+  const H = <span className="text-fg">{headline}</span>;
+  const T = <span className="text-fg">{target}</span>;
+  const why = h.detail ? <span className="text-fg-subtle"> — {h.detail}</span> : null;
+  if (!headline) return h.summary;
+  switch (h.kind) {
+    case "closed":
+      return h.outcome === "dismissed" ? <>Dismissed {H} as stale{why}</> : <>Resolved {H}{why}</>;
+    case "routed":
+      if (!target) return h.summary;
+      return h.outcome === "proposed"
+        ? <>Proposed {H} to {T} <span className="text-fg-subtle">(awaiting their approval)</span></>
+        : <>Handed {H} to {T}</>;
+    case "nudged":
+      return target ? <>Chased {T} on {H}</> : h.summary;
+    case "escalated":
+      return target ? <>Raised {H} to {T}{why}</> : <>Raised {H}{why}</>;
+    case "drafted":
+      return target ? <>Drafted {T} from {H}</> : h.summary;
+    case "merged":
+      return target ? <>Folded {H} into {T}</> : h.summary;
+    case "suggested_workflow":
+      return target ? <>Suggested running {T} on {H}</> : h.summary;
+    case "watching":
+      return <>Started watching {H}{why}</>;
+    case "stopped_watching":
+      return <>Stopped watching {H}{why}</>;
+    default:
+      return h.summary;
+  }
 }
+
+// Jump to the alert's card; when it is folded behind "Show more" (no element
+// yet), land on the queue section instead of clicking dead.
+function scrollToAlertCard(alertId: number) {
+  const target = document.getElementById(`alert-${alertId}`) ?? document.getElementById(SECTION_IDS.needsYou);
+  target?.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+function HandledTrailerLink({ href, label }: { href: string; label: string }) {
+  return (
+    <>
+      <span aria-hidden="true">·</span>
+      <Link href={href} className="hover:text-indigo-300 transition-colors">{label}</Link>
+    </>
+  );
+}
+
+function HandledRowView({
+  row,
+  reverted,
+  onReopen,
+}: {
+  row: HandledRow;
+  reverted: boolean;
+  onReopen?: (rowKey: string, alertId: number) => void;
+}) {
+  const h = row.item;
+  // Undo only while the close still stands and the server would accept a
+  // reopen (resolved / dismissed / expired / merged; "" = status unknown).
+  const canUndo =
+    Boolean(onReopen) && h.alert_id != null && isCloseKind(h) && !reverted && HANDLED_REOPENABLE.has(h.status ?? "");
+  // "open" means live in the queue right now — the only state with a card to
+  // jump to (an acked or snoozed alert has none).
+  const stillOpen = h.alert_id != null && h.status === "open" && !isCloseKind(h);
+  const proofHref = handledProofHref(h);
+  const alsoLine = handledAlsoLine(row);
+  return (
+    <div className="py-2 flex items-start justify-between gap-3">
+      <div className="min-w-0">
+        <p className={`text-xs leading-snug ${reverted ? "line-through text-fg-subtle" : "text-fg-muted"}`}>
+          {handledSentence(h)}
+        </p>
+        <p className="mt-0.5 text-[10px] text-fg-subtle flex flex-wrap items-center gap-x-1.5">
+          {alsoLine && <span>{alsoLine}</span>}
+          {alsoLine && <span aria-hidden="true">·</span>}
+          <span>{ageLabel(h.at)} ago</span>
+          {proofHref && <HandledTrailerLink href={proofHref} label={h.evidence_ref || "evidence"} />}
+          {h.kind === "drafted" && <HandledTrailerLink href="/artifacts" label="read the draft" />}
+          {(h.kind === "watching" || h.kind === "stopped_watching") && (
+            <HandledTrailerLink href="/watchlist" label="watchlist" />
+          )}
+          {reverted && (
+            <>
+              <span aria-hidden="true">·</span>
+              <span className="text-sky-300">Reopened</span>
+            </>
+          )}
+        </p>
+      </div>
+      {canUndo && (
+        <button
+          type="button"
+          onClick={() => onReopen?.(handledKey(h), h.alert_id as number)}
+          className="flex-shrink-0 text-[11px] text-fg-muted hover:text-indigo-300 transition-colors"
+        >
+          ↶ Undo
+        </button>
+      )}
+      {stillOpen && (
+        <button
+          type="button"
+          onClick={() => scrollToAlertCard(h.alert_id as number)}
+          className="flex-shrink-0 text-[11px] text-fg-muted hover:text-indigo-300 transition-colors"
+          title="Jump to it in your queue"
+        >
+          still open ↓
+        </button>
+      )}
+    </div>
+  );
+}
+
+const HANDLED_DETAILS_ID = "sec-handled-details";
 
 function HandledOvernightPanel({
   items,
@@ -1506,43 +1617,43 @@ function HandledOvernightPanel({
   onReopen?: (rowKey: string, alertId: number) => void;
   undone: Set<string>;
 }) {
-  if (items.length === 0) return null;
+  const [open, setOpen] = useState(false);
+  // The rail is rebuilt from the audit log on every fetch, so a close the
+  // principal already undid still has its row: `status === "open"` (server
+  // truth after a reload) or the in-session set marks it reverted.
+  const reverted = (h: HandledItem) => isCloseKind(h) && (h.status === "open" || undone.has(handledKey(h)));
+
+  // Guard on the grouped rows, not the raw items: a merge folded into a
+  // listed survivor leaves no row of its own.
+  const rows = groupHandled(items);
+  if (rows.length === 0) return null;
+
   return (
-    <section id={SECTION_IDS.handled} className="rounded-xl border border-line bg-surface-elevated p-4">
-      <div className="flex items-center gap-1.5 mb-1">
-        <SectionHeading title="Handled overnight" count={items.length} icon="check" />
+    <section id={SECTION_IDS.handled} className="rounded-xl border border-line bg-surface-elevated px-4 py-2.5">
+      <div className="flex items-start gap-1.5">
+        <p className="min-w-0 flex-1 text-sm text-fg">{handledHeadline(rows, reverted)}</p>
         <InfoTip align="left">
-          Moves the Executive made on its own while reviewing open alerts —
-          each one audited with its evidence. Undo brings an item back to
-          your queue.
+          Moves I completed on my own since your last delivered brief — routed,
+          chased, escalated, drafted, folded, or closed with cited evidence.
+          Rewrites of open alerts show on the card itself, not here. Undo puts a
+          closed item back in your queue.
         </InfoTip>
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          aria-controls={HANDLED_DETAILS_ID}
+          className="flex-shrink-0 mt-0.5 text-[11px] text-fg-muted hover:text-fg transition-colors"
+        >
+          {open ? "hide" : "details"} <span aria-hidden="true">{open ? "▾" : "▸"}</span>
+        </button>
       </div>
-      <div className="max-h-[24rem] overflow-y-auto pr-1 divide-y divide-line">
-        {items.map((h) => {
-          const rowKey = handledKey(h);
-          const canUndo = onReopen && h.alert_id != null && (h.kind === "closed" || h.kind === "merged");
-          const isUndone = undone.has(rowKey);
-          return (
-            <div key={rowKey} className="py-2 flex items-start justify-between gap-2">
-              <div className="min-w-0">
-                <span className="mr-1.5 inline-block px-1.5 py-0.5 rounded border text-[10px] text-sky-300 border-sky-500/30">
-                  {HANDLED_KIND_LABEL[h.kind] ?? h.kind}
-                </span>
-                <span className={`text-xs ${isUndone ? "line-through text-fg-subtle" : "text-fg-muted"}`}>{h.summary}</span>
-                <span className="ml-1.5 text-[10px] text-fg-subtle">{ageLabel(h.at)} ago</span>
-              </div>
-              {canUndo && !isUndone && (
-                <button
-                  type="button"
-                  onClick={() => onReopen(rowKey, h.alert_id as number)}
-                  className="flex-shrink-0 text-[11px] text-fg-muted hover:text-indigo-300 transition-colors"
-                >
-                  ↶ Undo
-                </button>
-              )}
-            </div>
-          );
-        })}
+      {/* Always in the DOM so aria-controls resolves while collapsed. */}
+      <div id={HANDLED_DETAILS_ID} hidden={!open} className="mt-1.5 divide-y divide-line border-t border-line">
+        {open &&
+          rows.map((row) => (
+            <HandledRowView key={handledKey(row.item)} row={row} reverted={reverted(row.item)} onReopen={onReopen} />
+          ))}
       </div>
     </section>
   );
@@ -1678,7 +1789,7 @@ export default function Briefing({ onContinue, showHeader = false, firstName }: 
     }
   }, [refreshToday]);
 
-  // Undo an autonomous close from the "Handled overnight" rail. The rail is
+  // Undo an autonomous close from the handled rail (HandledOvernightPanel). The rail is
   // rebuilt from the audit log on every fetch (the "closed" row persists after
   // a reopen), so a 409 "already open" after a reload counts as done.
   const handleReopen = useCallback(async (rowKey: string, alertId: number) => {
@@ -1822,7 +1933,7 @@ export default function Briefing({ onContinue, showHeader = false, firstName }: 
   const statPills: StatPill[] = today
     ? briefingStats({
         needsYou: mineProposals.length,
-        handledOvernight: handledOvernight.length,
+        handledOvernight: groupHandled(handledOvernight).length,
         peopleOverdue,
         peopleNeedReply,
         deptAtRisk: deptAtRiskCount,

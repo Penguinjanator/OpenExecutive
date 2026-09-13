@@ -90,3 +90,39 @@ def test_render_context_mentions_pending_watch_suggestions_once() -> None:
     assert "WATCH SUGGESTIONS WAITING: 2 sources" in text and "/watchlist" in text
     quiet = render_briefing_context(period_label="p", today_data=_today(), activity=[], since=since)
     assert "WATCH SUGGESTIONS" not in quiet
+
+
+def test_render_context_lists_rewritten_open_items_separately_from_handled() -> None:
+    since = datetime.now(UTC) - timedelta(hours=24)
+    today = _today()
+    reviewed = (datetime.now(UTC) - timedelta(hours=3)).isoformat()
+    # A carried item the review rewrote inside the window: still open, so it
+    # must surface as "what changed", never under HANDLED.
+    today["proposals"].append(_proposal(
+        4, hours_ago=70, review_verdict="changed",
+        review_note="payouts now delayed for 7 merchants", last_reviewed_at=reviewed,
+    ))
+    handled = [{"kind": "closed", "summary": "Resolved 'Stripe incident' — vendor marked resolved",
+                "at": "2026-09-11T07:00:00+00:00"}]
+    text = render_briefing_context(
+        period_label="2026-09-11", today_data=today, activity=[], since=since, handled=handled,
+    )
+    assert "REWRITTEN BY THE EXECUTIVE SINCE LAST BRIEF" in text
+    assert "- item 4 — payouts now delayed for 7 merchants" in text
+    # Listed exactly once, under REWRITTEN — not re-listed as new or carried.
+    assert text.count("item 4") == 1
+    assert text.index("REWRITTEN BY THE EXECUTIVE") < text.index("HANDLED OVERNIGHT BY THE EXECUTIVE")
+    # Rewritten items are still carried-over for the count.
+    assert "CARRIED OVER: 3 older item(s)" in text
+
+
+def test_eod_context_lists_rewritten_open_items() -> None:
+    since = datetime.now(UTC) - timedelta(hours=24)
+    today = _today()
+    today["proposals"].append(_proposal(
+        4, hours_ago=70, review_verdict="changed", review_note="two offers now expiring Friday",
+        last_reviewed_at=(datetime.now(UTC) - timedelta(hours=3)).isoformat(),
+    ))
+    text = _render_eod_context(period_label="p", today_data=today, activity=[], since=since)
+    assert "REWRITTEN BY THE EXECUTIVE TODAY" in text
+    assert "- item 4 — two offers now expiring Friday" in text

@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -52,14 +53,29 @@ REVIEW_EVENT_TYPES: tuple[str, ...] = (
     "alert_review_changed",
 )
 
+# Review events that are bookkeeping on a still-open alert, not a completed
+# move. A `changed` verdict rewrites the card's text in place — the alert
+# stays in "Needs you" and the card itself shows the note — so listing it
+# under "handled" double-reports it and mislabels it as done. It renders in
+# the brief's REWRITTEN block instead (see rewritten_since).
+_NOT_HANDLED_EVENT_TYPES: frozenset[str] = frozenset({"alert_review_changed"})
+
 # Every audit event type the handled block reads, mapped to the short kind
 # the brief and the /today rail render. The research watch policy's
 # autonomous moves ride alongside the alert review's.
 HANDLED_EVENT_KINDS: dict[str, str] = {
-    **{t: t.removeprefix("alert_review_") for t in REVIEW_EVENT_TYPES},
+    **{
+        t: t.removeprefix("alert_review_")
+        for t in REVIEW_EVENT_TYPES
+        if t not in _NOT_HANDLED_EVENT_TYPES
+    },
     "watchlist_research_added": "watching",
     "watchlist_auto_disabled": "stopped_watching",
 }
+
+# The nudge audit summary opens with "[alert N] " so `alerts.review` can count
+# delivered nudges per alert with a text query; it is bookkeeping, not prose.
+_ALERT_MARKER_RE = re.compile(r"^\[alert \d+\]\s*")
 
 
 def scope_for(kind: str) -> str:
@@ -121,11 +137,50 @@ def split_proposals(
     return new, carried
 
 
-def handled_since(since: datetime, limit: int = 20) -> list[dict[str, Any]]:
-    """Autonomous alert-review moves recorded in the audit log since ``since``.
+def rewritten_since(
+    proposals: list[dict[str, Any]], since: datetime | None
+) -> list[dict[str, Any]]:
+    """Open proposals the review rewrote (verdict ``changed``) at/after ``since``.
 
-    Each item: ``{"kind": event_type sans prefix, "summary": str, "at": iso,
-    "alert_id": int | None}``, newest first. Empty when the audit store is unavailable.
+    These are the alerts that dropped out of the handled block: still open,
+    text or severity refreshed by the Executive. The brief reports them under
+    "what changed", never as done. Empty when ``since`` is None.
+    """
+    if since is None:
+        return []
+    out: list[dict[str, Any]] = []
+    for p in proposals:
+        if p.get("review_verdict") != "changed":
+            continue
+        # Fail open like split_proposals: a rewrite with no readable stamp is
+        # reported rather than dropped from every block.
+        reviewed = parse_aware(p.get("last_reviewed_at"))
+        if reviewed is None or reviewed >= since:
+            out.append(p)
+    return out
+
+
+def rewritten_lines(
+    proposals: list[dict[str, Any]], since: datetime | None, limit: int = 10
+) -> list[str]:
+    """Bullet lines for the briefs' REWRITTEN block (one per rewritten open
+    proposal): ``- <headline> — <review note>``. Shared by the morning brief
+    and the end-of-day digest so the two never drift."""
+    return [
+        f"- {str(p.get('headline', ''))[:160]} — {str(p.get('review_note', ''))[:120]}"
+        for p in rewritten_since(proposals, since)[:limit]
+    ]
+
+
+def handled_since(since: datetime, limit: int = 20) -> list[dict[str, Any]]:
+    """Completed autonomous moves recorded in the audit log since ``since``.
+
+    Each item: ``{"kind": event_type sans prefix, "event_type": str,
+    "summary": str, "at": iso, "alert_id": int | None, "details": dict}``,
+    newest first. ``summary`` has the nudge bookkeeping marker stripped;
+    ``details`` is the audit row's structured payload (headline, target
+    person, evidence ref, new status …) for callers that render more than
+    one line. Empty when the audit store is unavailable.
     """
     try:
         from openexecutive.audit.logger import get_audit_logger
@@ -137,9 +192,11 @@ def handled_since(since: datetime, limit: int = 20) -> list[dict[str, Any]]:
                 details = ev.details if isinstance(ev.details, dict) else {}
                 out.append({
                     "kind": kind,
-                    "summary": ev.summary,
+                    "event_type": event_type,
+                    "summary": _ALERT_MARKER_RE.sub("", ev.summary or ""),
                     "at": ev.ts,
                     "alert_id": details.get("alert_id"),
+                    "details": details,
                 })
         out.sort(key=lambda e: e["at"], reverse=True)
         return out[:limit]
@@ -161,13 +218,21 @@ def build_brief_fingerprint(
     tomorrow (activity is keyed by kind + summary, never by its stamp)."""
     new, carried = split_proposals(today_data.get("proposals", []), since)
     payload = {
-        "new": sorted(int(p.get("alert_id", 0)) for p in new),
-        "carried": sorted(int(p.get("alert_id", 0)) for p in carried),
+        "new": sorted(int(p.get("alert_id") or 0) for p in new),
+        "carried": sorted(int(p.get("alert_id") or 0) for p in carried),
         "likely_stale": sum(1 for p in carried if p.get("review_verdict") == "likely_stale"),
         "activity": sorted(
             (str(a.get("kind", "")), str(a.get("summary", ""))[:80]) for a in activity
         ),
         "handled": sorted((h["kind"], h["summary"][:80]) for h in handled),
+        # A rewrite alone must still un-suppress the brief now that it no
+        # longer rides in `handled` (keyed on the note, never the stamp). Same
+        # list the REWRITTEN block renders: carried items only — a new item
+        # already moves the fingerprint by id.
+        "rewritten": sorted(
+            (int(p.get("alert_id") or 0), str(p.get("review_note", ""))[:80])
+            for p in rewritten_since(carried, since)
+        ),
         "depts": sorted(
             (d.get("slug", ""), d.get("at_risk_count", 0), d.get("off_track_count", 0))
             for d in today_data.get("departments", [])
@@ -218,6 +283,8 @@ __all__ = [
     "last_delivered",
     "pending_watch_suggestions",
     "record_delivered",
+    "rewritten_lines",
+    "rewritten_since",
     "scope_for",
     "since_for",
     "split_proposals",

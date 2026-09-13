@@ -578,6 +578,16 @@ class _MoveContext:
             and self.summary.moves_used < self.settings.max_moves_per_scan
         )
 
+    def person_label(self, person_id: int) -> str:
+        """Roster name for an audit summary; ``person <id>`` when unknown."""
+        for p in self.evidence.get("roster") or []:
+            try:
+                if int(p["id"]) == person_id and p.get("name"):
+                    return str(p["name"])
+            except (KeyError, TypeError, ValueError):
+                continue
+        return f"person {person_id}"
+
 
 def _close_or_annotate(ctx: _MoveContext) -> str:
     """resolved / stale: close only on high confidence with named evidence,
@@ -665,7 +675,8 @@ def _apply_merge(ctx: _MoveContext) -> bool:
         recommended_move="merge", reviewed_at=ctx.now.isoformat(), db_path=ctx.db_path,
     )
     _audit(EVENT_MERGED, f"Merged '{alert.headline[:80]}' into '{survivor.headline[:80]}'",
-           {**ctx.base_details, "superseded_by_alert_id": survivor.id})
+           {**ctx.base_details, "superseded_by_alert_id": survivor.id,
+            "superseded_by_headline": survivor.headline[:160]})
     ctx.summary.merged += 1
     return True
 
@@ -722,8 +733,10 @@ async def _apply_route(ctx: _MoveContext) -> None:
         ctx.summary.routed += 1
         ctx.move_taken = "route"
         ctx.label = "routed"
-        _audit(EVENT_ROUTED, f"Routed '{alert.headline[:80]}' to person {target} ({detail})",
-               {**ctx.base_details, "target_person_id": target, "detail": detail, "proposed": proposed})
+        who = ctx.person_label(target)
+        _audit(EVENT_ROUTED, f"Routed '{alert.headline[:80]}' to {who} ({detail})",
+               {**ctx.base_details, "target_person_id": target, "target_person_name": who,
+                "detail": detail, "proposed": proposed})
     else:
         _audit(EVENT_REVIEWED, f"Route attempt failed for '{alert.headline[:80]}': {detail}",
                {**ctx.base_details, "target_person_id": target, "error": detail})
@@ -746,8 +759,10 @@ async def _apply_nudge(ctx: _MoveContext) -> None:
     if ok:
         ctx.summary.nudged += 1
         ctx.move_taken = "nudge"
-        _audit(EVENT_NUDGED, f"[alert {ctx.alert_id}] Nudged person {target} about '{alert.headline[:80]}'",
-               {**ctx.base_details, "target_person_id": target, "detail": detail})
+        who = ctx.person_label(target)
+        _audit(EVENT_NUDGED, f"[alert {ctx.alert_id}] Nudged {who} about '{alert.headline[:80]}'",
+               {**ctx.base_details, "target_person_id": target, "target_person_name": who,
+                "detail": detail})
 
 
 async def _apply_escalate(ctx: _MoveContext) -> None:
