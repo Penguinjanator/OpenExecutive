@@ -1281,8 +1281,9 @@ today:
     close renders "Reopened" rather than a second Undo). The UI's handled
     rail is first-person and count-based ("Since your last brief: N off your
     plate, N in others' hands, N waiting on you", plus drafts ready /
-    workflows suggested / watch changes / reopened by you when present)
-    shown as ONE line by default, rows behind a "details" disclosure (escalations first, one row
+    workflows suggested / watch changes / other moves / back on your plate
+    when present) shown as ONE sentence by default (logic in
+    `packages/ui/src/lib/handled.ts`, tested by `npm test`), rows behind a "details" disclosure (escalations first, one row
     per alert, each linking its evidence to `/audit?event_type=…&q=…` and a
     still-open row to `#alert-<id>`; Undo → `POST /alerts/{id}/reopen`),
     nothing rendered when empty. The "Executive handled N overnight" status
