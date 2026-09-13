@@ -104,6 +104,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ranking and is shown to the review as evidence.
 
 ### Changed
+- **"Handled overnight" now says what the Executive actually did, and says
+  it with some pride.** The briefing rail no longer lists the review's
+  `changed` verdict (an "Updated '<old headline>' — …" row): that rewrite
+  leaves the alert open in "Needs you", where the card already shows the
+  note, so the row double-reported it and called it done. Rewritten items
+  now render in the morning brief and end-of-day digest as a REWRITTEN block
+  under "what changed" (`brief_state.rewritten_since`), and a rewrite alone
+  still un-suppresses the brief. Each remaining `/today.handled_overnight`
+  row is structured (headline, target, detail, outcome, evidence_ref,
+  event_type, and the alert's `status` now) instead of one truncated
+  sentence; routed / nudged audit summaries name the person rather than
+  "person 12", and the nudge bookkeeping marker is stripped for display.
+  The rail reads first-person: a count-only heading ("Since your last
+  brief: N off your plate, N in others' hands, N waiting on you"),
+  escalations first, one row per alert ("Resolved *X* — evidence",
+  "Dismissed *X* as stale — …", "Handed *X* to Dana Kim", "Chased Dana Kim
+  on *X*"), five rows before "Show more", every row linking its evidence to
+  a pre-filtered `/audit` (the audit page now reads `event_type` / `q` from
+  the query string) and a still-open row jumping to its card. Undo is only
+  offered while the close still stands; a close already undone shows
+  "Reopened" after a reload. A quiet night renders one honest line instead
+  of nothing.
 - **Specialists are told what departments watch.** The research context
   every specialist receives now carries a `DEPARTMENT WATCH INTERESTS`
   block (each department's watched entities), and the grounding rule

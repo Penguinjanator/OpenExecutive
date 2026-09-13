@@ -312,7 +312,10 @@ def test_route_in_auto_execute_department_assigns_and_dms(db: Path, audit_events
     assert row.recommended_move == "route" and row.review_verdict == "routed"
     assert dms == [(dana, "Dana — can you own the Acme renewal pricing by Friday?")]
     assert summary.routed == 1 and summary.moves_used == 1
-    assert any(e[0] == review.EVENT_ROUTED and e[2]["target_person_id"] == dana for e in audit_events)
+    routed = next(e for e in audit_events if e[0] == review.EVENT_ROUTED)
+    # The rail and the brief read this summary: a name, never a bare person id.
+    assert routed[1] == "Routed 'Renewal pricing question' to Dana (sent)"
+    assert routed[2]["target_person_id"] == dana and routed[2]["target_person_name"] == "Dana"
 
 
 def test_route_in_propose_only_department_proposes_instead_of_dm(db: Path, audit_events, dms, monkeypatch) -> None:
@@ -375,7 +378,8 @@ def test_nudge_respects_cap_and_records_marker(db: Path, audit_events, dms, monk
     _apply(db, aid, _verdict(aid, recommended_move="nudge", message="Gentle ping"), summary=summary)
     assert dms == [(dana, "Gentle ping")] and summary.nudged == 1
     nudged = next(e for e in audit_events if e[0] == review.EVENT_NUDGED)
-    assert nudged[1].startswith(f"[alert {aid}]")
+    assert nudged[1] == f"[alert {aid}] Nudged Dana about 'Waiting on Dana'"
+    assert nudged[2]["target_person_name"] == "Dana"
     # At the cap: no DM, audited as capped.
     monkeypatch.setattr(review, "_nudges_so_far", lambda alert_id: 3)
     _apply(db, aid, _verdict(aid, recommended_move="nudge", message="again"), summary=summary)
@@ -456,6 +460,9 @@ def test_merge_supersedes_only_into_a_shown_live_survivor(db: Path, audit_events
     s = alert_store.get_alert(survivor, db_path=db)
     assert d is not None and d.status == "dismissed" and d.superseded_by_alert_id == survivor
     assert s is not None and s.occurrence_count == 4 and summary.merged == 1  # absorbs the dup's count
+    merged = next(e for e in audit_events if e[0] == review.EVENT_MERGED)
+    assert merged[2]["superseded_by_alert_id"] == survivor
+    assert merged[2]["superseded_by_headline"] == "Story"  # lets the rail collapse the pair
 
     # Not shown to the model (no shared tag / source) → refused, even if live.
     unrelated = _insert(db, "unrelated", hours_ago=1, source="email", topic_tags=["hiring"])

@@ -156,23 +156,96 @@ class ProposalItem(BaseModel):
     suggested_workflow: str = ""
 
 
+def _as_int(raw: Any) -> int | None:
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _alert_status_now(alert_id: int | None) -> str:
+    """Current lifecycle state of the alert a handled row touched."""
+    if alert_id is None:
+        return ""
+    try:
+        from openexecutive.alerts.store import get_alert
+
+        alert = get_alert(alert_id)
+    except Exception:
+        logger.debug("today: alert status lookup failed for %s", alert_id, exc_info=True)
+        return ""
+    if alert is None:
+        return ""
+    if alert.superseded_by_alert_id is not None:
+        return "merged"
+    if alert.status in {"resolved", "dismissed", "expired"}:
+        return alert.status
+    return "open"
+
+
+# Which audit-details keys fill a handled row's `target` and `detail`, per
+# kind. `headline` defaults to the alert headline; watch rows use the slug.
+_HANDLED_TARGET_KEY: dict[str, str] = {
+    "routed": "target_person_name",
+    "nudged": "target_person_name",
+    "escalated": "new_severity",
+    "drafted": "draft_title",
+    "merged": "superseded_by_headline",
+    "suggested_workflow": "workflow_name",
+}
+_HANDLED_DETAIL_KEYS: dict[str, tuple[str, ...]] = {
+    "closed": ("evidence",),
+    "escalated": ("evidence",),
+    "watching": ("rationale", "reason"),
+    "stopped_watching": ("rationale", "reason"),
+}
+_WATCH_KINDS = frozenset({"watching", "stopped_watching"})
+
+
+def _handled_outcome(kind: str, details: dict[str, Any]) -> str:
+    """resolved | dismissed for a close, proposed for a gated route, else ''."""
+    if kind == "closed":
+        return str(details.get("new_status") or "")
+    if kind == "routed" and details.get("proposed"):
+        return "proposed"
+    return ""
+
+
+def _handled_item(h: dict[str, Any]) -> HandledItem:
+    """One structured rail row from a `brief_state.handled_since` entry."""
+    kind = str(h["kind"])
+    raw_details = h.get("details")
+    details: dict[str, Any] = raw_details if isinstance(raw_details, dict) else {}
+    alert_id = _as_int(h.get("alert_id"))
+    headline = details.get("slug") if kind in _WATCH_KINDS else details.get("headline")
+    target_key = _HANDLED_TARGET_KEY.get(kind)
+    target = details.get(target_key) if target_key else None
+    detail = next(
+        (str(details[k]) for k in _HANDLED_DETAIL_KEYS.get(kind, ()) if details.get(k)), ""
+    )
+    return HandledItem(
+        kind=kind,
+        summary=str(h["summary"]),
+        at=str(h["at"]),
+        alert_id=alert_id,
+        event_type=str(h.get("event_type") or ""),
+        headline=str(headline) if headline else None,
+        target=str(target) if target else None,
+        detail=detail,
+        outcome=_handled_outcome(kind, details),
+        evidence_ref=str(details.get("evidence_ref") or ""),
+        superseded_by_alert_id=_as_int(details.get("superseded_by_alert_id")),
+        status=_alert_status_now(alert_id),
+    )
+
+
 def _handled_overnight(now: datetime) -> list[HandledItem]:
-    """What the alert review did since the last delivered morning brief."""
+    """What the alert review completed since the last delivered morning brief."""
     try:
         from openexecutive.briefing import brief_state
 
         since = brief_state.since_for("principal_brief_morning", now=now)
-        items: list[HandledItem] = []
-        for h in brief_state.handled_since(since, limit=20):
-            raw_id = h.get("alert_id")
-            try:
-                alert_id = int(raw_id) if raw_id is not None else None
-            except (TypeError, ValueError):
-                alert_id = None
-            items.append(HandledItem(
-                kind=str(h["kind"]), summary=str(h["summary"]), at=str(h["at"]), alert_id=alert_id,
-            ))
-        return items
+        return [_handled_item(h) for h in brief_state.handled_since(since, limit=20)]
     except Exception:
         logger.debug("today: handled_overnight unavailable", exc_info=True)
         return []
@@ -267,6 +340,34 @@ class HandledItem(BaseModel):
     # The alert the move touched, when known — lets the UI offer Undo
     # (POST /alerts/{id}/reopen) right next to the "handled" row.
     alert_id: int | None = None
+    # Structured view of the same audit row so the rail can render "who /
+    # what / why" instead of one truncated sentence. All additive; `summary`
+    # stays the fallback line.
+    # Raw audit event type, for a pre-filtered /audit deep link.
+    event_type: str = ""
+    # The alert's headline when the move was made (a watch's slug for the
+    # watching / stopped_watching kinds).
+    headline: str | None = None
+    # Who or what the move went to: a person's name (routed / nudged), the
+    # survivor headline (merged), the new severity (escalated), the draft
+    # title (drafted) or the workflow name (suggested_workflow).
+    target: str | None = None
+    # The "why": the cited evidence (closed / escalated) or the watch
+    # policy's reason (watching / stopped_watching).
+    detail: str = ""
+    # Finer than `kind`: "resolved" | "dismissed" for a close (a dismissal is
+    # a judgment call and must read differently), "proposed" for a route
+    # that went through the authority gate instead of a DM, else "".
+    outcome: str = ""
+    # Server-minted evidence ref a close cited (S1 / R2 / A3), else "".
+    evidence_ref: str = ""
+    # The survivor a merge folded this alert into, for collapsing the pair.
+    superseded_by_alert_id: int | None = None
+    # The alert's status NOW ("open" | "resolved" | "dismissed" | "expired" |
+    # "merged"), "" when there is no alert. The rail is rebuilt from the audit
+    # log on every fetch, so this is what tells the UI a close was already
+    # undone (offer "Reopened", not another Undo).
+    status: str = ""
 
 
 class TodayResponse(BaseModel):

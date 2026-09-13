@@ -118,7 +118,7 @@ def _render_eod_context(
             parts.append("")
     else:
         from openexecutive.alerts.lifecycle import parse_aware
-        from openexecutive.briefing.brief_state import split_proposals
+        from openexecutive.briefing.brief_state import rewritten_lines, split_proposals
 
         new_items, carried = split_proposals(proposals, since)
         if new_items:
@@ -138,6 +138,14 @@ def _render_eod_context(
             if stale:
                 line += f", {stale} flagged likely stale"
             parts.append(line + ") — see /today")
+            parts.append("")
+        rewritten = rewritten_lines(carried, since)
+        if rewritten:
+            parts.append(
+                "REWRITTEN BY THE EXECUTIVE TODAY (still open — mention under "
+                "\"Still pending\", never as done):"
+            )
+            parts.extend(rewritten)
             parts.append("")
 
     depts = today_data.get("departments", [])

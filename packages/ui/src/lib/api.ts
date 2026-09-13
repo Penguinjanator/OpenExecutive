@@ -2549,6 +2549,18 @@ export interface HandledItem {
   summary: string;
   at: string;
   alert_id?: number | null;
+  // Structured view of the audit row (all additive; `summary` is the fallback).
+  event_type?: string;
+  headline?: string | null;
+  target?: string | null;
+  detail?: string;
+  // "resolved" | "dismissed" for a close, "proposed" for a gated route, else "".
+  outcome?: string;
+  evidence_ref?: string;
+  superseded_by_alert_id?: number | null;
+  // The alert's status NOW: "open" | "resolved" | "dismissed" | "expired" |
+  // "merged" | "" — "open" on a closed row means the close was already undone.
+  status?: string;
 }
 
 export interface InFlightItem {

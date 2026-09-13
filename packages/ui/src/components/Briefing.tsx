@@ -958,7 +958,7 @@ function ProposalCard({
     <div>{content}</div>
   );
   return (
-    <div className={`group py-3 hover:bg-surface-overlay/30 transition-colors${rowAccent}`}>
+    <div id={`alert-${proposal.alert_id}`} className={`group py-3 hover:bg-surface-overlay/30 transition-colors${rowAccent}`}>
       {contentArea}
       {/* Body expander — a sibling of the content area (never nested inside the
           Discuss click target, which HTML disallows) so a clamped long body can
@@ -1476,74 +1476,320 @@ function MonitoringPanel({
   );
 }
 
-// Handled overnight — what the Executive's alert review did on its own since
-// the last morning brief (routed, nudged, escalated, drafted, merged, closed,
-// updated). Every autonomous close is reversible here (Undo → reopen), which
-// is what makes the autonomy un-scary: visible, evidence-cited, one click back.
-const HANDLED_KIND_LABEL: Record<string, string> = {
-  closed: "Closed",
-  routed: "Routed",
-  nudged: "Nudged",
-  escalated: "Escalated",
-  drafted: "Drafted",
-  merged: "Merged",
-  suggested_workflow: "Suggested",
-  changed: "Updated",
+// Handled since your last brief — what the Executive's alert review COMPLETED
+// on its own since the last delivered morning brief (routed, nudged,
+// escalated, drafted, merged, closed) plus the research watch policy's
+// autonomous adds/drops. Rewrites of open alerts are deliberately absent:
+// the alert is still in "Needs you" and its card carries the note, so
+// listing it here would double-report it and call it done. Every autonomous
+// close is reversible here (Undo → reopen), which is what makes the autonomy
+// un-scary: visible, evidence-cited, one click back.
+//
+// Voice: first person, past tense, specific, nothing the audit row cannot
+// back. The heading counts three buckets and never interpolates names, so
+// it reads the same whether the roster lookup found "Dana Kim" or not.
+const HANDLED_VISIBLE = 5;
+
+// One table per kind: reading order (what needs the principal first, then
+// what they can undo, then what went to others, then transparency), the short
+// past-tense verb for the "also …" trailer, and whether the row is
+// transparency rather than accomplishment (folded behind "Show more").
+const HANDLED_KINDS: Record<string, { order: number; verb: string; quiet?: true }> = {
+  escalated: { order: 0, verb: "raised" },
+  closed: { order: 1, verb: "closed" },
+  merged: { order: 1, verb: "folded" },
+  routed: { order: 2, verb: "routed" },
+  nudged: { order: 2, verb: "chased" },
+  drafted: { order: 2, verb: "drafted" },
+  suggested_workflow: { order: 3, verb: "suggested a workflow", quiet: true },
+  watching: { order: 3, verb: "started watching" },
+  stopped_watching: { order: 3, verb: "stopped watching", quiet: true },
 };
+const handledOrder = (kind: string) => HANDLED_KINDS[kind]?.order ?? 4;
+const handledVerb = (kind: string) => HANDLED_KINDS[kind]?.verb ?? kind;
+const isQuietKind = (kind: string) => HANDLED_KINDS[kind]?.quiet === true;
 
 // Stable key for one handled row (an alert can appear twice in one pass —
-// e.g. updated then closed — so the alert id alone is not unique).
+// e.g. routed then closed — so the alert id alone is not unique).
 function handledKey(h: HandledItem): string {
   return `${h.kind}-${h.at}-${h.alert_id ?? ""}`;
 }
 
+function isCloseKind(h: HandledItem): boolean {
+  return h.kind === "closed" || h.kind === "merged";
+}
+
+// One visible row plus the other moves on the same alert folded under it.
+interface HandledRow {
+  item: HandledItem;
+  also: HandledItem[];
+  foldedIn: number;
+}
+
+// Collapse the newest-first list to one row per alert. A merge whose survivor
+// is also listed becomes a "duplicate folded in" count on the survivor. The
+// newest move wins the visible slot, except an escalation, which always
+// stays visible — the boast must never bury the row that needs the CEO.
+function groupHandled(items: HandledItem[]): HandledRow[] {
+  const listed = new Set(items.map((h) => h.alert_id).filter((id): id is number => id != null));
+  const foldedInto = new Map<number, number>();
+  const rest: HandledItem[] = [];
+  for (const h of items) {
+    const into = h.superseded_by_alert_id;
+    if (h.kind === "merged" && into != null && listed.has(into)) {
+      foldedInto.set(into, (foldedInto.get(into) ?? 0) + 1);
+    } else {
+      rest.push(h);
+    }
+  }
+  const byKey = new Map<string, HandledRow>();
+  const rows: HandledRow[] = [];
+  for (const h of rest) {
+    const key = h.alert_id != null ? `alert-${h.alert_id}` : handledKey(h);
+    const row = byKey.get(key);
+    if (!row) {
+      const fresh: HandledRow = {
+        item: h,
+        also: [],
+        foldedIn: h.alert_id != null ? foldedInto.get(h.alert_id) ?? 0 : 0,
+      };
+      byKey.set(key, fresh);
+      rows.push(fresh);
+    } else if (h.kind === "escalated" && row.item.kind !== "escalated") {
+      row.also.push(row.item);
+      row.item = h;
+    } else {
+      row.also.push(h);
+    }
+  }
+  // Stable sort keeps newest-first inside each bucket.
+  rows.sort((a, b) => handledOrder(a.item.kind) - handledOrder(b.item.kind));
+  return rows;
+}
+
+function joinClauses(parts: string[]): string {
+  if (parts.length <= 1) return parts.join("");
+  if (parts.length === 2) return `${parts[0]} and ${parts[1]}`;
+  return `${parts.slice(0, -1).join(", ")}, and ${parts[parts.length - 1]}`;
+}
+
+// "Since your last brief: 3 off your plate, 2 in others' hands, and 1 waiting
+// on you." Counts only — a name lookup that fell back to "person 12" can
+// never leak into the headline. A reverted close is back on the plate, so it
+// is not counted.
+function handledHeadline(rows: HandledRow[], reverted: (h: HandledItem) => boolean): string {
+  let offPlate = 0;
+  let others = 0;
+  let waiting = 0;
+  for (const r of rows) {
+    const k = r.item.kind;
+    if (k === "closed" && !reverted(r.item)) offPlate += 1;
+    else if (k === "routed" || k === "nudged") others += 1;
+    else if (k === "escalated") waiting += 1;
+  }
+  const parts: string[] = [];
+  if (offPlate > 0) parts.push(`${offPlate} off your plate`);
+  if (others > 0) parts.push(`${others} in others' hands`);
+  if (waiting > 0) parts.push(`${waiting} waiting on you`);
+  if (parts.length === 0) {
+    const n = rows.length;
+    return `Since your last brief: ${n} move${n === 1 ? "" : "s"} on my own.`;
+  }
+  return `Since your last brief: ${joinClauses(parts)}.`;
+}
+
+// First-person sentence for one row. Falls back to the audit summary when the
+// row predates the structured fields (no headline / target to compose from).
+function handledSentence(h: HandledItem): React.ReactNode {
+  const headline = h.headline ?? "";
+  const target = h.target ?? "";
+  const H = <span className="text-fg">{headline}</span>;
+  const T = <span className="text-fg">{target}</span>;
+  const why = h.detail ? <span className="text-fg-subtle"> — {h.detail}</span> : null;
+  if (!headline) return h.summary;
+  switch (h.kind) {
+    case "closed":
+      return h.outcome === "dismissed" ? <>Dismissed {H} as stale{why}</> : <>Resolved {H}{why}</>;
+    case "routed":
+      if (!target) return h.summary;
+      return h.outcome === "proposed"
+        ? <>Proposed {H} to {T} <span className="text-fg-subtle">(awaiting their approval)</span></>
+        : <>Handed {H} to {T}</>;
+    case "nudged":
+      return target ? <>Chased {T} on {H}</> : h.summary;
+    case "escalated":
+      return target ? <>Raised {H} to {T}{why}</> : <>Raised {H}{why}</>;
+    case "drafted":
+      return target ? <>Drafted {T} from {H}</> : h.summary;
+    case "merged":
+      return target ? <>Folded {H} into {T}</> : h.summary;
+    case "suggested_workflow":
+      return target ? <>Suggested running {T} on {H}</> : h.summary;
+    case "watching":
+      return <>Started watching {H}{why}</>;
+    case "stopped_watching":
+      return <>Stopped watching {H}{why}</>;
+    default:
+      return h.summary;
+  }
+}
+
+function scrollToAlertCard(alertId: number) {
+  document.getElementById(`alert-${alertId}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+// The audit page pre-filters on these two query params, so the row's
+// "evidence" link lands on the rows that back it.
+function handledProofHref(h: HandledItem): string | null {
+  if (!h.event_type) return null;
+  const q = (h.headline ?? "").slice(0, 40);
+  return `/audit?event_type=${encodeURIComponent(h.event_type)}&q=${encodeURIComponent(q)}`;
+}
+
+// Muted trailer under a collapsed row: duplicates folded in, other moves.
+function handledAlsoLine(row: HandledRow): string {
+  const parts: string[] = [];
+  if (row.foldedIn > 0) parts.push(`${row.foldedIn} duplicate${row.foldedIn === 1 ? "" : "s"} folded in`);
+  if (row.also.length > 0) parts.push(`also ${row.also.map((a) => handledVerb(a.kind)).join(", ")} earlier`);
+  return parts.join(" · ");
+}
+
+function HandledTrailerLink({ href, label }: { href: string; label: string }) {
+  return (
+    <>
+      <span aria-hidden="true">·</span>
+      <Link href={href} className="hover:text-indigo-300 transition-colors">{label}</Link>
+    </>
+  );
+}
+
+function HandledRowView({
+  row,
+  reverted,
+  onReopen,
+}: {
+  row: HandledRow;
+  reverted: boolean;
+  onReopen?: (rowKey: string, alertId: number) => void;
+}) {
+  const h = row.item;
+  const canUndo = Boolean(onReopen) && h.alert_id != null && isCloseKind(h) && !reverted;
+  const stillOpen = h.alert_id != null && h.status === "open" && !isCloseKind(h);
+  const proofHref = handledProofHref(h);
+  const alsoLine = handledAlsoLine(row);
+  return (
+    <div className="py-2 flex items-start justify-between gap-3">
+      <div className="min-w-0">
+        <p className={`text-xs leading-snug ${reverted ? "line-through text-fg-subtle" : "text-fg-muted"}`}>
+          {handledSentence(h)}
+        </p>
+        <p className="mt-0.5 text-[10px] text-fg-subtle flex flex-wrap items-center gap-x-1.5">
+          {alsoLine && <span>{alsoLine}</span>}
+          {alsoLine && <span aria-hidden="true">·</span>}
+          <span>{ageLabel(h.at)} ago</span>
+          {proofHref && <HandledTrailerLink href={proofHref} label={h.evidence_ref || "evidence"} />}
+          {h.kind === "drafted" && <HandledTrailerLink href="/artifacts" label="read the draft" />}
+          {(h.kind === "watching" || h.kind === "stopped_watching") && (
+            <HandledTrailerLink href="/watchlist" label="watchlist" />
+          )}
+          {reverted && (
+            <>
+              <span aria-hidden="true">·</span>
+              <span className="text-sky-300">Reopened</span>
+            </>
+          )}
+        </p>
+      </div>
+      {canUndo && (
+        <button
+          type="button"
+          onClick={() => onReopen?.(handledKey(h), h.alert_id as number)}
+          className="flex-shrink-0 text-[11px] text-fg-muted hover:text-indigo-300 transition-colors"
+        >
+          ↶ Undo
+        </button>
+      )}
+      {stillOpen && (
+        <button
+          type="button"
+          onClick={() => scrollToAlertCard(h.alert_id as number)}
+          className="flex-shrink-0 text-[11px] text-fg-muted hover:text-indigo-300 transition-colors"
+          title="Jump to it in your queue"
+        >
+          still open ↓
+        </button>
+      )}
+    </div>
+  );
+}
+
 function HandledOvernightPanel({
   items,
+  reviewedOpenCount,
   onReopen,
   undone,
 }: {
   items: HandledItem[];
+  // Open alerts the review re-read in the last day — the honest basis for
+  // the quiet-night line.
+  reviewedOpenCount: number;
   onReopen?: (rowKey: string, alertId: number) => void;
   undone: Set<string>;
 }) {
-  if (items.length === 0) return null;
+  const [showAll, setShowAll] = useState(false);
+  // The rail is rebuilt from the audit log on every fetch, so a close the
+  // principal already undid still has its row: `status === "open"` (server
+  // truth after a reload) or the in-session set marks it reverted.
+  const reverted = (h: HandledItem) => isCloseKind(h) && (h.status === "open" || undone.has(handledKey(h)));
+
+  if (items.length === 0) {
+    if (reviewedOpenCount === 0) return null;
+    return (
+      <section id={SECTION_IDS.handled} className="rounded-xl border border-line bg-surface-elevated px-4 py-3">
+        <p className="text-xs text-fg-muted">
+          Quiet night. I re-read {reviewedOpenCount} open alert{reviewedOpenCount === 1 ? "" : "s"} — none needed a move.
+        </p>
+      </section>
+    );
+  }
+
+  const rows = groupHandled(items);
+  const loud = rows.filter((r) => !isQuietKind(r.item.kind));
+  const quiet = rows.filter((r) => isQuietKind(r.item.kind));
+  const visible = showAll ? [...loud, ...quiet] : loud.slice(0, HANDLED_VISIBLE);
+  const hiddenCount = rows.length - visible.length;
+  const closesStanding = rows.filter((r) => r.item.kind === "closed" && !reverted(r.item)).length;
+
   return (
     <section id={SECTION_IDS.handled} className="rounded-xl border border-line bg-surface-elevated p-4">
-      <div className="flex items-center gap-1.5 mb-1">
-        <SectionHeading title="Handled overnight" count={items.length} icon="check" />
+      <div className="flex items-start gap-1.5 mb-2">
+        <p className="text-sm font-medium text-fg">{handledHeadline(rows, reverted)}</p>
         <InfoTip align="left">
-          Moves the Executive made on its own while reviewing open alerts —
-          each one audited with its evidence. Undo brings an item back to
-          your queue.
+          Moves I completed on my own since your last delivered brief — routed,
+          chased, escalated, drafted, folded, or closed with cited evidence.
+          Rewrites of open alerts show on the card itself, not here. Undo puts a
+          closed item back in your queue.
         </InfoTip>
       </div>
-      <div className="max-h-[24rem] overflow-y-auto pr-1 divide-y divide-line">
-        {items.map((h) => {
-          const rowKey = handledKey(h);
-          const canUndo = onReopen && h.alert_id != null && (h.kind === "closed" || h.kind === "merged");
-          const isUndone = undone.has(rowKey);
-          return (
-            <div key={rowKey} className="py-2 flex items-start justify-between gap-2">
-              <div className="min-w-0">
-                <span className="mr-1.5 inline-block px-1.5 py-0.5 rounded border text-[10px] text-sky-300 border-sky-500/30">
-                  {HANDLED_KIND_LABEL[h.kind] ?? h.kind}
-                </span>
-                <span className={`text-xs ${isUndone ? "line-through text-fg-subtle" : "text-fg-muted"}`}>{h.summary}</span>
-                <span className="ml-1.5 text-[10px] text-fg-subtle">{ageLabel(h.at)} ago</span>
-              </div>
-              {canUndo && !isUndone && (
-                <button
-                  type="button"
-                  onClick={() => onReopen(rowKey, h.alert_id as number)}
-                  className="flex-shrink-0 text-[11px] text-fg-muted hover:text-indigo-300 transition-colors"
-                >
-                  ↶ Undo
-                </button>
-              )}
-            </div>
-          );
-        })}
+      <div className="divide-y divide-line">
+        {visible.map((row) => (
+          <HandledRowView key={handledKey(row.item)} row={row} reverted={reverted(row.item)} onReopen={onReopen} />
+        ))}
       </div>
+      {(hiddenCount > 0 || showAll) && (
+        <button
+          type="button"
+          onClick={() => setShowAll((v) => !v)}
+          className="w-full pt-2 text-[11px] text-fg-muted hover:text-fg transition-colors"
+        >
+          {showAll ? "Show fewer" : `Show ${hiddenCount} more`}
+        </button>
+      )}
+      {closesStanding > 0 && (
+        <p className="mt-2 pt-2 border-t border-line text-[11px] text-fg-subtle">
+          {closesStanding} fewer card{closesStanding === 1 ? "" : "s"} in your queue since your last brief · every close cites its evidence.
+        </p>
+      )}
     </section>
   );
 }
@@ -1678,7 +1924,7 @@ export default function Briefing({ onContinue, showHeader = false, firstName }: 
     }
   }, [refreshToday]);
 
-  // Undo an autonomous close from the "Handled overnight" rail. The rail is
+  // Undo an autonomous close from the handled rail (HandledOvernightPanel). The rail is
   // rebuilt from the audit log on every fetch (the "closed" row persists after
   // a reopen), so a 409 "already open" after a reload counts as done.
   const handleReopen = useCallback(async (rowKey: string, alertId: number) => {
@@ -1801,6 +2047,13 @@ export default function Briefing({ onContinue, showHeader = false, firstName }: 
   const restProposals = mineProposals.slice(1);
   const staleNeedsYouIds = olderThan(mineProposals, NEEDS_YOU_DISMISS_OLDER_THAN_DAYS);
   const handledOvernight = today?.handled_overnight ?? [];
+  // Open alerts the review actually re-read in the last day — the honest
+  // basis for the quiet-night line (a verdict stamped three days ago is not
+  // "I read it last night").
+  const reviewedOpenCount = (today?.proposals ?? []).filter((p) => {
+    const t = Date.parse(p.last_reviewed_at ?? "");
+    return !Number.isNaN(t) && Date.now() - t < 24 * 60 * 60 * 1000;
+  }).length;
 
   // Status-strip inputs, all from data already computed above.
   const inFlightCount = today?.in_flight?.length ?? 0;
@@ -2219,6 +2472,7 @@ export default function Briefing({ onContinue, showHeader = false, firstName }: 
                   />
                   <HandledOvernightPanel
                     items={handledOvernight}
+                    reviewedOpenCount={reviewedOpenCount}
                     onReopen={handleReopen}
                     undone={undoneRows}
                   />

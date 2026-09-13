@@ -1,7 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { Fragment, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   getAuditLog,
@@ -157,16 +158,27 @@ function formatTimeOnly(ts: string): string {
   }
 }
 
+// Deep links (e.g. the briefing's "Handled" rail linking a move to its
+// evidence) pre-fill the type and text filters from the query string.
 export default function AuditPage() {
+  return (
+    <Suspense fallback={null}>
+      <AuditPageInner />
+    </Suspense>
+  );
+}
+
+function AuditPageInner() {
+  const searchParams = useSearchParams();
   const [items, setItems] = useState<AuditEvent[]>([]);
   const [total, setTotal] = useState(0);
   const [eventTypes, setEventTypes] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const [eventType, setEventType] = useState<string>("");
+  const [eventType, setEventType] = useState<string>(searchParams.get("event_type") ?? "");
   const [sessionId, setSessionId] = useState<string>("");
-  const [q, setQ] = useState<string>("");
+  const [q, setQ] = useState<string>(searchParams.get("q") ?? "");
   const [since, setSince] = useState<string>("");
   const [until, setUntil] = useState<string>("");
   const [offset, setOffset] = useState<number>(0);

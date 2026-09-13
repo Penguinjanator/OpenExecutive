@@ -1505,3 +1505,83 @@ def test_proposals_carry_lifecycle_fields_and_demote_likely_stale(
     s = by_headline["stale one"]
     assert s["review_verdict"] == "likely_stale"
     assert s["score"] < f["score"]
+
+
+def test_handled_overnight_rows_are_structured_and_track_current_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rail is rebuilt from audit rows: each carries the who / what / why the
+    audit row recorded, plus the alert's status NOW so an undone close renders
+    as reopened instead of offering a second Undo."""
+    from openexecutive.audit import logger as audit_logger
+    from openexecutive.briefing import brief_state
+
+    db = tmp_path / "today.db"
+    _setup_isolated_db(db, monkeypatch)
+    al = audit_logger.AuditLogger(db_path=tmp_path / "audit.db")
+    al.initialize_db()
+    monkeypatch.setattr(audit_logger, "get_audit_logger", lambda: al)
+    monkeypatch.setattr(brief_state, "since_for", lambda kind, now=None: datetime.now(UTC) - timedelta(hours=1))
+
+    def _alert(headline: str) -> int:
+        aid = alert_store.insert_alert(
+            source="triage", external_id=f"ext-{headline}", severity="medium",
+            headline=headline, body=headline,
+        )
+        assert aid is not None
+        return aid
+
+    closed_id = _alert("Stripe payouts delayed")
+    undone_id = _alert("Old webinar follow-up")
+    routed_id = _alert("Q3 pricing page copy stale")
+    survivor_id = _alert("Payout delay")
+    dup_id = _alert("Payout delay (duplicate)")
+    alert_store.set_status(closed_id, "resolved")
+    alert_store.set_status(undone_id, "dismissed")
+    alert_store.mark_superseded(dup_id, survivor_id)
+
+    al.log("alert_review_closed", "Resolved 'Stripe payouts delayed' — vendor confirmed", actor="executive",
+           details={"alert_id": closed_id, "headline": "Stripe payouts delayed", "new_status": "resolved",
+                    "evidence": "vendor status page confirmed the fix", "evidence_ref": "R2"})
+    al.log("alert_review_closed", "Dismissed as stale 'Old webinar follow-up' — no activity", actor="executive",
+           details={"alert_id": undone_id, "headline": "Old webinar follow-up", "new_status": "dismissed",
+                    "evidence": "no activity in 30 days", "evidence_ref": "A1"})
+    al.log("alert_review_routed", "Routed 'Q3 pricing page copy stale' to Dana Kim (proposal 9)",
+           actor="executive",
+           details={"alert_id": routed_id, "headline": "Q3 pricing page copy stale",
+                    "target_person_id": 3, "target_person_name": "Dana Kim", "proposed": True})
+    al.log("alert_review_merged", "Merged 'Payout delay (duplicate)' into 'Payout delay'", actor="executive",
+           details={"alert_id": dup_id, "headline": "Payout delay (duplicate)",
+                    "superseded_by_alert_id": survivor_id, "superseded_by_headline": "Payout delay"})
+    al.log("watchlist_research_added", "Started watching stock-acme — competitor ticker", actor="executive",
+           details={"slug": "stock-acme", "rationale": "competitor ticker named on Sales"})
+    al.log("alert_review_changed", "Updated 'Something' — rewritten", actor="executive",
+           details={"alert_id": routed_id, "headline": "Something"})
+    # The principal undid the dismissal after the review ran.
+    assert alert_store.reopen_alert(undone_id)
+
+    res = _make_client().get("/today")
+    assert res.status_code == 200
+    rows = {r["headline"]: r for r in res.json()["handled_overnight"]}
+    assert "Something" not in rows  # rewrites are not "handled"
+
+    closed = rows["Stripe payouts delayed"]
+    assert closed["kind"] == "closed" and closed["outcome"] == "resolved"
+    assert closed["detail"] == "vendor status page confirmed the fix"
+    assert closed["evidence_ref"] == "R2" and closed["event_type"] == "alert_review_closed"
+    assert closed["status"] == "resolved" and closed["alert_id"] == closed_id
+
+    undone = rows["Old webinar follow-up"]
+    assert undone["outcome"] == "dismissed" and undone["status"] == "open"
+
+    routed = rows["Q3 pricing page copy stale"]
+    assert routed["target"] == "Dana Kim" and routed["outcome"] == "proposed"
+    assert routed["status"] == "open"
+
+    merged = rows["Payout delay (duplicate)"]
+    assert merged["target"] == "Payout delay" and merged["superseded_by_alert_id"] == survivor_id
+    assert merged["status"] == "merged"
+
+    watching = rows["stock-acme"]
+    assert watching["kind"] == "watching" and watching["alert_id"] is None
+    assert watching["detail"] == "competitor ticker named on Sales" and watching["status"] == ""

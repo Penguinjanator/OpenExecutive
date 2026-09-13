@@ -158,3 +158,61 @@ def test_pending_watch_suggestions_counts_dry_run_research_rows(tmp_path: Path, 
                              mode="dry_run", origin="research_proposed", db_path=db)
     ms.insert_watchlist_item(slug="rss-b", signal_type="rss", target="https://b.com/f", db_path=db)
     assert brief_state.pending_watch_suggestions() == 1
+
+
+def test_handled_since_excludes_rewrites_and_strips_nudge_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openexecutive.audit import logger as audit_logger
+
+    al = audit_logger.AuditLogger(db_path=tmp_path / "audit.db")
+    al.initialize_db()
+    monkeypatch.setattr(audit_logger, "get_audit_logger", lambda: al)
+    # A rewrite leaves the alert open: it is not "handled" and must not be listed.
+    al.log("alert_review_changed", "Updated 'Old headline' — now 7 merchants", actor="executive",
+           details={"alert_id": 4, "headline": "Old headline"})
+    al.log("alert_review_nudged", "[alert 7] Nudged Dana Kim about 'Acme renewal'", actor="executive",
+           details={"alert_id": 7, "headline": "Acme renewal", "target_person_name": "Dana Kim"})
+
+    handled = brief_state.handled_since(datetime.now(UTC) - timedelta(hours=1))
+    assert [h["kind"] for h in handled] == ["nudged"]
+    row = handled[0]
+    assert row["summary"] == "Nudged Dana Kim about 'Acme renewal'"
+    assert row["event_type"] == "alert_review_nudged"
+    assert row["alert_id"] == 7
+    assert row["details"]["target_person_name"] == "Dana Kim"
+    assert "alert_review_changed" not in brief_state.HANDLED_EVENT_KINDS
+
+
+def test_rewritten_since_picks_changed_verdicts_reviewed_in_window() -> None:
+    since = datetime.now(UTC) - timedelta(hours=12)
+    inside = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    before = (datetime.now(UTC) - timedelta(hours=30)).isoformat()
+    proposals = [
+        {"alert_id": 1, "review_verdict": "changed", "last_reviewed_at": inside},
+        {"alert_id": 2, "review_verdict": "changed", "last_reviewed_at": before},
+        {"alert_id": 3, "review_verdict": "relevant", "last_reviewed_at": inside},
+        {"alert_id": 4, "review_verdict": "changed"},
+    ]
+    assert [p["alert_id"] for p in brief_state.rewritten_since(proposals, since)] == [1]
+    assert brief_state.rewritten_since(proposals, None) == []
+
+
+def test_fingerprint_moves_when_a_carried_item_is_rewritten() -> None:
+    since = datetime.now(UTC) - timedelta(hours=12)
+    old = _proposal(5, hours_ago=40)
+    base = dict(activity=[], handled=[], since=since)
+    fp_plain = brief_state.build_brief_fingerprint(
+        today_data={"proposals": [old], "departments": [], "people": []}, **base,
+    )
+    rewritten = {**old, "review_verdict": "changed", "review_note": "now 7 merchants",
+                 "last_reviewed_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()}
+    fp_rewritten = brief_state.build_brief_fingerprint(
+        today_data={"proposals": [rewritten], "departments": [], "people": []}, **base,
+    )
+    assert fp_plain != fp_rewritten
+    # Re-running with the same note (a later timestamp) is still the same brief.
+    again = {**rewritten, "last_reviewed_at": datetime.now(UTC).isoformat()}
+    assert brief_state.build_brief_fingerprint(
+        today_data={"proposals": [again], "departments": [], "people": []}, **base,
+    ) == fp_rewritten

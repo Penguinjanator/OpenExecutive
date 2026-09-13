@@ -45,9 +45,11 @@ STANDALONE_BRIEF_SYSTEM = (
     "  2. **What changed** — anything NEW since the last brief: a goal that "
     "flipped, a reply that landed, an external signal that moved. One bullet "
     "per item, terse.\n"
-    "  3. **Handled overnight** — what you already did on your own from the "
-    "HANDLED block (routed, nudged, drafted, closed with evidence). One "
-    "bullet each, past tense, naming the person or item.\n"
+    "  3. **Handled overnight** — what you already completed on your own from "
+    "the HANDLED block (routed, nudged, escalated, drafted, merged, closed "
+    "with evidence). One bullet each, past tense, naming the person or item. "
+    "Items under REWRITTEN are still open — they belong in 'What changed', "
+    "never here.\n"
     "  4. **Needs you** — ONLY the items under NEW SINCE LAST BRIEF, most "
     "time-sensitive first, each with its why-now when given. If the context "
     "has a CARRIED OVER line, add exactly one sentence after the list "
@@ -171,7 +173,7 @@ def render_briefing_context(
                 parts.append(f"- {p.get('headline', '')[:160]}")
             parts.append("")
     else:
-        from openexecutive.briefing.brief_state import split_proposals
+        from openexecutive.briefing.brief_state import rewritten_lines, split_proposals
 
         new_items, carried = split_proposals(proposals, since)
         if new_items:
@@ -192,6 +194,14 @@ def render_briefing_context(
             if stale:
                 line += f", {stale} flagged likely stale"
             parts.append(line + ") — see /today")
+            parts.append("")
+        rewritten = rewritten_lines(carried, since)
+        if rewritten:
+            parts.append(
+                "REWRITTEN BY THE EXECUTIVE SINCE LAST BRIEF (still open — mention under "
+                "\"What changed\", never as done):"
+            )
+            parts.extend(rewritten)
             parts.append("")
         if handled:
             parts.append("HANDLED OVERNIGHT BY THE EXECUTIVE (already done — report, don't ask):")
