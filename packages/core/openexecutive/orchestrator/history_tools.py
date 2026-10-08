@@ -104,7 +104,7 @@ def _keep_private(session: Any, person: Any) -> bool:
     private the same way and a follow-up restating a note stays private too
     (the lockdown, ``read_mail``, is this turn's alone). False
     when that can't be made so."""
-    from openexecutive.delegation.settings import turn_delegation
+    from openexecutive.delegation.settings import history_len, turn_delegation
     from openexecutive.memory.session_store import mark_mail_private
 
     pinned = turn_delegation(session)
@@ -115,7 +115,7 @@ def _keep_private(session: Any, person: Any) -> bool:
     if not session_id:
         return False
     try:
-        owner = mark_mail_private(str(session_id), person.id)
+        owner = mark_mail_private(str(session_id), person.id, history_len=history_len(session))
     except Exception:
         logger.exception("recall_history: couldn't mark the conversation private")
         return False

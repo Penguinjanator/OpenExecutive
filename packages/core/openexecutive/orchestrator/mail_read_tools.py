@@ -13,7 +13,8 @@ so they are fenced the same way:
 - **Private.** Before the first read each marks the turn as having read the
   owner's mail (``TurnDelegation.touched_mail`` and ``read_mail``): its audit rows are private,
   it teaches no memory, the conversation is theirs alone, and nothing that
-  reaches anyone else runs for the rest of the turn (``delegation.lockdown``).
+  opens a link, runs a script or workflow, or posts to everyone runs for the rest
+  of the turn (``delegation.lockdown``).
 - **Read-only.** Nothing is changed, labelled, drafted or sent.
 - **Capped per turn**: ``SEARCHES_PER_TURN`` searches, ``THREADS_PER_TURN``
   thread reads and ``ATTACHMENTS_PER_TURN`` attachment reads, each slot taken
@@ -243,6 +244,18 @@ def _sender(message: Any) -> str:
     return f"{name} <{message.from_addr}>" if name else message.from_addr
 
 
+def _note_senders(writer: Any, senders: list[str]) -> None:
+    """Remember who sent the mail this turn read, so a contact the speaker
+    asks to add may take one of these addresses (``mail_senders``)."""
+    from email.utils import parseaddr
+
+    for sender in senders:
+        name, address = parseaddr(str(sender or ""))
+        address = address.strip().lower()
+        if "@" in address:
+            writer.pinned.mail_senders[address] = name.strip()
+
+
 def _id_refusal(writer: Any, value: str, what: str) -> str | None:
     """Why ``value`` can't be one of their mailbox's ids (each mailbox has its
     own id shape, Gmail's or Outlook's), or None when it can."""
@@ -341,6 +354,7 @@ async def handle_search_my_email(tool_input: dict[str, Any]) -> str:
             ]
         else:
             threads = await _recent_inbox(writer.mailbox, days, limit)
+        _note_senders(writer, [t["from"] for t in threads])
         if not threads:
             return json.dumps({
                 "status": "not_found",
@@ -424,6 +438,7 @@ async def handle_read_my_email(tool_input: dict[str, Any]) -> str:
         shown = messages[-READ_MESSAGES:]
         first = len(messages) - len(shown) + 1
         _remember_read(writer, thread.id, messages[0])
+        _note_senders(writer, [_sender(m) for m in shown])
         return json.dumps({
             "status": "ok",
             "thread_id": thread.id,

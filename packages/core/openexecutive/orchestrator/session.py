@@ -11,6 +11,17 @@ if TYPE_CHECKING:
     from openexecutive.memory.workspace_settings import PrincipalRole
 
 
+def history_window_start(total: int, max_turns: int = 20, step_turns: int = 10) -> int:
+    """Index of the first of ``total`` history messages the model is shown
+    (``Session.get_recent_history``): the last ``max_turns`` turns, the start
+    moving in steps of ``step_turns``. Messages before it are out of view."""
+    keep = max_turns * 2
+    if total <= keep:
+        return 0
+    step = max(1, step_turns) * 2
+    return ((total - keep) // step) * step
+
+
 @dataclass
 class Session:
     session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -168,12 +179,7 @@ class Session:
         prompt cache (``orchestrator.executive._apply_history_cache_marker``)
         would miss and re-write the whole conversation each time.
         """
-        total = len(self.conversation_history)
-        keep = max_turns * 2
-        start = 0
-        if total > keep:
-            step = max(1, step_turns) * 2
-            start = ((total - keep) // step) * step
+        start = history_window_start(len(self.conversation_history), max_turns, step_turns)
         history = self.conversation_history[start:]
         # Anthropic requires messages to start with a user turn.
         # Drop a leading assistant message if history length is odd (can happen on error recovery).

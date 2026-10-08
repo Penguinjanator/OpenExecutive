@@ -550,11 +550,6 @@ def _solo_meeting_gate(class_mode: str, session: Any) -> GateDecision:
 
 async def handle_create_calendar_event(tool_input: dict[str, Any]) -> str:
     """Propose (or auto-execute when promoted) a calendar meeting."""
-    from openexecutive.delegation.lockdown import mail_touched_refusal
-
-    if (refused := mail_touched_refusal('create_calendar_event')) is not None:
-        return refused
-
     from openexecutive.config import get_settings
     from openexecutive.departments.authority import gate_action
     from openexecutive.memory.decision_ledger import (
@@ -781,11 +776,6 @@ async def handle_create_instant_meeting(tool_input: dict[str, Any]) -> str:
     max-attendees, principal-protection, and the daily booking cap, and records
     an executed row in the decision ledger for audit.
     """
-    from openexecutive.delegation.lockdown import mail_touched_refusal
-
-    if (refused := mail_touched_refusal('create_instant_meeting')) is not None:
-        return refused
-
     from openexecutive.config import get_settings
     from openexecutive.memory.decision_ledger import (
         STATUS_FAILED,
@@ -946,11 +936,6 @@ async def _do_delete_event(
 
 async def handle_cancel_calendar_event(tool_input: dict[str, Any]) -> str:
     """Cancel a booked event by its decision_instance_id."""
-    from openexecutive.delegation.lockdown import mail_touched_refusal
-
-    if (refused := mail_touched_refusal('cancel_calendar_event')) is not None:
-        return refused
-
     from openexecutive.memory.decision_ledger import (
         get_decision_instance,
         mark_reversed,

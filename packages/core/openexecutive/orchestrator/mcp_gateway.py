@@ -2802,7 +2802,8 @@ class MCPGateway:
 
     async def call_tool(self, tool_input: dict[str, Any]) -> str:
         # Act as me: once the turn has read the principal's own mail, only
-        # the Google Workspace reads run (delegation.lockdown).
+        # PRIVATE_TURN_MCP_TOOLS run: reads, and sends whose every recipient
+        # the roster checks below (delegation.lockdown).
         from openexecutive.delegation.lockdown import outside_reach_refusal
 
         refused = outside_reach_refusal(

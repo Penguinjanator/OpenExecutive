@@ -2079,12 +2079,13 @@ class Executive:
             # Act as me: once the turn has read the principal's own mail (in
             # an earlier round, or with a ghostwrite_email, a mailbox read or
             # recall_history in this one — a round's tools run together),
-            # nothing that reaches anyone else runs for the rest of the turn
-            # (delegation.lockdown). A later turn of that conversation
-            # (touched_mail, not read_mail) refuses only what reaches an
-            # outside address with no recipient check (carried_withholds).
-            # The offered list stays as it is, so the cached prefix never
-            # changes mid-turn.
+            # nothing that opens a link, runs a script or workflow, or posts
+            # to everyone runs for the rest of the turn (delegation.lockdown).
+            # A later turn of that conversation stays private (touched_mail)
+            # and withholds the same tools only while the reading turn is in
+            # the history it is shown (mail_in_view, carried_withholds). The
+            # offered list stays as it is, so the cached prefix never changes
+            # mid-turn.
             mail_touched_uses: list[dict[str, Any]] = []
             refusal_for: Callable[[str], str] = mail_touched_withheld_error
             if pinned_delegation is not None and (
@@ -2095,7 +2096,7 @@ class Executive:
                     tu for tu in [*skill_tool_uses, *mcp_tool_uses, *script_tool_uses]
                     if mail_touched_withholds(tu["name"], tu["input"])
                 ]
-            elif pinned_delegation is not None and pinned_delegation.touched_mail:
+            elif pinned_delegation is not None and pinned_delegation.touched_mail and pinned_delegation.mail_in_view:
                 refusal_for = carried_withheld_error
                 mail_touched_uses = [
                     tu for tu in [*skill_tool_uses, *mcp_tool_uses, *script_tool_uses]
@@ -2872,7 +2873,10 @@ class Executive:
                 not fanout_hinted
                 and self._script_tools
                 and step_script.RUN_SCRIPT_TOOL not in not_offered
-                and not (pinned_delegation is not None and pinned_delegation.touched_mail)
+                and not (
+                    pinned_delegation is not None
+                    and (pinned_delegation.read_mail or (pinned_delegation.touched_mail and pinned_delegation.mail_in_view))
+                )
                 and not any(tu["name"] == step_script.RUN_SCRIPT_TOOL for tu in tool_uses)
                 and any(step_script.lists_many(str(results_by_id.get(tu["id"], ""))) for tu in tool_uses)
             ):

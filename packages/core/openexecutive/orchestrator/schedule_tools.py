@@ -181,11 +181,6 @@ def _guard_outbound(*, tool: str, channel: str, channel_ref: str, text: str) -> 
     ``done`` activity row is written, so a suppressed attempt never counts itself
     toward the rate cap.
     """
-    from openexecutive.delegation.lockdown import mail_touched_refusal
-
-    # Act as me: a turn that read the principal's own mail sends nothing.
-    if (refused := mail_touched_refusal(tool)) is not None:
-        return refused
     from openexecutive.orchestrator.outbound_guard import check_outbound_allowed
 
     reason = check_outbound_allowed(channel, channel_ref, text)

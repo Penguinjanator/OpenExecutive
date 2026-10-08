@@ -54,7 +54,7 @@ import contextvars
 import logging
 import re
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -92,10 +92,21 @@ class TurnDelegation:
     # that once read them (``_carry_kept_private``).
     touched_mail: bool = False
     # This turn itself read their mailbox or notes (set before the read, with
-    # ``touched_mail``): nothing that reaches anyone else runs for the rest of
-    # it (``delegation.lockdown``). Never carried into the next turn: what
+    # ``touched_mail``): nothing that opens a link, runs a script or workflow,
+    # or posts to everyone runs for the rest of it (``delegation.lockdown``). Never carried into the next turn: what
     # the mail said reaches a later turn only as the Executive's own reply.
     read_mail: bool = False
+    # A conversation that once read their mail (``touched_mail``) whose
+    # reading turn is still in the history the model is shown: the replies
+    # there may repeat what the mail said, so the carried lockdown holds
+    # (``delegation.lockdown.carried_withholds``). Once that turn scrolls out
+    # of view nothing from the mail is left in the turn, and it lifts.
+    mail_in_view: bool = False
+    # Who sent the mail this turn read, address to display name
+    # (``mail_read_tools``): a new contact's address may be one of them, when
+    # its name or address matches the contact's, never one the mail's text
+    # only mentions (``delegation.lockdown.speaker_named_contact``).
+    mail_senders: dict[str, str] = field(default_factory=dict)
     # Drafts made this turn, against the per-turn cap.
     drafts: int = 0
     # Searches and thread reads of their mailbox this turn, against the
@@ -409,20 +420,46 @@ def pin_turn_delegation(session: Any, speaker_text: str) -> TurnDelegation:
         session_id=getattr(session, "session_id", None),
     )
     if not isinstance(override, DelegationOverride):
-        _carry_kept_private(pinned)
+        _carry_kept_private(pinned, history_len(session))
     session.turn_delegation = pinned
     _TURN.set(pinned)
     return pinned
 
 
-def _carry_kept_private(pinned: TurnDelegation) -> None:
+def history_len(session: Any) -> int | None:
+    """How many history messages ``session`` holds now, or None when that
+    can't be told (which keeps a carried lockdown in view)."""
+    history = getattr(session, "conversation_history", None)
+    return len(history) if isinstance(history, list) else None
+
+
+# A turn adds up to three history messages (its words, an added message, the
+# reply), so the turn that read the mail ends at most this far past the
+# length stored before it.
+_TURN_SPAN = 2
+
+
+def mail_still_in_view(read_at: int | None, total: int | None) -> bool:
+    """Whether the turn that read the mail, stored as ``read_at`` history
+    messages before it (``session_store.mail_read_at``), is still in what the
+    model is shown of a ``total``-message history. Unknown counts as in view."""
+    from openexecutive.orchestrator.session import history_window_start
+
+    if read_at is None or total is None:
+        return True
+    return history_window_start(total) <= read_at + _TURN_SPAN
+
+
+def _carry_kept_private(pinned: TurnDelegation, total: int | None = None) -> None:
     """A conversation that once read someone's mail (``mark_mail_private``)
     stays theirs on every later turn: its rows are private to them and it
     teaches no memory, however it is answered (``touched_mail``). Nobody else
-    drafts in it. The lockdown is not carried (``read_mail``): history keeps
-    only the speaker's words and the Executive's replies, never the mail a
-    tool returned, so a later turn locks only if it reads mail itself. Fails
-    closed: a flag that can't be read counts as set."""
+    drafts in it. The turn's own lockdown is not carried (``read_mail``):
+    history keeps only the speaker's words and the Executive's replies, never
+    the mail a tool returned. Those replies may still repeat it, so the
+    narrower carried lockdown holds while the reading turn is among the
+    ``total`` history messages the model is shown (``mail_in_view``). Fails
+    closed: a flag that can't be read counts as set and in view."""
     if not pinned.session_id:
         return
     from openexecutive.memory import session_store
@@ -436,6 +473,11 @@ def _carry_kept_private(pinned: TurnDelegation) -> None:
     if not kept:
         return
     pinned.touched_mail = True
+    try:
+        pinned.mail_in_view = mail_still_in_view(session_store.mail_read_at(pinned.session_id), total)
+    except Exception:
+        logger.warning("delegation: couldn't read when the conversation read mail — keeping it locked", exc_info=True)
+        pinned.mail_in_view = True
     if owner is not None and owner != pinned.person_id:
         pinned.enabled = pinned.offered = False
         pinned.person_id = owner
@@ -508,6 +550,18 @@ def turn_read_delegate_mail(session: Any = None) -> bool:
         session = current_session.get()
     pinned = turn_delegation(session)
     return pinned is not None and pinned.read_mail
+
+
+def turn_carries_mail_lock(session: Any = None) -> bool:
+    """Whether the current turn runs in a conversation that read the
+    speaker's mail with that turn still in view (``mail_in_view``): the
+    carried lockdown applies. ``session`` defaults to the bound one."""
+    if session is None:
+        from openexecutive.orchestrator.schedule_tools import current_session
+
+        session = current_session.get()
+    pinned = turn_delegation(session)
+    return pinned is not None and pinned.touched_mail and pinned.mail_in_view
 
 
 def turn_touched_delegate_mail(session: Any = None) -> bool:

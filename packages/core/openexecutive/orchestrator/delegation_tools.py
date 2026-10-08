@@ -216,7 +216,7 @@ def _keep_conversation_private(writer: _Writer) -> bool:
     conversation is someone else's: their mail and this person's would share
     it. An eval's fake mailbox (``DelegationOverride``) has no conversation to
     mark."""
-    from openexecutive.delegation.settings import DelegationOverride
+    from openexecutive.delegation.settings import DelegationOverride, history_len
     from openexecutive.memory.session_store import mark_mail_private
     from openexecutive.orchestrator.schedule_tools import current_session
 
@@ -227,7 +227,7 @@ def _keep_conversation_private(writer: _Writer) -> bool:
     if not session_id:
         return False
     try:
-        owner = mark_mail_private(str(session_id), writer.person.id)
+        owner = mark_mail_private(str(session_id), writer.person.id, history_len=history_len(session))
     except Exception:
         logger.exception("delegation_tools: couldn't mark the conversation private")
         return False

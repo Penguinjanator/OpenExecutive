@@ -223,4 +223,3 @@ def test_it_rides_with_act_as_me_but_opens_no_mailbox() -> None:
 
 def test_it_stays_on_after_mail_is_read() -> None:
     assert not lockdown.mail_touched_withholds(rt.REMIND_ME, {})
-    assert not lockdown.carried_withholds(rt.REMIND_ME, {})

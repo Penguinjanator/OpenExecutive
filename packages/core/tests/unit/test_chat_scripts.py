@@ -229,17 +229,17 @@ def test_a_turn_that_read_the_owners_mail_refuses_the_whole_script(
     assert any(r["details"].get("refused") == "mail_touched" for r in audit)
 
 
-def test_a_later_turn_of_a_mail_conversation_refuses_scripts_and_outside_tools_but_sends(
+def test_a_later_turn_of_a_mail_conversation_is_not_locked_once_the_mail_is_out_of_view(
     monkeypatch: pytest.MonkeyPatch, audit: list[dict[str, Any]]
 ) -> None:
-    # A later turn of a conversation that read the owner's mail: private
-    # (touched_mail) but not locked (read_mail). What reaches only the roster
-    # runs; a script or a gateway tool outside PRIVATE_TURN_MCP_TOOLS doesn't.
+    # A later turn of a conversation that read the owner's mail, once that
+    # turn is out of the history the model is shown: private (touched_mail)
+    # but not locked, so scripts, outside tools and sends all run.
     from types import SimpleNamespace
 
     from openexecutive.orchestrator import executive as ex
 
-    pinned = SimpleNamespace(offered=False, touched_mail=True, read_mail=False)
+    pinned = SimpleNamespace(offered=False, touched_mail=True, read_mail=False, mail_in_view=False)
     monkeypatch.setattr("openexecutive.orchestrator.executive.turn_delegation", lambda _s: pinned)
     slack: list[dict[str, Any]] = []
 
@@ -249,20 +249,20 @@ def test_a_later_turn_of_a_mail_conversation_refuses_scripts_and_outside_tools_b
 
     monkeypatch.setitem(ex._ALL_SKILL_HANDLERS, "send_slack_dm", send_slack_dm)
     gateway = _Gateway()
+    fetch = {"name": "fetch__fetch_url", "arguments": {"url": "https://x.example"}}
     send = {"name": "google_workspace__send_gmail_message", "arguments": {"to": "ben@co.example"}}
     provider = _ScriptedProvider([
         _FinalMsg([
             _ToolUseBlock("tu-s", "run_script", {"script": SCRIPT}),
-            _ToolUseBlock("tu-f", "call_tool", {"name": "fetch__fetch_url", "arguments": {"url": "https://x.example"}}),
+            _ToolUseBlock("tu-f", "call_tool", fetch),
             _ToolUseBlock("tu-g", "call_tool", send),
             _ToolUseBlock("tu-d", "send_slack_dm", {"slack_user_id": "U1", "text": "hi"}),
         ], "tool_use"),
         _FinalMsg([_TextBlock("Done.")], "end_turn"),
     ])
     _run(provider, gateway)
-    for refused in ("tu-s", "tu-f"):
-        assert "new conversation" in json.loads(_any_result(provider, refused))["error"]
-    assert gateway.calls == [send]
+    assert not any(r["details"].get("refused") == "mail_touched" for r in audit)
+    assert fetch in gateway.calls and send in gateway.calls
     assert slack == [{"slack_user_id": "U1", "text": "hi"}]
 
 

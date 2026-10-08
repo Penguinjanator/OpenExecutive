@@ -233,7 +233,11 @@ def get_session_owner(session_id: str, db_path: Path = DB_PATH) -> tuple[bool, i
 
 
 def mark_mail_private(
-    session_id: str, owner_person_id: int | None = None, db_path: Path = DB_PATH
+    session_id: str,
+    owner_person_id: int | None = None,
+    db_path: Path = DB_PATH,
+    *,
+    history_len: int | None = None,
 ) -> int | None:
     """Make ``session_id`` its owner's alone from now on: a turn in it read or
     drafted in the speaker's own mailbox (Act as me), and its replies quote
@@ -245,7 +249,11 @@ def mark_mail_private(
     missing row is created here, owned by ``owner_person_id`` (the speaker);
     the adapter's ``create_session`` then leaves it as it is. A row without an
     owner gets this one. A row owned by someone else is left exactly as it
-    is, unmarked: the caller sees its owner returned and reads nothing."""
+    is, unmarked: the caller sees its owner returned and reads nothing.
+
+    ``history_len`` is how many history messages the conversation held before
+    this turn (``mail_read_at``); None stores unknown, which carries the
+    lockdown for good."""
     now = datetime.now(UTC).isoformat()
     with _get_conn(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -256,13 +264,28 @@ def mark_mail_private(
         if stored is not None and stored != owner_person_id:
             return int(stored)
         conn.execute(
-            "INSERT INTO sessions (session_id, title, created_at, updated_at, caller_person_id, mail_private) "
-            "VALUES (?, ?, ?, ?, ?, 1) "
-            "ON CONFLICT(session_id) DO UPDATE SET mail_private = 1, "
+            "INSERT INTO sessions (session_id, title, created_at, updated_at, caller_person_id, mail_private, mail_read_at) "
+            "VALUES (?, ?, ?, ?, ?, 1, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET mail_private = 1, mail_read_at = excluded.mail_read_at, "
             "caller_person_id = COALESCE(caller_person_id, excluded.caller_person_id)",
-            (session_id, session_id, now, now, owner_person_id),
+            (session_id, session_id, now, now, owner_person_id, history_len),
         )
     return owner_person_id
+
+
+def mail_read_at(session_id: str, db_path: Path = DB_PATH) -> int | None:
+    """How many history messages ``session_id`` held before the last turn
+    that read its owner's mail (``mark_mail_private``), or None when unknown
+    or never read."""
+    if not db_path.exists():
+        return None
+    with _get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT mail_read_at FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+    if row is None or row["mail_read_at"] is None:
+        return None
+    return int(row["mail_read_at"])
 
 
 def session_mail_private(session_id: str, db_path: Path = DB_PATH) -> bool:

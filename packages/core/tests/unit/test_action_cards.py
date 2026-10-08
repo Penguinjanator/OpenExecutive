@@ -156,7 +156,6 @@ def test_it_rides_with_act_as_me_stays_on_after_mail_and_opens_no_mailbox() -> N
     assert act.PROPOSE_ACTIONS in DELEGATION_TOOL_NAMES and act.PROPOSE_ACTIONS in DELEGATION_TOOL_HANDLERS
     assert act.PROPOSE_ACTIONS not in MAILBOX_TOOL_NAMES
     assert not lockdown.mail_touched_withholds(act.PROPOSE_ACTIONS, {})
-    assert not lockdown.carried_withholds(act.PROPOSE_ACTIONS, {})
 
 
 def test_the_chip_says_it_is_waiting() -> None:

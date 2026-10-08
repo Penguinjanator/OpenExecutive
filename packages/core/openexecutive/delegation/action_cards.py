@@ -1,10 +1,11 @@
 """Approval cards: actions the Executive suggests on a turn about someone's
 mail, done only when that person taps Approve (``orchestrator.action_card_tools``).
 
-A turn that read someone's mail may not message anyone, invite anyone or
-change the roster (``delegation.lockdown``): text in the mail could otherwise
-steer it. What the mail asks for is still often right, so the Executive
-leaves it on a card instead: each action spelled out exactly as it will
+What someone's mail asks for is never done on its say-so: text in the mail
+could otherwise steer the Executive into messaging, inviting or adding
+people the person never asked for (``delegation.lockdown`` adds a contact
+only when the person named it). What the mail asks for is still often
+right, so the Executive leaves it on a card instead: each action spelled out exactly as it will
 happen, for the person to approve with one tap.
 
 **What a card holds.** Up to ``MAX_ACTIONS`` actions of three kinds, each
