@@ -1,9 +1,14 @@
+import logging
 import re
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from pydantic import Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+# One PYTHON_JOB_EXTRA_LIBRARIES entry: a package name, optionally with its
+# import name when that differs ("scikit-learn (import sklearn)").
+_EXTRA_LIBRARY = re.compile(r"[A-Za-z0-9_.\-]+( \(import [A-Za-z0-9_.]+\))?")
 
 # Walk up from this file to find the repo root .env. If no .env exists
 # (CI, fresh checkouts), `_ROOT` becomes `cwd` so file-path defaults stay
@@ -628,6 +633,10 @@ class Settings(BaseSettings):
     # required with the URL.
     python_job_runner_url: str | None = Field(None, alias="PYTHON_JOB_RUNNER_URL")
     python_job_runner_key: str | None = Field(None, alias="PYTHON_JOB_RUNNER_KEY")
+    # Libraries the runner has beyond the local sandbox's, named in the job
+    # tool's description (e.g. "scipy, scikit-learn (import sklearn)"). Used
+    # only with PYTHON_JOB_RUNNER_URL; the local sandbox can't install more.
+    python_job_extra_libraries: str | None = Field(None, alias="PYTHON_JOB_EXTRA_LIBRARIES")
 
     @field_validator("python_job_runner_url")
     @classmethod
@@ -644,6 +653,24 @@ class Settings(BaseSettings):
                 "PYTHON_JOB_RUNNER_URL must be an https URL (plain http only to localhost, .internal or .flycast)"
             )
         return v
+
+    @field_validator("python_job_extra_libraries")
+    @classmethod
+    def _validate_python_job_extra_libraries(cls, v: str | None) -> str | None:
+        # It goes into a tool description, so only package names, each with an
+        # optional import name ("scikit-learn (import sklearn)"). A bad
+        # value is dropped, not fatal: it is optional and the control plane may
+        # push it to machines that must still boot.
+        v = " ".join((v or "").split())
+        if not v:
+            return None
+        items = [item.strip() for item in v.split(",")]
+        if len(v) > 300 or not all(_EXTRA_LIBRARY.fullmatch(item) for item in items):
+            logging.getLogger(__name__).warning(
+                "PYTHON_JOB_EXTRA_LIBRARIES ignored: not a short comma-separated list of package names"
+            )
+            return None
+        return ", ".join(items)
 
     @model_validator(mode="after")
     def _validate_python_job_runner_key(self) -> "Settings":
