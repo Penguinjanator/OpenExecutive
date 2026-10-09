@@ -259,6 +259,34 @@ caching:
     same prefix from its first round to its last. recall_history (Always in
     the loop, orchestrator.history_tools) joins the same way when
     history_tools.recall_person allows it, before the same sort.
+  turn_reading_budget: |
+    TOOL_RESULTS_TURN_MAX_CHARS (default 40,000; 0 = off) bounds what all of
+    one turn's tool results add together, since every result is re-sent on
+    each later call of the turn. executive._turn_result_limit gives each
+    result min(TOOL_RESULT_MAX_CHARS, what is left), never below 3,000
+    (_TURN_BUDGET_FLOOR), and _cap_tool_result(budget_spent=True) replaces the
+    marker's "call the tool again more narrowly" advice (that re-read would be
+    cut too) with: the question has read as much as it can: answer from what you
+    have and say what you could not read, and never edit, rewrite or replace
+    anything from that cut result, so a partial read never becomes a lossy
+    write. The read the question needs to edit may be the cut one, so
+    executive._TurnReadingBudget gives each turn one full re-read: repeating a
+    cut call with the same tool and input (compared as sorted JSON) is answered
+    with the stored full result (replay, before dispatch) under the per-result
+    cap, never by running the tool again (the cut may have been a write), and
+    the marker offers that while it is left;
+    after it, the marker says to offer the edit as its own request (a fresh
+    budget). A turn so reads at most the budget plus one result. A result short
+    enough not to be cut never spends the re-read. consult_specialist results neither
+    count nor are cut (they are the analysis, not a read); run_script results
+    count but are never cut below the per-result cap, since step_script puts
+    the list of writes that already ran at their head and a 3,000-character
+    cut would hide some, so the model would repeat them. open_tools and
+    search_tools results are treated the same way (_NEVER_CUT_BY_TURN_BUDGET):
+    they are the schema the next call needs. Pairs with
+    TOOL_BUILDING_ADDENDUM's multi-read rule: an answer that needs three or
+    more reads builds a run_script tool that returns only what answers the
+    question, so the budget is rarely reached.
   deferred_tool_groups: |
     The less common skill tools are not in the tool list. orchestrator.
     tool_groups.GROUPS puts them in named groups (calendar, people, goals,

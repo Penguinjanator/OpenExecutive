@@ -244,9 +244,20 @@ _MIN_USEFUL_CAP = 1_000
 # under this (the longest in the MCP surface is ~40 chars); the bound exists
 # so a model-supplied name cannot inflate the marker past its own budget.
 _TOOL_NAME_MARKER_MAX = 80
+# Once a turn's reading budget (TOOL_RESULTS_TURN_MAX_CHARS) is used up, a
+# further tool result still shows this much, so the model sees what it got.
+_TURN_BUDGET_FLOOR = 3_000
+
+# Results the turn's reading budget counts but never cuts (see
+# _turn_result_limit).
+_NEVER_CUT_BY_TURN_BUDGET = frozenset(
+    {step_script.RUN_SCRIPT_TOOL, tool_groups.OPEN_TOOLS, "search_tools"}
+)
 
 
-def _cap_tool_result(text: Any, *, tool_name: str, limit: int) -> Any:
+def _cap_tool_result(
+    text: Any, *, tool_name: str, limit: int, budget_spent: bool = False, full_reread_left: bool = False
+) -> Any:
     """Bound one tool result before it enters the prompt.
 
     A circuit breaker, not a routine clipper: the default budget is set so
@@ -270,9 +281,16 @@ def _cap_tool_result(text: Any, *, tool_name: str, limit: int) -> Any:
 
     Precondition: ``limit`` must be at least ``_MIN_USEFUL_CAP``. The
     "never exceeds ``limit``" guarantee holds by reserving the marker
-    inside the budget, and the marker itself is ~284-383 chars — below
+    inside the budget, and the marker itself is ~280-850 chars — below
     that floor there is no room for it and the guarantee breaks. The
     config field enforces this with ``ge=1_000``.
+
+    ``budget_spent`` says the turn's reading budget, not this result's own
+    size, set ``limit``: the marker then says to answer from what the turn
+    has rather than read more, and never to edit from the cut text. With
+    ``full_reread_left`` it also offers the turn's one full re-read
+    (``_TurnReadingBudget``), so an edit the question asked for can still
+    be done from the whole document.
     """
     if not isinstance(text, str):
         return text
@@ -292,9 +310,30 @@ def _cap_tool_result(text: Any, *, tool_name: str, limit: int) -> Any:
         return (
             f"\n\n[TRUNCATED by Open Executive: showed the first {shown:,} of "
             f"{len(text):,} characters from `{safe_name}` ({pct}% omitted). "
-            "This is NOT the full result. To see more, call the tool again "
-            "with a narrower request — a page range, a section name, a query "
-            "or filter — rather than re-requesting the whole document.]"
+            "This is NOT the full result."
+            + (
+                # A narrower re-read would be cut the same way, so the
+                # budget note replaces the "ask again" advice.
+                " This question has already read as much as it can. Never "
+                "edit, rewrite or replace anything from this cut result."
+                + (
+                    " If you need this whole result to edit or rewrite it, "
+                    "call the tool again with exactly the same input: that "
+                    "repeat does not run the tool again, it brings back this "
+                    "same result in full (once per question)."
+                    if full_reread_left
+                    else " If you needed it to edit or rewrite something, say "
+                    "it was too long to work on here and offer to do it as "
+                    "its own request."
+                )
+                + " Otherwise answer from what you have, and say what you "
+                "could not read."
+                if budget_spent
+                else " To see more, call the tool again with a narrower "
+                "request — a page range, a section name, a query or filter — "
+                "rather than re-requesting the whole document."
+            )
+            + "]"
         )
 
     # Reserve the marker inside the budget so the capped result never
@@ -309,6 +348,101 @@ def _cap_tool_result(text: Any, *, tool_name: str, limit: int) -> Any:
         safe_name, len(text), shown, limit,
     )
     return text[:shown] + marker(shown, pct)
+
+
+def _turn_result_limit(name: str, *, per_result: int, turn_budget: int, used: int) -> tuple[int, bool]:
+    """The cap for one tool result, given what the turn has already read.
+
+    Every tool result stays in the prompt for each later call of the turn,
+    so a turn that reads several long documents re-sends all of them on
+    every call. ``turn_budget`` (TOOL_RESULTS_TURN_MAX_CHARS; 0 = off)
+    bounds what a turn's results add together: once ``used`` reaches it, a
+    further result is cut to ``_TURN_BUDGET_FLOOR``. Returns (limit, whether
+    the budget rather than ``per_result`` set it). A specialist's analysis
+    is the answer itself, not a read, so it neither counts nor is cut by the
+    budget. A built tool's result counts but is never cut below
+    ``per_result``: it is already bounded (step_script), and it lists the
+    writes that already ran, which a short cut would hide and the model would
+    then repeat. Tool discovery (``open_tools``, ``search_tools``) is treated
+    the same way: its result is the schema for the next call, and a cut one
+    would leave the model unable to make it.
+    """
+    if turn_budget <= 0 or name == "consult_specialist":
+        return per_result, False
+    if name in _NEVER_CUT_BY_TURN_BUDGET:
+        return per_result, False
+    remaining = turn_budget - used
+    if remaining >= per_result:
+        return per_result, False
+    return min(per_result, max(_TURN_BUDGET_FLOOR, remaining)), True
+
+
+class _TurnReadingBudget:
+    """One turn's reading budget (TOOL_RESULTS_TURN_MAX_CHARS), with one
+    escape hatch.
+
+    ``_turn_result_limit`` decides the cap from what the turn has used. A
+    read cut by the budget may be the very document the question asks to
+    edit, and an edit from a cut read would drop everything past the cut.
+    So the turn gets one full re-read: when the model repeats a call the
+    budget cut, same tool and same input, the loop answers it with the
+    result it already has (``replay``), under the per-result cap, and never
+    runs the tool again. Replaying rather than re-running matters: the
+    budget cuts any tool's result, and a repeated write (an event, a
+    message) would happen twice. Once per turn, so the budget still bounds
+    the turn: at most one extra ``per_result``.
+    """
+
+    def __init__(self, *, per_result: int, turn_budget: int) -> None:
+        self.per_result = per_result
+        self.turn_budget = turn_budget
+        self.used = 0
+        # Full text of each result the budget cut, by call.
+        self._cut_results: dict[str, str] = {}
+        # tool_use ids answered by ``replay``: shown in full, not cut again.
+        self._replayed: set[str] = set()
+        self.full_reread_left = True
+
+    @staticmethod
+    def _key(name: str, tool_input: Any) -> str:
+        try:
+            return name + "\x00" + json.dumps(tool_input, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            return name + "\x00" + repr(tool_input)
+
+    def replay(self, tool_use: dict[str, Any]) -> str | None:
+        """The stored full result if ``tool_use`` repeats a call the budget
+        cut and the turn's one re-read is left; the caller then answers it
+        with this text instead of dispatching it. ``None`` otherwise."""
+        if not self.full_reread_left:
+            return None
+        full = self._cut_results.get(self._key(tool_use["name"], tool_use["input"]))
+        if full is None:
+            return None
+        self.full_reread_left = False
+        self._replayed.add(tool_use["id"])
+        return full
+
+    def cap(self, name: str, tool_input: Any, text: Any, tool_use_id: str = "") -> Any:
+        """``text`` capped for the prompt, counted against the budget."""
+        if tool_use_id and tool_use_id in self._replayed:
+            limit, budget_spent = self.per_result, False
+        else:
+            limit, budget_spent = _turn_result_limit(
+                name, per_result=self.per_result, turn_budget=self.turn_budget, used=self.used
+            )
+            if budget_spent and isinstance(text, str) and len(text) > limit:
+                self._cut_results[self._key(name, tool_input)] = text
+        content = _cap_tool_result(
+            text,
+            tool_name=name,
+            limit=limit,
+            budget_spent=budget_spent,
+            full_reread_left=self.full_reread_left,
+        )
+        if name != "consult_specialist" and isinstance(content, str):
+            self.used += len(content)
+        return content
 
 
 # The history breakpoint lives an hour: people answer in minutes, not
@@ -1895,6 +2029,12 @@ class Executive:
         caller_message_count = len(current_messages)
         last_full_text = ""
         specialists_consulted: list[str] = []
+        # What this turn's tool results have put in the prompt so far: every
+        # one is re-sent on each later call.
+        reading_budget = _TurnReadingBudget(
+            per_result=self._settings.tool_result_max_chars,
+            turn_budget=self._settings.tool_results_turn_max_chars,
+        )
 
         for iteration in range(1, max_iterations + 1):
             logger.info(
@@ -2047,9 +2187,18 @@ class Executive:
                         group_results[tu["id"]] = error or ""
                     else:
                         tool_uses[i] = call
+            # The turn's one full re-read of a result the reading budget cut
+            # is answered from that result, never by running the tool again
+            # (it may have been a write).
+            for tu in tool_uses:
+                if tu["id"] not in group_results:
+                    replayed = reading_budget.replay(tu)
+                    if replayed is not None:
+                        group_results[tu["id"]] = replayed
+            dispatch_uses = [tu for tu in tool_uses if tu["id"] not in group_results]
 
-            specialist_tool_uses = [tu for tu in tool_uses if tu["name"] == "consult_specialist"]
-            skill_tool_uses = [tu for tu in tool_uses if tu["name"] in turn_handlers]
+            specialist_tool_uses = [tu for tu in dispatch_uses if tu["name"] == "consult_specialist"]
+            skill_tool_uses = [tu for tu in dispatch_uses if tu["name"] in turn_handlers]
             # Dispatch guard: a tool this mode does not offer never runs, even
             # if the model emits it anyway — it gets an error tool_result.
             withheld_uses = [tu for tu in skill_tool_uses if tu["name"] in withheld_tools]
@@ -2057,9 +2206,9 @@ class Executive:
                 skill_tool_uses = [
                     tu for tu in skill_tool_uses if tu["name"] not in withheld_tools
                 ]
-            mcp_tool_uses = [tu for tu in tool_uses if tu["name"] in MCP_TOOL_NAMES]
+            mcp_tool_uses = [tu for tu in dispatch_uses if tu["name"] in MCP_TOOL_NAMES]
             script_tool_uses = [
-                tu for tu in tool_uses
+                tu for tu in dispatch_uses
                 if self._script_tools
                 and tu["name"] in (step_script.RUN_SCRIPT_TOOL, step_script.LIST_SAVED_TOOLS_TOOL)
             ]
@@ -2855,18 +3004,15 @@ class Executive:
             # output, tool errors and the unknown-tool fallback, and it
             # leaves non-model consumers (the propose_form_values JSON
             # parse above, the audit trail) reading the full text.
-            tool_results = [
-                {
-                    "type": "tool_result",
-                    "tool_use_id": tu["id"],
-                    "content": _cap_tool_result(
-                        results_by_id.get(tu["id"], f"Unknown tool: {tu['name']}"),
-                        tool_name=tu["name"],
-                        limit=self._settings.tool_result_max_chars,
-                    ),
-                }
-                for tu in tool_uses
-            ]
+            tool_results: list[dict[str, Any]] = []
+            for tu in tool_uses:
+                content = reading_budget.cap(
+                    tu["name"],
+                    tu["input"],
+                    results_by_id.get(tu["id"], f"Unknown tool: {tu['name']}"),
+                    tu["id"],
+                )
+                tool_results.append({"type": "tool_result", "tool_use_id": tu["id"], "content": content})
             # Messages the person sent since the last round ride in this
             # round's user message, after the tool results (which must come
             # first). Only this loop's own, newest message changes, so the
