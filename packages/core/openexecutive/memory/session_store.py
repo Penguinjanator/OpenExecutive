@@ -493,6 +493,9 @@ def search_past_messages(
 
 
 def delete_session(session_id: str, db_path: Path = DB_PATH) -> bool:
+    from openexecutive.orchestrator import conversation_files
+
+    conversation_files.forget(session_id)
     if not db_path.exists():
         return False
     with _get_conn(db_path) as conn:
